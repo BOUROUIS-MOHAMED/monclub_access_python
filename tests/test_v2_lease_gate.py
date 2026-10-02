@@ -134,7 +134,7 @@ def _dev(did, mode, proto="ZK_PULLSDK"):
 
 
 def test_the_app_starts_no_ultra_worker_on_a_reader(no_driver):
-    from app.ui.app import ultra_devices_for_this_pc
+    from app.core.ultra_worker_pool import devices_to_drive as ultra_devices_for_this_pc
     assert ultra_devices_for_this_pc([_dev(8, "ULTRA"), _dev(9, "AGENT")]) == []
     lg.reset_for_tests()
     assert [d["id"] for d in ultra_devices_for_this_pc([_dev(8, "ULTRA"), _dev(9, "AGENT")])] == [8]

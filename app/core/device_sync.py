@@ -51,6 +51,8 @@ from app.core.settings_reader import (  # ✅ NEW: backend-driven settings (SQLi
 )
 from app.core import telemetry as _tel
 from app.core import push_safety as _push_safety
+from app.core import device_push_rules as _push_rules
+from app.core import device_service_gate as _service_gate
 from app.core.utils import from_b64, from_hex, to_b64
 from app.sdk.pullsdk import STRUCTURAL_ERROR_CODES
 from app.sdk.pullsdk import PullSDK, PullSDKError
@@ -1196,17 +1198,10 @@ class DeviceSyncEngine:
             dev_id = normalized_device.get("id")
             dev_name = normalized_device.get("name", "")
 
-            if not _boolish(normalized_device.get("active"), default=True):
-                self.logger.info(
-                    "[DeviceSync] Skip single-device id=%s name=%r: active=False",
-                    dev_id, dev_name,
-                )
-                return False
-            if not _boolish(normalized_device.get("accessDevice"), default=True):
-                self.logger.info(
-                    "[DeviceSync] Skip single-device id=%s name=%r: accessDevice=False",
-                    dev_id, dev_name,
-                )
+            _off = _service_gate.out_of_service_reason(normalized_device)
+            if _off:
+                # In service off (spec 3): nothing is written to this turnstile.
+                self.logger.info("[DeviceSync] Skip single-device id=%s name=%r: %s", dev_id, dev_name, _off)
                 return False
 
             users = getattr(cache, "users", []) or []
@@ -1528,10 +1523,8 @@ class DeviceSyncEngine:
         did = int(_to_int(dev_id, default=0) or 0)
         if did <= 0:
             return False
-        if not _boolish(normalized_device.get("active"), default=True):
-            return False
-        if not _boolish(normalized_device.get("accessDevice"), default=True):
-            return False
+        if _service_gate.out_of_service_reason(normalized_device):
+            return False  # In service off (spec 3)
         if (not _lease_gate.device_allowed(did) or _lease_gate.writes_frozen(did)
                 or _device_hold.is_held(did)):
             # P3b-2: another PC drives it, or this PC is handing it over (its ownership record
@@ -1597,6 +1590,7 @@ class DeviceSyncEngine:
             device=normalized_device,
             default_door_id=default_door_id,
             stats_out=filter_stats,
+            apply_card_mode=True,
         )
         desired_user = desired.get(pin)
 
@@ -1939,37 +1933,9 @@ class DeviceSyncEngine:
             raw_fingerprint_enabled = device.get("fingerprint_enabled")
         fingerprint_enabled = _boolish(raw_fingerprint_enabled, default=False)
 
-        # Resolve AuthorizeDoorId bitmask for userauthorize.
-        # AuthorizeDoorId is a bitmask: door1=1, door2=2, door3=4, door4=8.
-        #
-        # Priority: use doorIds from the backend (already bitmask values set in
-        # the dashboard, e.g. [1, 2, 4, 8]). OR them to get combined bitmask.
-        # Fallback: compute bitmask from doorPresets physical door numbers.
-        door_ids_raw = device.get("doorIds") or []
-        door_ids_list = _norm_int_list(door_ids_raw)
-
-        if door_ids_list:
-            door_bitmask = 0
-            for v in door_ids_list:
-                door_bitmask |= int(v)
-            door_ids = door_ids_list
-        else:
-            presets = device.get("doorPresets") or []
-            physical_doors = sorted(set(
-                int(p.get("doorNumber") or p.get("door_number") or 0)
-                for p in presets if isinstance(p, dict)
-                and (p.get("doorNumber") or p.get("door_number"))
-            ))
-            physical_doors = [d for d in physical_doors if d > 0]
-
-            if physical_doors:
-                door_bitmask = 0
-                for d in physical_doors:
-                    door_bitmask |= 1 << (int(d) - 1)
-                door_ids = physical_doors
-            else:
-                door_bitmask = int(default_door_id)
-                door_ids = [int(default_door_id)]
+        # AuthorizeDoorId: doorIds are door numbers 1-4; empty = presets, else all doors
+        # (spec 8.4, device_push_rules.door_numbers_and_bitmask).
+        door_ids, door_bitmask = _push_rules.door_numbers_and_bitmask(device, default_door_id)
 
         return door_ids, door_bitmask, authorize_timezone_id, fingerprint_enabled
 
@@ -2060,6 +2026,9 @@ class DeviceSyncEngine:
             # _filter_users_for_device. Dropping the key here would silently derive
             # MEMBERSHIP pins for a device the backend switched to ACCOUNT.
             "pinScheme": g("pinScheme", "pin_scheme", default=None),
+            # CARD CHOICE (ULTRA merge): OFF / TURNSTILE / PC -- the push paths write no card for
+            # OFF or PC (device_push_rules.roster_for_card_mode). Guide 6.2.
+            "cardDecision": g("cardDecision", "card_decision", default=None),
             "doorPresets": list(g("doorPresets", "door_presets", default=None) or []),
             "fingerprintEnabled": _boolish(g("fingerprintEnabled", "fingerprint_enabled", default=False), False),
             # Per-device fingerprint template-version override (9 or 10) parsed
@@ -2089,6 +2058,7 @@ class DeviceSyncEngine:
         default_door_id: int,
         stats_out: Dict[str, Any] | None = None,
         quiet: bool = False,
+        apply_card_mode: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
         """
         Returns dict(pin -> user).
@@ -2281,6 +2251,10 @@ class DeviceSyncEngine:
             stats_out["skipped_offline_projections"] = offline_projections
             stats_out["dropped_cards"] = dropped_cards
 
+        # The card choice (ULTRA merge): OFF / PC write no card, and nothing at all without
+        # fingerprints. Only the paths that WRITE ask for it; a caller that names members does not.
+        if apply_card_mode:
+            out = _push_rules.roster_for_card_mode(out, device)
         return out
 
     def _collect_templates_for_pin(
@@ -3003,6 +2977,7 @@ class DeviceSyncEngine:
             users=users,
             device=normalized_device,
             default_door_id=default_door_id,
+            apply_card_mode=True,
         )
 
         if local_fp_index is None:
@@ -3039,6 +3014,11 @@ class DeviceSyncEngine:
         # degenerate case where every per-user part happens to be unchanged.
         if device_pin_scheme(normalized_device) == PIN_SCHEME_ACCOUNT:
             fingerprint_parts.append(f"pinScheme={PIN_SCHEME_ACCOUNT}")
+
+        # The C3 door timing and repeat block (spec 3: a change to the panel block applies at once):
+        # exactly what the push writes, so a change moves the hash and the pass is not skipped.
+        _drivertime_items, _af_param = _push_rules.panel_param_items(normalized_device)
+        fingerprint_parts.append(f"panel={';'.join(_drivertime_items)}|{_af_param}")
 
         if detail_out is not None:
             # Header (device-level) part of the fingerprint, before per-user parts.
@@ -3242,6 +3222,7 @@ class DeviceSyncEngine:
             desired = self._filter_users_for_device(
                 users=users, device=device, default_door_id=default_door_id,
                 stats_out=filter_stats,
+                apply_card_mode=True,
             )
         desired_pins = set(desired.keys())
         pin_scheme = filter_stats.get("pin_scheme") or device_pin_scheme(device)
@@ -4496,57 +4477,24 @@ class DeviceSyncEngine:
                 except Exception:
                     pass
 
-            # ── Write door timing to controller firmware ──
-            # Without this, the C3 keeps its factory/old defaults and the
-            # turnstile relay stays active too long (allows a second person).
-            presets = device.get("doorPresets") or []
-            for p in presets:
-                if not isinstance(p, dict):
-                    continue
-                dn = p.get("doorNumber") or p.get("door_number")
-                ps = p.get("pulseSeconds") or p.get("pulse_seconds")
-                if dn is not None and ps is not None and int(ps) > 0:
-                    param_str = f"Door{int(dn)}Drivertime={int(ps)}"
-                    try:
-                        sdk.set_device_param(items=param_str)
-                        self.logger.info(
-                            "[DeviceSync] Device id=%s SetDeviceParam %s OK",
-                            dev_id, param_str,
-                        )
-                    except Exception as ex:
-                        self.logger.warning(
-                            "[DeviceSync] Device id=%s SetDeviceParam %s failed: %s",
-                            dev_id, param_str, ex,
-                        )
-
-            # [Anti-fraud] Push DoorIntertime (Punch Interval) to C3 controller.
-            # DoorXIntertime=N prevents the same card from being accepted on
-            # door X within N seconds (range 0-255). This is the correct C3
-            # parameter for re-entry prevention — NOT AntiPassback (which is
-            # about in/out tracking). Failure is non-fatal — the software
-            # AntiFraudGuard and ULTRA _card_cooldown remain backup enforcers.
-            _af_card = bool(device.get("anti_fraude_card", True))
-            _af_duration = min(int(device.get("anti_fraude_duration") or 30), 255)
-            _af_params = []
-            if _af_card and _af_duration > 0:
-                for p in presets:
-                    if not isinstance(p, dict):
-                        continue
-                    dn = p.get("doorNumber") or p.get("door_number")
-                    if dn is not None:
-                        _af_params.append(f"Door{int(dn)}Intertime={_af_duration}")
-            _af_param = ",".join(_af_params) if _af_params else "AntiPassback=0"
+            # Door timing and the repeat block on the controller (device_push_rules.panel_param_items,
+            # the same items the device hash covers). Without the timing the C3 keeps its factory
+            # pulse; the repeat block is DoorNIntertime per preset door (0-255 s), else AntiPassback=0.
+            # Failure is non-fatal.
+            _drivertime_items, _af_param = _push_rules.panel_param_items(device)
+            for param_str in _drivertime_items:
+                try:
+                    sdk.set_device_param(items=param_str)
+                    self.logger.info("[DeviceSync] Device id=%s SetDeviceParam %s OK", dev_id, param_str)
+                except Exception as ex:
+                    self.logger.warning(
+                        "[DeviceSync] Device id=%s SetDeviceParam %s failed: %s", dev_id, param_str, ex)
             try:
                 sdk.set_device_param(items=_af_param)
-                self.logger.info(
-                    "[DeviceSync] Device id=%s anti-fraud param OK (%s)",
-                    dev_id, _af_param,
-                )
+                self.logger.info("[DeviceSync] Device id=%s anti-fraud param OK (%s)", dev_id, _af_param)
             except Exception as _af_ex:
                 self.logger.warning(
-                    "[DeviceSync] Device id=%s anti-passback param FAILED (non-fatal): %s",
-                    dev_id, _af_ex,
-                )
+                    "[DeviceSync] Device id=%s anti-passback param FAILED (non-fatal): %s", dev_id, _af_ex)
 
             self._last_removal_report = {"aborted": int(removal_aborted),
                                          "failed": list(failed_stale),

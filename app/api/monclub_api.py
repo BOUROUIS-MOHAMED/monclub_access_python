@@ -64,6 +64,12 @@ class MonClubApiConflictError(MonClubApiHttpError):
 
 
 
+# D11 / D13 (ULTRA merge, backend plan 1 Task 9): the three outcomes of a removal-request ack.
+ACK_DONE = "DONE"    # 200 {requestId, kind, status DONE|CANCELLED, changed}: stop retrying
+ACK_GONE = "GONE"    # 404 code REMOVAL_REQUEST_NOT_FOUND: not this gym's or this device's; stop
+ACK_RETRY = "RETRY"  # anything else (network, 401, 5xx, a 404 without that code): retry later
+
+
 def _now_epoch_ms() -> str:
     # backend-friendly numeric timestamp (string)
     return str(int(time.time() * 1000))
@@ -425,6 +431,35 @@ class MonClubApi:
             self.logger.debug("[API] ack_pending_sync HTTP %s -> %s", r.status_code, (r.text or "")[:200])
             return False
         return True
+
+    def ack_removal_request(self, *, token: str, device_id: int, request_id: str,
+                            result_code: str = "", result_detail: str = "",
+                            timeout: int = 15) -> Dict[str, Any]:
+        """Acknowledge a removal request this PC ran on a turnstile (D11 fingerprint erase, D13
+        card removal): ``POST {base}/manager/gym/access/v1/devices/{deviceId}/removal-requests/
+        {requestId}/ack`` with the gym token, ``base`` as ``_derive_api_base`` builds it
+        (``{scheme}://{host}/api/v1``). Body ``{resultCode, resultDetail}``, cut to the server's
+        32 / 255 characters. Returns ``{"outcome": ACK_DONE | ACK_GONE | ACK_RETRY,
+        "httpStatus", "status", "detail"}``; never raises."""
+        url = (f"{self._derive_api_base()}/manager/gym/access/v1/devices/{int(device_id)}"
+               f"/removal-requests/{quote(str(request_id or ''), safe='')}/ack")
+        body = {"resultCode": str(result_code or "")[:32] or None,
+                "resultDetail": str(result_detail or "")[:255] or None}
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        try:
+            r = self._session.post(url, json=body, headers=headers, timeout=timeout)
+        except Exception as e:
+            return {"outcome": ACK_RETRY, "httpStatus": None, "status": "",
+                    "detail": f"request failed: {e}"[:200]}
+        text = (r.text or "").strip()
+        data = _load_error_payload(text)
+        if r.status_code == 200:
+            return {"outcome": ACK_DONE, "httpStatus": 200, "status": str(data.get("status") or ""),
+                    "detail": ""}
+        if r.status_code == 404 and str(data.get("code") or "").upper() == "REMOVAL_REQUEST_NOT_FOUND":
+            return {"outcome": ACK_GONE, "httpStatus": 404, "status": "", "detail": text[:200]}
+        return {"outcome": ACK_RETRY, "httpStatus": int(r.status_code), "status": "",
+                "detail": (text[:200] or f"HTTP {r.status_code}")}
 
     def report_daily_sync(self, *, token: str, ok: bool, error: str | None = None, timeout: int = 10) -> bool:
         """Report the outcome of the scheduled daily 22:00 auto-sync to the backend so the

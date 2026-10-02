@@ -245,6 +245,90 @@ def normalize_access_data_mode(v: Any) -> str:
     return "DEVICE"
 
 
+# ---- ULTRA merge (spec 2026-10-02 sections 3, 4, D6, D10; backend plan 1 "What plan 2 relies on") ----
+CARDS_OFF = "OFF"
+CARDS_TURNSTILE = "TURNSTILE"
+CARDS_PC = "PC"
+_CARD_DECISIONS = (CARDS_OFF, CARDS_TURNSTILE, CARDS_PC)
+
+# Idle back-off ceiling of a device whose cards the PC decides: the ceiling bounds how long a scan
+# waits in the panel's RTLog before the PC sees it (spec section 4: "at most 300 ms").
+PC_DECIDED_MAX_IDLE_POLL_MS = 300
+
+# memberBlockSeconds has no server maximum (backend plan 1 OD-5); Access clamps it (plan 2 OD-5).
+MEMBER_BLOCK_MAX_SECONDS = 3600
+
+
+def effective_card_decision(dev: Dict[str, Any]) -> str:
+    """OFF / TURNSTILE / PC for one device payload or normalized device (camelCase or snake_case).
+
+    Absent, null or an unknown value is TURNSTILE (spec section 6, defensive). PC on a device whose
+    driver is not PullSDK is TURNSTILE too: an MB2000 reports a card it does not hold without its
+    number, so the PC could never decide it (D10; plan 1: "release-1 Access must still refuse to
+    run PC-decided cards on a ZK_STANDALONE driver, whatever arrives"). The driver is the one this
+    PC really uses (device_driver.resolve_device_protocol, local override included).
+    """
+    raw = _safe_str(dev.get("cardDecision") or dev.get("card_decision"), "").strip().upper()
+    if raw not in _CARD_DECISIONS:
+        return CARDS_TURNSTILE
+    if raw == CARDS_PC:
+        try:
+            from app.sdk.device_driver import DeviceProtocol, resolve_device_protocol
+
+            if resolve_device_protocol(dev) != DeviceProtocol.ZK_PULLSDK:
+                return CARDS_TURNSTILE
+        except Exception:
+            return CARDS_TURNSTILE
+    return raw
+
+
+def member_block_seconds(dev: Dict[str, Any]) -> int:
+    """Seconds a member is refused after a PC-decided entry on this device; 0 = off.
+
+    The server's memberBlockSeconds when it sent one, clamped to 0..MEMBER_BLOCK_MAX_SECONDS.
+    Absent or null: the spec section 3 derivation, the server backfill's own rule (plan 1
+    contract): antiFraudeDuration when antiFraudeQrCode is on, or when the device is AGENT and
+    antiFraudeCard is on; otherwise 0. The raw duration is used, as the backfill does, not the
+    5..300 clamp of anti_fraude_duration below.
+    """
+    raw = dev.get("memberBlockSeconds")
+    if raw is None:
+        raw = dev.get("member_block_seconds")
+    if raw is not None and str(raw).strip() != "":
+        return _clamp_int(raw, 0, 0, MEMBER_BLOCK_MAX_SECONDS)
+    duration = _safe_int(dev.get("antiFraudeDuration", dev.get("anti_fraude_duration")), 30)
+    qr_on = _boolish(dev.get("antiFraudeQrCode", dev.get("anti_fraude_qr_code")), True)
+    card_on = _boolish(dev.get("antiFraudeCard", dev.get("anti_fraude_card")), True)
+    agent = normalize_access_data_mode(dev.get("accessDataMode") or dev.get("access_data_mode")) == "AGENT"
+    if qr_on or (agent and card_on):
+        return _clamp_int(duration, 0, 0, MEMBER_BLOCK_MAX_SECONDS)
+    return 0
+
+
+def removal_request_id(dev: Dict[str, Any], key: str) -> Optional[str]:
+    """A pending removal request of a device -- D11 ``fingerprintEraseRequestId``, D13
+    ``cardRemovalRequestId`` (backend plan 1): the UUID stripped and lower-cased, None when absent
+    or blank. The snake_case column name (a cached DB row) is read too."""
+    snake = "".join("_" + c.lower() if c.isupper() else c for c in key)
+    raw = dev.get(key)
+    if raw is None:
+        raw = dev.get(snake)
+    value = _safe_str(raw, "").strip().lower()
+    return value or None
+
+
+def _positive_ids(values: Any) -> List[int]:
+    """Distinct positive ints of a list, in order (the device's allowedMemberships)."""
+    if not isinstance(values, (list, tuple, set)):
+        return []
+    out: List[int] = []
+    for v in values:
+        n = _safe_int(v, 0)
+        if n > 0 and n not in out:
+            out.append(n)
+    return out
+
+
 def normalize_global_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize GymAccessSoftwareSettingsDto (camelCase) into internal snake_case keys.
@@ -370,6 +454,12 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
 
     empty_factor = _clamp_float(dev.get("emptyBackoffFactor"), 1.35, 1.0, 3.0)
     empty_backoff_max = _clamp_int(dev.get("emptyBackoffMaxMs"), 300, 0, 120000)
+    # Cards decided by the PC (spec section 4): at most PC_DECIDED_MAX_IDLE_POLL_MS, whatever is stored.
+    card_decision = effective_card_decision(dev)
+    # ULTRA only: the AGENT engine reads the same key (realtime_agent.py:878), and the backend
+    # backfill gives an unconverted AGENT device cardDecision=PC (plan 1, V127).
+    if card_decision == CARDS_PC and access_data_mode == "ULTRA":
+        empty_backoff_max = min(empty_backoff_max, PC_DECIDED_MAX_IDLE_POLL_MS)
 
     # TOTP/RFID
     totp_enabled = _boolish(dev.get("totpEnabled"), True)
@@ -491,6 +581,16 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
         "rfid_enabled": bool(rfid_enabled),
         "rfid_min_digits": int(rfid_min_digits),
         "rfid_max_digits": int(rfid_max_digits),
+
+        # ULTRA merge (spec section 3): the card choice (D10 applied), the per-member block of
+        # PC-decided entries, and the device's plans (D6, checked by card_decision.py).
+        "card_decision": card_decision,
+        "member_block_seconds": member_block_seconds(dev),
+        "allowed_memberships": _positive_ids(dev.get("allowedMemberships") or dev.get("allowed_memberships")),
+        # Pending one-shot removal requests (D11 fingerprint erase, D13 card removal): read here;
+        # plan 3 runs them and acknowledges them (one /removal-requests/{id}/ack endpoint).
+        "fingerprint_erase_request_id": removal_request_id(dev, "fingerprintEraseRequestId"),
+        "card_removal_request_id": removal_request_id(dev, "cardRemovalRequestId"),
 
         "anti_fraude_card":             _boolish(dev.get("antiFraudeCard"), True),
         "anti_fraude_qr_code":          _boolish(dev.get("antiFraudeQrCode"), True),

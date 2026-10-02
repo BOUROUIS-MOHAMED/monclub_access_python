@@ -491,11 +491,31 @@ def test_the_refresh_reports_an_unreadable_device_table(monkeypatch):
 
 
 # ================================================================== review round 1
-def test_r1_the_refresh_gives_the_scheduler_no_device_without_a_worker(world):
+def test_r1_the_refresh_gives_the_scheduler_no_device_without_a_worker(world, monkeypatch):
     """R1-F2: refresh_devices also replaces the ULTRA scheduler's device list, and the scheduler
-    pushes a device WITHOUT a worker over its own session (the no-worker fallback). A fast patch
-    that adds an ULTRA device must not hand it to the scheduler before the engine restarts."""
+    pushes a device WITHOUT a worker over its own session (the no-worker fallback). ULTRA merge
+    (plan 2, spec section 6 "Taking effect"): a fast patch that adds an ULTRA device starts its
+    worker in the same refresh, BEFORE the scheduler's list is replaced -- so the list still names
+    only devices that have a worker."""
     app, engine = world["app"], world["engine"]
+    started = []
+
+    class _Worker:
+        def __init__(self, **kw):
+            self._device, self._settings, self._stop_evt = kw["device"], kw["settings"], kw["stop_event"]
+            started.append(int(self._device["id"]))
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return True
+
+        def update_device(self, device, settings):
+            self._device, self._settings = device, settings
+
+    monkeypatch.setattr(engine, "_new_worker", lambda **kw: _Worker(**kw))
+    app._request_running_ultra_sync = MagicMock(return_value=True)
     added = dict(_device("MEMBERSHIP"), id=10, name="Sortie", ipAddress="192.168.9.11")
     bundle = {"bundleId": "b-add", "requiresReconcile": False, "items": [{
         "kind": "ENTITY_UPSERT", "entityType": "GYM_DEVICE", "entityId": 10,
@@ -504,7 +524,9 @@ def test_r1_the_refresh_gives_the_scheduler_no_device_without_a_worker(world):
 
     app.apply_fast_patch_bundle(bundle)
 
-    assert [d.get("id") for d in engine._sync_scheduler._devices] == [_DEVICE_ID]
+    assert started == [10]
+    assert sorted(engine._workers) == [_DEVICE_ID, 10]
+    assert sorted(d.get("id") for d in engine._sync_scheduler._devices) == [_DEVICE_ID, 10]
 
 
 def test_r1_a_worker_whose_lease_is_not_drive_still_gets_its_new_device_row(world):

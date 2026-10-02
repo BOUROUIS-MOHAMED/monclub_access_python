@@ -27,7 +27,6 @@ from app.core.access_verification import (
 from app.core.db import (
     get_recent_access_history,
     insert_access_history,
-    count_recent_for_user_door,
     load_sync_cache,
     invalidate_sync_cache,
     get_local_state_generation,
@@ -49,6 +48,12 @@ from app.core.v2 import removed_pins as _removed_pins
 from app.core import zkem_rtlog_filter as _zkem_rtlog
 from app.core.v2 import loss as _v2_loss
 from app.sdk.device_driver import DeviceProtocol, get_driver, resolve_device_protocol
+from app.core import card_decision as _card_decision
+from app.core import device_service_gate as _service_gate
+from app.core import desk_alerts as _desk_alerts
+from app.core import removal_requests as _removal_requests
+from app.core.ultra_pc_entry import PcEntryMixin, _scan_mode_for_event, _uid_for_alert
+from app.core import ultra_worker_pool as _worker_pool
 
 logger = logging.getLogger("zkapp")
 
@@ -146,23 +151,13 @@ def _sync_cache_without_revoked_ids(cache: Any, revoked_ids: set[int] | None) ->
 _CLOCK_SKEW_WARN_SEC = 20.0
 _CLOCK_SKEW_WARN_INTERVAL_SEC = 120.0
 
-# Card/QR re-scan cooldown has TWO distinct jobs that used to be conflated:
-#   1. DEBOUNCE — the C3 controller fires several RTLog events per single scan
-#      (one per door). We must suppress those for a few seconds so the relay
-#      isn't re-pulsed. This is ALWAYS needed, even with anti-fraud off, and is
-#      short (a member can't physically re-enter within it).
-#   2. ANTI-PASSBACK — block re-use of the same card/QR for anti_fraude_duration
-#      seconds. This applies ONLY when anti-fraud is enabled for that scan kind.
-# The old code used a single frozen value (anti_fraude_duration, computed once at
-# init), so disabling anti-fraud still blocked re-entry for the stale 30s. This
-# debounce floor is the cooldown when anti-fraud is off.
+# C3 event-burst debounce. One scan on a C3 panel reaches the RTLog as several events (one per
+# door); the same scanned string inside this window is dropped so the relay is not pulsed twice.
+# It is the ONLY drop before a decision and never reads anti_fraude_*: a member's repeat entries are
+# the member block's job (repeat_guard.py, PC-decided entries, refused with a reason) and the
+# panel's own Intertime (device_sync, C3 doors with a preset). 3.0 s is the value ULTRA has always
+# used here; the field measurement of the C3 burst (spec 2026-10-02 section 12) is what sets it.
 _ULTRA_CARD_DEBOUNCE_SEC = 3.0
-
-# How long a staff member's just-rescued TOTP code stays exempt from the
-# re-entry block. Only needs to span the same code's re-scan window (the code
-# rotates ~every 30s; a fresh code's first scan is never blocked anyway), so a
-# couple of TOTP periods is plenty. The DEBOUNCE floor still applies to staff.
-_ULTRA_STAFF_CODE_TTL_SEC = 120.0
 
 # Minimum spacing between RTLog poll+process passes interleaved into a long
 # device sync (the ``ultra_sync_yield_to_rtlog`` feature). The yield hook fires
@@ -538,7 +533,23 @@ def _set_shared_totp_index(value, gen) -> None:
         pass
 
 
-class UltraDeviceWorker(threading.Thread):
+def _apply_poll_settings(worker: Any, settings: Dict[str, Any]) -> None:
+    """Busy pause, idle pause, back-off factor and ceiling of one worker, from normalized settings.
+
+    The idle ceiling is the WORST-CASE wait of a scan in the panel's RTLog before the PC sees it
+    (an owner measured 1.8-2.3 s at 2000 ms). settings_reader caps it at 300 ms for a device whose
+    cards the PC decides (spec section 4). Called at construction and on every device refresh; a
+    module function so update_device also works on the bare objects some tests hand it.
+    """
+    worker._busy_min = int(settings.get("busy_sleep_min_ms", 0))
+    worker._busy_max = int(settings.get("busy_sleep_max_ms", 50))
+    worker._empty_min = int(settings.get("empty_sleep_min_ms", 200))
+    worker._empty_max = int(settings.get("empty_sleep_max_ms", 500))
+    worker._backoff = float(settings.get("empty_backoff_factor", 1.35))
+    worker._backoff_cap = int(settings.get("empty_backoff_max_ms", 300))
+
+
+class UltraDeviceWorker(PcEntryMixin, threading.Thread):
     """Per-device thread: polls RTLog, classifies events, TOTP rescue."""
 
     def __init__(
@@ -627,28 +638,12 @@ class UltraDeviceWorker(threading.Thread):
         # monotonic() is still < 3600). The startup clock-correction must run.
         self._last_clock_check_mono: float = float("-inf")
         self._device_pc_skew_sec: Optional[float] = None
-        # Card/QR re-scan cooldown state. The effective cooldown is computed
-        # PER EVENT from current settings (see _effective_card_cooldown_sec) so a
-        # dashboard change (e.g. disabling anti-fraud) takes effect immediately
-        # instead of being frozen at the value seen when the worker started.
-        self._card_cooldown: Dict[str, float] = {}  # card_no -> monotonic timestamp
-        # TOTP codes of staff members, exempt from the re-entry block (kept only
-        # for the debounce floor). code -> monotonic expiry. Populated after a
-        # staff TOTP rescue (see _handle_totp_rescue / _effective_card_cooldown_sec).
-        self._staff_codes: Dict[str, float] = {}
+        # C3 event-burst debounce state (see _process_event): card_no -> monotonic timestamp.
+        self._card_cooldown: Dict[str, float] = {}
 
-        # Adaptive sleep settings (same as AGENT mode)
-        self._busy_min = int(settings.get("busy_sleep_min_ms", 0))
-        self._busy_max = int(settings.get("busy_sleep_max_ms", 50))
-        self._empty_min = int(settings.get("empty_sleep_min_ms", 200))
-        self._empty_max = int(settings.get("empty_sleep_max_ms", 500))
-        self._backoff = float(settings.get("empty_backoff_factor", 1.35))
-        # Idle RTLog poll cap. This is the WORST-CASE latency from "member scans the
-        # QR" to "MonClub sees it": the scan sits in the controller's RTLog until the
-        # next poll. The old 2000ms cap made an idle-period scan wait up to ~2s (the
-        # gym owner measured 1.8-2.3s). 300ms keeps it sub-second; the held persistent
-        # connection makes frequent GetRTLog cheap.
-        self._backoff_cap = int(settings.get("empty_backoff_max_ms", 300))
+        # Polling knobs (busy pause, idle pause, back-off factor, ceiling): read here and again
+        # on every device refresh (update_device), so a dashboard change applies live (spec 5).
+        _apply_poll_settings(self, settings)
         self._empty_sleep_ms = float(self._empty_min)
         # M-002: RTLog poll timeout configurable per-device (was hardcoded 15.0)
         self._poll_timeout_sec = float(settings.get("rtlog_poll_timeout_sec", 15.0))
@@ -765,6 +760,8 @@ class UltraDeviceWorker(threading.Thread):
         self._device = device
         self._settings = settings
         self._device_name = str(device.get("name", ""))
+        # Polling knobs apply live too (spec section 5); the next idle pause uses them.
+        _apply_poll_settings(self, settings)
         # Hot-window tunable can change from the dashboard without restarting
         # the worker — read it back on every device refresh.
         try:
@@ -2163,6 +2160,7 @@ class UltraDeviceWorker(threading.Thread):
         roster_stats: Dict[str, Any] = {}
         by_pin = engine._filter_users_for_device(
             users=users_all, device=device, default_door_id=1, stats_out=roster_stats,
+            apply_card_mode=True,
         )
         # Read by _run_standalone_full_sync to refuse removals on an incomplete roster.
         self._last_standalone_roster_stats = roster_stats
@@ -6160,69 +6158,17 @@ class UltraDeviceWorker(threading.Thread):
         self._seen.append(event_id)
         return False
 
-    def _effective_card_cooldown_sec(self, card_no: str) -> float:
-        """Re-scan cooldown for this card/QR, from CURRENT settings.
-
-        Short debounce by default; the longer anti_fraude_duration only when
-        anti-fraud is enabled for this scan kind (QR vs RFID). Read live each
-        event so a dashboard toggle (disable anti-fraud) takes effect at once.
-        """
-        # Staff exemption (TOTP): a staff member's just-rescued code is exempt
-        # from the long re-entry block — only the short debounce floor applies,
-        # so staff re-enter freely while the C3 multi-event burst is still
-        # deduped. RFID can't be exempted (the controller opens it itself).
-        sc = getattr(self, "_staff_codes", None)
-        if sc:
-            exp = sc.get(card_no)
-            if exp is not None and exp > time.monotonic():
-                return float(_ULTRA_CARD_DEBOUNCE_SEC)
-
-        s = self._settings or {}
-        # Pure format check (independent of the totp enable flags) so we consult
-        # the correct anti-fraud toggle for a QR/TOTP code vs an RFID card.
-        prefix = str(s.get("totp_prefix", "9") or "9")
-        try:
-            digits = int(s.get("totp_digits", 6) or 6)
-        except (TypeError, ValueError):
-            digits = 6
-        is_qr = (
-            len(card_no) == len(prefix) + digits
-            and card_no.startswith(prefix)
-            and card_no[len(prefix):].isdigit()
-        )
-        af_on = bool(s.get("anti_fraude_qr_code") if is_qr else s.get("anti_fraude_card"))
-        try:
-            af_dur = int(s.get("anti_fraude_duration") or 0)
-        except (TypeError, ValueError):
-            af_dur = 0
-        if af_on and af_dur > 0:
-            return max(float(_ULTRA_CARD_DEBOUNCE_SEC), float(af_dur))
+    def _burst_debounce_sec(self) -> float:
+        """The C3 event-burst window (_ULTRA_CARD_DEBOUNCE_SEC). A method so a test can turn it off."""
         return float(_ULTRA_CARD_DEBOUNCE_SEC)
 
-    def _is_staff_rfid_card(self, card_no: str) -> bool:
-        """True if ``card_no`` is an RFID card belonging to a STAFF member.
-
-        Lets a staff card's device-blocked re-entry slip past the software
-        re-scan cooldown so it reaches the rescue path (TOTP is handled
-        separately via _staff_codes). Cheap: cached local state (dict lookup) +
-        the cached staff-plan-id set. Never raises."""
+    def _staff_membership_ids(self):
+        """The cached STAFF plan ids (never a DB read on the door path; ultra_pc_entry and the
+        QR verdict read them through here)."""
         try:
-            if self._is_totp_format(card_no):
-                return False
-            if not bool(self._settings.get("ultra_rfid_staff_rescue_enabled", True)):
-                return False
-            _creds, _uam, users_by_card = self._get_cached_local_state()
-            hits = users_by_card.get(card_no) or []
-            staff_ids = get_staff_membership_ids_cached()
-            for u in (hits if isinstance(hits, list) else [hits]):
-                if not isinstance(u, dict):
-                    continue
-                pid = u.get("membershipId")
-                if pid is not None and int(pid) in staff_ids:
-                    return True
+            return get_staff_membership_ids_cached()
         except Exception:
-            return False
-        return False
+            return frozenset()
 
     # ------------------------------------------------------------------ #
     # Event classification (core ULTRA logic)
@@ -6231,6 +6177,8 @@ class UltraDeviceWorker(threading.Thread):
     def _process_event(self, evt: Dict[str, Any]):
         """Classify RTLog event and route to appropriate handler."""
         t0 = time.monotonic()
+        if not _service_gate.in_service(self._settings):
+            return  # In service off: no decision, no popup, no history (spec section 3)
         if not hasattr(self, "_card_cooldown") or not isinstance(self._card_cooldown, dict):
             self._card_cooldown = {}
 
@@ -6251,41 +6199,22 @@ class UltraDeviceWorker(threading.Thread):
             logger.debug(f"{self._prefix} SKIP duplicate event_id={event_id}")
             return
 
-        # Card/QR re-scan cooldown. Computed per-event from CURRENT settings:
-        #   - anti-fraud OFF  -> short debounce only (member can re-enter in ~3s)
-        #   - anti-fraud ON   -> anti_fraude_duration (anti-passback)
-        # The C3 fires several events per single scan; the debounce floor stops
-        # the relay re-pulsing without blocking a deliberate re-entry.
-        # A never-seen card is "never", not 0.0: monotonic counts from boot, so a
-        # 0.0 default put every first scan inside the window while uptime < cooldown.
+        # C3 event-burst debounce: one scan reaches the RTLog as several events (one per door), so
+        # the same scanned string inside the window is dropped and the relay is not pulsed twice.
+        # It is the only drop before a decision and never reads anti_fraude_*: repeat entries are
+        # the member block's job (repeat_guard.py, PC-decided entries, refused with a reason) and
+        # the panel's Intertime. A never-seen card is "never", not 0.0: monotonic counts from boot,
+        # so a 0.0 default put every first scan inside the window while uptime was short.
         if card_no:
-            cooldown = self._effective_card_cooldown_sec(card_no)
             now_mono = time.monotonic()
-            last_seen = self._card_cooldown.get(card_no, float("-inf"))
-            elapsed = now_mono - last_seen
-            if elapsed < cooldown:
-                # A re-scan inside the cooldown window — normally skip. EXCEPTION:
-                # a valid STAFF RFID card must reach the rescue path (the device
-                # blocked its re-entry; the PC re-opens for staff). Only the
-                # debounce floor still applies, so the C3's multi-event burst is
-                # still deduped. (TOTP staff use _staff_codes in the cooldown calc.)
-                if (
-                    elapsed >= float(_ULTRA_CARD_DEBOUNCE_SEC)
-                    and self._is_staff_rfid_card(card_no)
-                ):
-                    logger.debug(
-                        f"{self._prefix} staff RFID re-entry past debounce — "
-                        f"allow through to rescue: card={card_no!r} elapsed={elapsed:.1f}s"
-                    )
-                else:
-                    logger.debug(
-                        f"{self._prefix} SKIP card cooldown: card={card_no!r} "
-                        f"elapsed={elapsed:.1f}s < {cooldown}s"
-                    )
-                    return
+            elapsed = now_mono - self._card_cooldown.get(card_no, float("-inf"))
+            if elapsed < self._burst_debounce_sec():
+                logger.debug(
+                    f"{self._prefix} SKIP event burst: card={card_no!r} elapsed={elapsed:.1f}s"
+                )
+                return
             self._card_cooldown[card_no] = now_mono
-            # Prune old entries to avoid unbounded growth. Anything older than the
-            # max possible cooldown window is safe to evict.
+            # Prune old entries to avoid unbounded growth.
             if len(self._card_cooldown) > 2000:
                 cutoff = now_mono - 600.0
                 self._card_cooldown = {k: v for k, v in self._card_cooldown.items() if v > cutoff}
@@ -6412,6 +6341,10 @@ class UltraDeviceWorker(threading.Thread):
             self._handle_allow(card_no, event_time, event_id, door_id, str(event_type_raw), raw_row)
         elif self._is_totp_format(card_no):
             self._handle_totp_rescue(card_no, event_time, event_id, door_id, raw_row, scan_epoch)
+        elif self._settings.get("card_decision") == "PC":
+            # Cards decided by the PC (spec section 4, C3 only): the turnstile holds no card,
+            # refused this one and reported it; the PC decides (ultra_pc_entry._handle_pc_card).
+            self._handle_pc_card(card_no, event_time, event_id, door_id, str(event_type_raw), raw_row)
         else:
             # Denied, non-TOTP = a denied RFID card. If it is a VALID STAFF
             # member the PC re-opens (staff skip the device re-entry interval);
@@ -6632,6 +6565,7 @@ class UltraDeviceWorker(threading.Thread):
             event_time=event_time,
             door_id=door_id,
             raw=raw_row,
+            user_id=_uid_for_alert(user),
         )
 
         if (time.monotonic() - t0) * 1000 >= 250:
@@ -6765,8 +6699,17 @@ class UltraDeviceWorker(threading.Thread):
         decision_ms = (time.monotonic() - t0) * 1000
         record_totp_roster_check(result, source=self._tel_wid)
 
-        allowed = result.get("allowed", False)
-        reason = result.get("reason", "DENY_TOTP_FAILED")
+        # The PC verdict on top of the matched code (spec section 4, card_decision.py): the
+        # device's plans (D6) and the member block; staff are exempt from the block.
+        verdict = _card_decision.decide_qr(
+            totp_result=result, settings=self._settings, users_by_am=users_by_am,
+            staff_ids=self._staff_membership_ids(), guard=self._member_guard(),
+            now=time.monotonic(),
+        )
+        if result.get("allowed") and not verdict.allowed:
+            self._note_pc_refusal(verdict, kind="qr", door_id=door_id)
+        allowed = verdict.allowed
+        reason = verdict.reason
         user = result.get("user")
         user_name = ""
         user_image = ""
@@ -6806,22 +6749,6 @@ class UltraDeviceWorker(threading.Thread):
         )
 
         if allowed:
-            # Staff exemption: mark this code so a re-scan only pays the debounce
-            # floor, not the re-entry delay. Resolved from the member's plan id
-            # (cached set, no per-scan DB read). RFID is opened by the device
-            # itself, so it can't be exempted this way — TOTP only.
-            try:
-                plan_id = user.get("membershipId") if isinstance(user, dict) else None
-                if plan_id is not None and int(plan_id) in get_staff_membership_ids_cached():
-                    now_m = time.monotonic()
-                    self._staff_codes[code] = now_m + _ULTRA_STAFF_CODE_TTL_SEC
-                    if len(self._staff_codes) > 500:
-                        self._staff_codes = {k: v for k, v in self._staff_codes.items() if v > now_m}
-                    logger.debug(
-                        f"{self._prefix} staff re-entry exemption: plan={plan_id} code={masked_code}"
-                    )
-            except Exception:
-                pass
             # Open door
             logger.info(
                 f"{self._prefix} TOTP_RESCUE opening door: door_id={door_id} "
@@ -6834,6 +6761,7 @@ class UltraDeviceWorker(threading.Thread):
 
             if door_opened:
                 self._totp_rescues += 1
+                self._arm_member_block(verdict)
                 logger.info(
                     f"{self._prefix} TOTP_RESCUE door OPENED: code={masked_code} "
                     f"user={user_name!r} decision={decision_ms:.0f}ms cmd={cmd_ms:.0f}ms"
@@ -6979,120 +6907,6 @@ class UltraDeviceWorker(threading.Thread):
     # DENY handler (passive observation)
     # ------------------------------------------------------------------ #
 
-    def _handle_rfid_rescue(
-        self, card_no: str, event_time: str, event_id: str,
-        door_id: Optional[int], event_type: str, raw_row: Dict[str, Any],
-    ):
-        """PC-side STAFF rescue for a denied RFID card.
-
-        The device denied this card (unknown, or — the common case — its
-        punch-interval re-entry block fired). If the card is a VALID member whose
-        plan is STAFF, the PC re-opens the door so staff skip the re-entry delay.
-        Every other denied card falls through to _handle_deny, so the device's
-        decision (including the interval block) stands for non-staff.
-
-        SECURITY: opens ONLY when verify_card validates the card (RFID enabled,
-        format/length, exactly one active-member match) AND the member's plan is
-        in the cached STAFF set. Never opens a non-staff, unknown, or invalid card.
-        Runs on the worker thread; opens via the held SDK socket (no 2nd Connect).
-        """
-        if not bool(self._settings.get("ultra_rfid_staff_rescue_enabled", True)):
-            self._handle_deny(card_no, event_time, event_id, door_id, event_type, raw_row)
-            return
-
-        t0 = time.monotonic()
-        _creds, _uam, users_by_card = self._get_cached_local_state()
-        vr = verify_card(scanned=card_no, settings=self._settings, users_by_card=users_by_card)
-        user = vr.get("user") if vr.get("allowed") else None
-        plan_id = user.get("membershipId") if isinstance(user, dict) else None
-        is_staff = False
-        staff_n = -1
-        try:
-            staff_ids = get_staff_membership_ids_cached()
-            staff_n = len(staff_ids)
-            is_staff = plan_id is not None and int(plan_id) in staff_ids
-        except Exception:
-            is_staff = False
-
-        # Observability for the staff blind spot (rare — only on RFID deny events):
-        # valid=is the card a recognised active member, staff_n=size of the STAFF
-        # plan set (0 => backend membersType not deployed), staff=matched. Lets the
-        # next gym test tell "backend not deployed" (staff_n=0) from "plan mismatch"
-        # (staff_n>0, valid=1, staff=0) from "unknown card" (valid=0).
-        _tel.event(
-            "RFID_RESCUE_EVAL", worker=self._tel_wid, valid=bool(vr.get("allowed")),
-            staff=is_staff, staff_n=staff_n, plan=plan_id, event_id=event_id,
-        )
-
-        if not (vr.get("allowed") and is_staff):
-            # Not a valid staff card — respect the device's deny.
-            self._handle_deny(card_no, event_time, event_id, door_id, event_type, raw_row)
-            return
-
-        masked = card_no[0] + "*" * (len(card_no) - 2) + card_no[-1] if len(card_no) > 2 else card_no
-        user_name = str(user.get("fullName", user.get("full_name", user.get("name", ""))) or "")
-        logger.info(
-            f"{self._prefix} RFID_STAFF_RESCUE opening: card={masked} user={user_name!r} "
-            f"plan={plan_id} door={door_id} event_id={event_id}"
-        )
-        t_cmd = time.monotonic()
-        door_opened = self._open_door_with_retry(door_id=door_id)
-        cmd_ms = (time.monotonic() - t_cmd) * 1000
-        _tel.event(
-            "RFID_STAFF_RESCUE", worker=self._tel_wid, ok=door_opened,
-            plan=plan_id, cmd_ms=round(cmd_ms), event_id=event_id,
-        )
-
-        # Enrich popup/history from the member (mirror _handle_allow).
-        user_image = str(user.get("image", "") or "")
-        user_profile_image = str(user.get("userProfileImage", "") or "")
-        image_source = str(user.get("imageSource", "") or "")
-        user_image_status = str(user.get("userImageStatus", "") or "")
-        user_phone = str(user.get("phone", "") or "")
-        user_valid_from = str(user.get("validFrom", user.get("valid_from", "")) or "")
-        user_valid_to = str(user.get("validTo", user.get("valid_to", "")) or "")
-        user_membership_id: Optional[int] = None
-        raw_am_id = user.get("activeMembershipId")
-        if raw_am_id is not None:
-            try:
-                user_membership_id = int(str(raw_am_id).strip())
-            except (ValueError, TypeError):
-                pass
-
-        reason = "ALLOW_STAFF_RFID" if door_opened else "DOOR_CMD_FAILED"
-        self._enqueue_notification(
-            event_id=event_id,
-            allowed=door_opened,
-            reason=reason,
-            scan_mode=_scan_mode_for_event(raw_row),
-            user_full_name=user_name,
-            user_image=user_image,
-            user_membership_id=user_membership_id,
-            user_membership_plan_id=plan_id,
-            user_phone=user_phone,
-            user_valid_from=user_valid_from,
-            user_valid_to=user_valid_to,
-            user_birthday=(str(user.get("birthday") or "") if isinstance(user, dict) else ""),
-            image_source=image_source,
-            user_image_status=user_image_status,
-            user_profile_image=user_profile_image,
-            # for the frequent-pass visual alert only
-            user_id=_uid_for_alert(user),
-            door_id=door_id,
-        )
-        self._enqueue_history(
-            event_id=event_id,
-            allowed=door_opened,
-            reason=reason,
-            event_type=event_type,
-            card_no=card_no,
-            event_time=event_time,
-            door_id=door_id,
-            raw=raw_row,
-        )
-        if (time.monotonic() - t0) * 1000 >= 250:
-            _tel.warn("RFID_RESCUE_SLOW", worker=self._tel_wid, dur_ms=round((time.monotonic() - t0) * 1000))
-
     def _handle_deny(
         self, card_no: str, event_time: str, event_id: str,
         door_id: Optional[int], event_type: str, raw_row: Dict[str, Any],
@@ -7160,6 +6974,13 @@ class UltraDeviceWorker(threading.Thread):
         door_id: Optional[int] = None,
     ):
         t0 = time.monotonic()
+        # The desk alerts (desk_alerts.py: Windows toast, daily pass alert, repeat-block sound),
+        # once per decided scan and whether or not the popup is on (spec section 5, D4).
+        _desk_alerts.after_scan(
+            self._settings, device_id=self._device_id, device_name=self._device_name,
+            allowed=allowed, reason=reason, user_id=user_id, user_full_name=user_full_name,
+            user_image=user_image, door_id=door_id, prefix=self._prefix,
+        )
         popup_enabled = self._settings.get("popup_enabled", True)
         if not popup_enabled:
             return
@@ -7202,43 +7023,12 @@ class UltraDeviceWorker(threading.Thread):
         if reason == "DOOR_CMD_FAILED":
             message = "Valid code but door did not open -- try again or use card"
 
-        # ── Frequent-pass VISUAL alert (X passages inside Y minutes) ──
-        # Tells the entry screen that this member already came through recently, so
-        # the front desk can compare the face to the photo.
-        #
-        # THIS NEVER BLOCKS. `allowed`, the door pulse and the access decision were
-        # all settled by the caller before we got here; nothing below is read back
-        # into the decision. Blocking re-entry remains anti_fraude_duration only.
-        _rep_count = 0
-        _rep_limit = 0
-        _rep_window = 0
-        _prev_at = ""
-        try:
-            _rep_limit = int(self._settings.get("frequent_pass_limit") or 0)
-            _rep_window = int(self._settings.get("frequent_pass_window_minutes") or 0)
-            if (
-                allowed
-                and _rep_limit > 1
-                and _rep_window > 0
-                and user_id is not None
-                and door_id is not None
-            ):
-                _prior, _prev_raw = count_recent_for_user_door(
-                    user_id=int(user_id),
-                    device_id=int(self._device_id),
-                    door_id=int(door_id),
-                    window_minutes=_rep_window,
-                )
-                # ULTRA persists history asynchronously (_enqueue_history is drained
-                # on a later tick), so the scan being handled right now is NOT in
-                # access_history yet. Count it explicitly.
-                _total = int(_prior) + 1
-                if _total >= _rep_limit:
-                    _rep_count = _total
-                    _prev_at = str(_prev_raw or "")
-        except Exception as exc:
-            _rep_count, _prev_at = 0, ""
-            logger.warning(f"{self._prefix} frequent-pass alert check failed: {exc}")
+        # Frequent-pass VISUAL alert (X passages inside Y minutes; desk_alerts.frequent_pass).
+        # Never blocks: `allowed` and the door were settled by the caller.
+        rep = _desk_alerts.frequent_pass(
+            self._settings, allowed=allowed, user_id=user_id, device_id=self._device_id,
+            door_id=door_id, prefix=self._prefix,
+        )
 
         try:
             req = NotificationRequest(
@@ -7267,10 +7057,7 @@ class UltraDeviceWorker(threading.Thread):
                 popup_duration_sec=int(self._settings.get("popup_duration_sec", 3)),
                 popup_enabled=True,
                 win_notify_enabled=bool(self._settings.get("win_notify_enabled", False)),
-                repeat_count=_rep_count,
-                repeat_limit=(_rep_limit if _rep_count else 0),
-                repeat_window_min=(_rep_window if _rep_count else 0),
-                previous_entry_at=_prev_at,
+                **rep,
             )
             self._popup_q.put_nowait(req)
             logger.debug(
@@ -7322,6 +7109,8 @@ class UltraDeviceWorker(threading.Thread):
         OLDEST queued record is dropped so the worker never blocks (history is a
         best-effort audit record, and the device's own log retains the event).
         """
+        if not _service_gate.keeps_history(self._settings):
+            return  # Keep entry history off: no row for this device (spec section 3)
         item = {
             "event_id": event_id,
             "door_id": door_id,
@@ -8557,42 +8346,6 @@ class UltraSyncScheduler:
 # ---------------------------------------------------------------------------
 
 
-def _scan_mode_for_event(raw_row: Any, default: str = "RFID_CARD") -> str:
-    """Popup/history scan_mode for one device event.
-
-    ZK_STANDALONE (zkemkeeper / MB2000) reports the verify modality per punch and
-    the driver publishes it as rawRow["scan_mode_hint"] (app/sdk/zk_standalone.py).
-    PullSDK/C3 rows carry no such key, so C2-400 behaviour is byte-identical.
-
-    CONFIDENT OVERRIDE ONLY: only FINGERPRINT is honoured. PASSWORD/UNKNOWN have no
-    branch in the popup's method mapper and would render as "Carte" anyway, so
-    emitting them buys nothing while leaking unmapped values into the scan_mode
-    space that /door-history also consumes.
-    """
-    try:
-        if isinstance(raw_row, dict):
-            if str(raw_row.get("scan_mode_hint") or "").strip().upper() == "FINGERPRINT":
-                return "FINGERPRINT"
-    except Exception:
-        pass
-    return default
-
-
-def _uid_for_alert(user: Any) -> Optional[int]:
-    """userId out of a cached member dict, for the frequent-pass VISUAL alert only.
-
-    Returns None whenever the member could not be resolved, which switches the
-    alert off for that scan. Never raises and never participates in the access
-    decision.
-    """
-    try:
-        if isinstance(user, dict) and user.get("userId") not in (None, ""):
-            return int(str(user.get("userId")).strip())
-    except (ValueError, TypeError):
-        pass
-    return None
-
-
 class UltraEngine:
     """Orchestrates ULTRA mode: sync scheduler + per-device RTLog workers."""
 
@@ -8704,6 +8457,8 @@ class UltraEngine:
         ultra_devices = [d for d in devices if _adm(d) == "ULTRA"]
         # P3b-2: never start a worker for a turnstile another PC drives (reader / lease).
         ultra_devices = _lease_gate.filter_devices(ultra_devices)
+        # In service off (active or accessDevice off): no worker, no scheduler push (spec section 3).
+        ultra_devices = _worker_pool.in_service_only(ultra_devices, self._logger)
 
         all_device_count = len(devices)
         non_ultra = [d for d in devices if _adm(d) != "ULTRA"]
@@ -8763,24 +8518,7 @@ class UltraEngine:
 
         # Start per-device workers first so scheduler can route work to them
         for d, settings in prepared_devices:
-            device_id = int(d.get("id", 0))
-
-            worker = UltraDeviceWorker(
-                device=d,
-                settings=settings,
-                popup_q=self._popup_q,
-                history_q=self._history_q,
-                stop_event=self._stop_event,
-                cfg=self._cfg,
-                on_full_sync_started=self._sync_scheduler._handle_worker_full_sync_started,
-                on_full_sync_finished=self._sync_scheduler._handle_worker_full_sync_finished,
-            )
-            self._workers[device_id] = worker
-            try:
-                worker.start()
-                self._logger.info("[ULTRA] Worker thread started for device id=%s name=%r", device_id, d.get("name"))
-            except Exception as _w_exc:
-                self._logger.error("[ULTRA] Worker thread start FAILED for device id=%s: %s", device_id, _w_exc)
+            _worker_pool.start_worker(self, d, settings)
 
         # Start sync scheduler with worker references so it can route timed work
         self._sync_scheduler.set_workers(self._workers)
@@ -8794,121 +8532,41 @@ class UltraEngine:
             name="UltraWatchdog",
         )
         self._watchdog_thread.start()
+        # One-shot removal requests (D11, D13): run here when this PC drives the turnstile.
+        _removal_requests.start_runner(self)
 
     def refresh_devices(self, devices: List[Dict[str, Any]], *, update_scheduler: bool = True) -> int:
-        """Refresh each running ULTRA worker's device snapshot in place.
+        """Refresh each running worker's device row in place (ultra_worker_pool.refresh_copies):
+        workers keep their device dict (allowedMemberships, doorIds, pinScheme, the card choice...)
+        and a sync or a fast patch makes the database newer. Returns the number refreshed."""
+        return _worker_pool.refresh_copies(self, devices, update_scheduler=update_scheduler)
 
-        Workers cache the device dict at construction (self._device), which is
-        used to filter members against allowedMemberships at push time. When
-        the dashboard edits a device (adds memberships, changes doorIds, etc.)
-        a sync brings the new payload into local SQLite — but the in-memory
-        worker snapshots stay stale, so newly-allowed members get filtered out
-        and pin-deleted instead of pushed. Call this after every sync that
-        returned a refreshed devices section.
+    def reconcile_devices(
+        self, devices: List[Dict[str, Any]], *, stop_undriven: bool, refresh_copies: bool = True,
+    ) -> Dict[str, int]:
+        """Start the worker of each ULTRA device in service this PC drives that has none, stop the
+        worker of a device that left ULTRA or went out of service (and, with stop_undriven, of one
+        this PC no longer drives), then refresh the copies -- without restarting the engine (spec
+        section 6 "Taking effect"). See ultra_worker_pool.reconcile."""
+        return _worker_pool.reconcile(
+            self, devices, stop_undriven=stop_undriven, refresh_copies_too=refresh_copies,
+        )
 
-        ``update_scheduler=False`` refreshes the workers' copies only and leaves the scheduler's
-        device list as it is (the app's refresh while not every worker is driven, review R2-4).
-
-        Returns the number of workers refreshed.
-        """
-        if not self._running:
-            return 0
-
-        from app.core.settings_reader import normalize_device_settings
-
-        def _adm(d):
-            return str(d.get("accessDataMode") or d.get("access_data_mode") or "").strip().upper()
-
-        ultra_all = [d for d in (devices or []) if _adm(d) == "ULTRA"]
-        # The scheduler's list follows the lease (a turnstile this PC does not drive is never
-        # pushed); a worker's device COPY does not: it is data, and a worker left with an old
-        # copy while its lease was away would have every later pass stopped by the pinScheme
-        # guard once the lease came back (review R1-F5, guide §3.2e). Writes stay lease-gated.
-        ultra_devices = _lease_gate.filter_devices(ultra_all)
-
-        refreshed = 0
-        for d in ultra_all:
-            try:
-                device_id = int(d.get("id", 0))
-            except (TypeError, ValueError):
-                continue
-            if device_id <= 0:
-                continue
-            worker = self._workers.get(device_id)
-            if worker is None:
-                continue
-            try:
-                settings = normalize_device_settings(d)
-                d["_settings"] = settings
-                worker.update_device(d, settings)
-                refreshed += 1
-            except Exception as exc:
-                self._logger.warning(
-                    "[ULTRA:%s] refresh_devices failed: %s", device_id, exc
-                )
-
-        if refreshed > 0:
-            self._logger.info(
-                "[ULTRA] refreshed %d worker device snapshot(s) in place", refreshed
-            )
-
-        if self._sync_scheduler is not None and update_scheduler:
-            try:
-                self._sync_scheduler.update_devices(ultra_devices)
-            except Exception as exc:
-                self._logger.warning(
-                    "[ULTRA] sync_scheduler.update_devices failed: %s", exc
-                )
-
-        return refreshed
+    def _new_worker(self, **kwargs: Any) -> "UltraDeviceWorker":
+        """The worker factory, resolved at call time (tests patch UltraDeviceWorker or this)."""
+        return UltraDeviceWorker(**kwargs)
 
     def _watchdog_loop(self):
         """Restart dead UltraDeviceWorker threads every _watchdog_interval_sec seconds.
 
-        This is the SOLE restart mechanism: every restart goes through this watchdog, to
-        avoid races between restarters.
+        This is the SOLE restart mechanism: every restart goes through this watchdog, to avoid
+        races between restarters. A worker removed on purpose (ultra_worker_pool.reconcile) is no
+        longer in _workers and is never restarted.
         """
         self._logger.info("[ULTRA] Watchdog started (interval=%.0fs)", self._watchdog_interval_sec)
         while not self._stop_event.wait(self._watchdog_interval_sec):
             for device_id, worker in list(self._workers.items()):
-                if worker.is_alive():
-                    continue
-                with self._worker_restart_lock:
-                    # Double-check inside lock: another thread may have restarted it
-                    current = self._workers.get(device_id)
-                    if current is not None and current.is_alive():
-                        continue
-                    self._logger.error(
-                        "[ULTRA:%s] watchdog: worker thread is dead — restarting", device_id
-                    )
-                    try:
-                        new_worker = UltraDeviceWorker(
-                            device=worker._device,
-                            settings=worker._settings,
-                            popup_q=self._popup_q,
-                            history_q=self._history_q,
-                            stop_event=self._stop_event,
-                            cfg=self._cfg,
-                            on_full_sync_started=(
-                                self._sync_scheduler._handle_worker_full_sync_started
-                                if self._sync_scheduler
-                                else None
-                            ),
-                            on_full_sync_finished=(
-                                self._sync_scheduler._handle_worker_full_sync_finished
-                                if self._sync_scheduler
-                                else None
-                            ),
-                        )
-                        new_worker.start()
-                        self._workers[device_id] = new_worker
-                        if self._sync_scheduler is not None:
-                            self._sync_scheduler.wake_pending_sync()
-                        self._logger.info("[ULTRA:%s] watchdog: worker restarted OK", device_id)
-                    except Exception as exc:
-                        self._logger.error(
-                            "[ULTRA:%s] watchdog: worker restart FAILED: %s", device_id, exc
-                        )
+                _worker_pool.restart_if_dead(self, device_id, worker)
         self._logger.info("[ULTRA] Watchdog stopped")
 
     def stop(self):

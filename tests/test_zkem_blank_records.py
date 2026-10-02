@@ -36,7 +36,7 @@ def worker():
     w.handled = []
     w._handle_allow = lambda *a, **k: w.handled.append(("allow",) + a)       # type: ignore
     w._handle_rfid_rescue = lambda *a, **k: w.handled.append(("deny",) + a)  # type: ignore
-    w._effective_card_cooldown_sec = lambda card: 0.0
+    w._burst_debounce_sec = lambda: 0.0
     return w
 
 

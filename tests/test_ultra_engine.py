@@ -1354,19 +1354,12 @@ class TestPollWithWatchdogNoThreadLeak:
 
 
 # ---------------------------------------------------------------------------
-# TestCardCooldown — re-scan cooldown: debounce (always) vs anti-passback (only
-# when anti-fraud enabled). Regression for the "wait 30-40s to re-enter even
-# with anti-fraud disabled" production bug (frozen _card_cooldown_sec).
+# TestCardCooldown -- the C3 event-burst debounce is the only drop before a decision. It is the
+# fixed _ULTRA_CARD_DEBOUNCE_SEC and never reads anti_fraude_* (ULTRA merge, spec section 3): a
+# repeat past the debounce reaches its handler, where the member block decides (PC entries).
 # ---------------------------------------------------------------------------
 
 class TestCardCooldown:
-    @patch("app.core.ultra_engine.insert_access_history", return_value=1)
-    @patch("app.core.ultra_engine.load_local_state", return_value=_EMPTY_LOCAL_STATE)
-    def test_antifraud_off_uses_short_debounce(self, mock_lls, mock_iah):
-        worker = _make_worker(settings=_make_settings(
-            anti_fraude_card=False, anti_fraude_qr_code=False, anti_fraude_duration=0))
-        assert worker._effective_card_cooldown_sec("4894671") == _ULTRA_CARD_DEBOUNCE_SEC
-
     @patch("app.core.ultra_engine.insert_access_history", return_value=1)
     @patch("app.core.ultra_engine.load_local_state", return_value=_EMPTY_LOCAL_STATE)
     def test_antifraud_off_blocks_rapid_duplicate_only(self, mock_lls, mock_iah):
@@ -1380,48 +1373,41 @@ class TestCardCooldown:
         # same card within the debounce -> skipped (prevents C3 double-open)
         worker._process_event(_make_event(event_id="c2", event_type=0, card_no=card))
         assert worker._events_processed == 1
-        # debounce elapsed -> re-entry allowed (this was 30-40s before the fix)
+        # debounce elapsed -> re-entry allowed
         worker._card_cooldown[card] = time.monotonic() - (_ULTRA_CARD_DEBOUNCE_SEC + 1.0)
         worker._process_event(_make_event(event_id="c3", event_type=0, card_no=card))
         assert worker._events_processed == 2
 
     @patch("app.core.ultra_engine.insert_access_history", return_value=1)
     @patch("app.core.ultra_engine.load_local_state", return_value=_EMPTY_LOCAL_STATE)
-    def test_antifraud_on_blocks_for_duration(self, mock_lls, mock_iah):
+    def test_anti_fraud_settings_no_longer_lengthen_the_drop(self, mock_lls, mock_iah):
         worker = _make_worker(settings=_make_settings(
-            anti_fraude_card=True, anti_fraude_duration=30))
+            anti_fraude_card=True, anti_fraude_qr_code=True, anti_fraude_duration=300))
         worker._cached_state = _EMPTY_LOCAL_STATE
         worker._cached_state_ts = time.monotonic()
         card = "4894671"
-        assert worker._effective_card_cooldown_sec(card) == 30.0
         worker._process_event(_make_event(event_id="a1", event_type=0, card_no=card))
         assert worker._events_processed == 1
-        worker._card_cooldown[card] = time.monotonic() - 10.0   # < 30 -> blocked
+        worker._card_cooldown[card] = time.monotonic() - 1.0          # inside the burst -> dropped
         worker._process_event(_make_event(event_id="a2", event_type=0, card_no=card))
         assert worker._events_processed == 1
-        worker._card_cooldown[card] = time.monotonic() - 31.0   # > 30 -> allowed
+        worker._card_cooldown[card] = time.monotonic() - (_ULTRA_CARD_DEBOUNCE_SEC + 1.0)  # far below 300
         worker._process_event(_make_event(event_id="a3", event_type=0, card_no=card))
         assert worker._events_processed == 2
 
-    @patch("app.core.ultra_engine.insert_access_history", return_value=1)
-    @patch("app.core.ultra_engine.load_local_state", return_value=_EMPTY_LOCAL_STATE)
-    def test_cooldown_tracks_live_settings_not_frozen(self, mock_lls, mock_iah):
-        worker = _make_worker(settings=_make_settings(
-            anti_fraude_card=True, anti_fraude_duration=30))
-        card = "4894671"
-        assert worker._effective_card_cooldown_sec(card) == 30.0
-        # operator disables anti-fraud -> takes effect immediately (not frozen)
-        worker.update_device(worker._device, _make_settings(
-            anti_fraude_card=False, anti_fraude_qr_code=False, anti_fraude_duration=0))
-        assert worker._effective_card_cooldown_sec(card) == _ULTRA_CARD_DEBOUNCE_SEC
+    def test_the_old_cooldown_helpers_are_gone(self):
+        assert _ULTRA_CARD_DEBOUNCE_SEC == 3.0
+        assert not hasattr(UltraDeviceWorker, "_effective_card_cooldown_sec")
+        assert not hasattr(UltraDeviceWorker, "_is_staff_rfid_card")
+        assert not hasattr(_ue, "_ULTRA_STAFF_CODE_TTL_SEC")
+        assert _make_worker()._burst_debounce_sec() == _ULTRA_CARD_DEBOUNCE_SEC
 
     @patch("app.core.ultra_engine.insert_access_history", return_value=1)
     @patch("app.core.ultra_engine.load_local_state", return_value=_EMPTY_LOCAL_STATE)
     def test_a_never_seen_scan_is_not_in_cooldown_right_after_boot(self, mock_lls, mock_iah, monkeypatch):
         """time.monotonic() counts from boot. A never-seen card/QR used to default to
-        last_seen=0.0, i.e. "seen at boot", so while uptime was below the window
-        (anti-fraud up to 300 s) every first scan was skipped: no popup, no history,
-        and no QR rescue -- the terminal refuses a QR it cannot know."""
+        last_seen=0.0, i.e. "seen at boot", so while uptime was below the window every first
+        scan was skipped: no popup, no history, and no QR rescue."""
         worker = _make_worker(settings=_make_settings(
             anti_fraude_card=True, anti_fraude_qr_code=True, anti_fraude_duration=300,
             totp_prefix="9", totp_digits=6))
@@ -1436,7 +1422,7 @@ class TestCardCooldown:
         worker._process_event(_make_event(event_id="b2", event_type=27, card_no=qr))
         assert worker._handle_allow.call_count == 1, "a first card scan was skipped"
         assert worker._handle_totp_rescue.call_count == 1, "a first QR never reached the rescue"
-        # The anti-passback window still applies from the first scan on.
+        # The burst debounce still applies from the first scan on.
         clock["t"] = 11.0
         worker._process_event(_make_event(event_id="b3", event_type=0, card_no=card))
         worker._process_event(_make_event(event_id="b4", event_type=27, card_no=qr))
@@ -1444,15 +1430,6 @@ class TestCardCooldown:
         clock["t"] = 311.0
         worker._process_event(_make_event(event_id="b5", event_type=0, card_no=card))
         assert worker._handle_allow.call_count == 2
-
-    @patch("app.core.ultra_engine.insert_access_history", return_value=1)
-    @patch("app.core.ultra_engine.load_local_state", return_value=_EMPTY_LOCAL_STATE)
-    def test_qr_uses_qr_antifraud_flag_not_card(self, mock_lls, mock_iah):
-        worker = _make_worker(settings=_make_settings(
-            anti_fraude_card=False, anti_fraude_qr_code=True, anti_fraude_duration=25,
-            totp_prefix="9", totp_digits=6))
-        assert worker._effective_card_cooldown_sec("9123456") == 25.0          # QR/TOTP
-        assert worker._effective_card_cooldown_sec("4894671") == _ULTRA_CARD_DEBOUNCE_SEC  # RFID
 
 
 # ---------------------------------------------------------------------------
@@ -1796,43 +1773,6 @@ def test_request_run_sdk_times_out_without_drain():
 
 
 # ---------------------------------------------------------------------------
-# Staff re-entry exemption (TOTP): staff plans bypass the long re-entry block
-# but still pay the short debounce floor (so the C3 multi-event burst is deduped).
-# ---------------------------------------------------------------------------
-def test_staff_code_exempt_from_reentry_block_keeps_debounce_floor():
-    settings = _make_settings(
-        totp_prefix="9", totp_digits=6,
-        anti_fraude_qr_code=True, anti_fraude_card=True, anti_fraude_duration=30,
-    )
-    worker = _make_worker(settings=settings)
-    qr = "9123456"  # prefix '9' + 6 digits -> QR format
-
-    # Baseline: anti-fraud on -> the full 30s re-entry block.
-    assert worker._effective_card_cooldown_sec(qr) == 30.0
-
-    # Marked as a recently-rescued staff code -> only the debounce floor.
-    worker._staff_codes[qr] = time.monotonic() + 60.0
-    assert worker._effective_card_cooldown_sec(qr) == _ULTRA_CARD_DEBOUNCE_SEC
-
-    # An expired staff entry no longer exempts.
-    worker._staff_codes[qr] = time.monotonic() - 1.0
-    assert worker._effective_card_cooldown_sec(qr) == 30.0
-
-
-def test_non_staff_code_unaffected_by_exemption():
-    settings = _make_settings(
-        totp_prefix="9", totp_digits=6,
-        anti_fraude_qr_code=True, anti_fraude_duration=30,
-    )
-    worker = _make_worker(settings=settings)
-    # A different code, never marked staff, keeps the full block.
-    assert worker._effective_card_cooldown_sec("9777777") == 30.0
-    # And RFID cards are untouched by the staff-code path (not in _staff_codes).
-    worker._staff_codes["9123456"] = time.monotonic() + 60.0
-    assert worker._effective_card_cooldown_sec("9777777") == 30.0
-
-
-# ---------------------------------------------------------------------------
 # RFID staff-rescue (denied + valid + staff -> PC opens, skip delay; else deny).
 # Security-critical: a NEW door-opening path. Confirmed by the on-device log that
 # the C3 fires EVENT=20 (Too Short Punch Interval) with the card on an interval
@@ -1862,19 +1802,6 @@ def _rescue_worker():
     w._cached_state_gen = get_local_state_generation()
     w._cached_state_ts = time.monotonic()
     return w
-
-
-def test_is_staff_rfid_card():
-    w = _rescue_worker()
-    with patch.object(_ue, "get_staff_membership_ids_cached", return_value={_STAFF_PLAN}):
-        assert w._is_staff_rfid_card(_STAFF_CARD) is True
-        assert w._is_staff_rfid_card(_NONSTAFF_CARD) is False
-        assert w._is_staff_rfid_card("00000000") is False      # unknown card
-        assert w._is_staff_rfid_card("91234567") is False       # TOTP format -> not RFID
-    # setting off -> never staff
-    w._settings["ultra_rfid_staff_rescue_enabled"] = False
-    with patch.object(_ue, "get_staff_membership_ids_cached", return_value={_STAFF_PLAN}):
-        assert w._is_staff_rfid_card(_STAFF_CARD) is False
 
 
 def test_rfid_rescue_opens_for_valid_staff():
@@ -1949,13 +1876,16 @@ def test_cooldown_lets_staff_rfid_reentry_reach_rescue():
     w._handle_rfid_rescue.assert_called_once()
 
 
-def test_cooldown_skips_nonstaff_rfid_reentry():
+def test_a_nonstaff_repeat_after_the_debounce_reaches_its_handler():
+    # ULTRA merge (spec section 3): the anti-fraud window no longer hides the repeat of a card the
+    # turnstile decided; past the burst debounce it reaches its handler (here the staff rescue,
+    # which lets the deny stand), so it gets its popup and history.
     w = _rescue_worker()
     w._card_cooldown = {_NONSTAFF_CARD: time.monotonic() - 8.0}
     w._handle_rfid_rescue = MagicMock()
     with patch.object(_ue, "get_staff_membership_ids_cached", return_value={_STAFF_PLAN}):
         w._process_event(_deny_evt(_NONSTAFF_CARD, "e21"))
-    w._handle_rfid_rescue.assert_not_called()   # non-staff -> cooldown skips it (deny stands)
+    w._handle_rfid_rescue.assert_called_once()
 
 
 def test_cooldown_skips_staff_within_debounce_floor():

@@ -41,7 +41,7 @@ def worker(monkeypatch):
     w.handled = []
     w._handle_allow = lambda *a, **k: w.handled.append(a)      # type: ignore[method-assign]
     w._handle_rfid_rescue = lambda *a, **k: w.handled.append(a)  # type: ignore[method-assign]
-    w._effective_card_cooldown_sec = lambda card: 0.0           # re-scans are not debounced here
+    w._burst_debounce_sec = lambda: 0.0                         # re-scans are not debounced here
     w.ages = []
     real_age = w._record_event_age
     w._record_event_age = lambda epoch: (w.ages.append(epoch), real_age(epoch))  # type: ignore
