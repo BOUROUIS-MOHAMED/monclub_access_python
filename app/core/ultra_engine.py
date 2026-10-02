@@ -146,23 +146,13 @@ def _sync_cache_without_revoked_ids(cache: Any, revoked_ids: set[int] | None) ->
 _CLOCK_SKEW_WARN_SEC = 20.0
 _CLOCK_SKEW_WARN_INTERVAL_SEC = 120.0
 
-# Card/QR re-scan cooldown has TWO distinct jobs that used to be conflated:
-#   1. DEBOUNCE — the C3 controller fires several RTLog events per single scan
-#      (one per door). We must suppress those for a few seconds so the relay
-#      isn't re-pulsed. This is ALWAYS needed, even with anti-fraud off, and is
-#      short (a member can't physically re-enter within it).
-#   2. ANTI-PASSBACK — block re-use of the same card/QR for anti_fraude_duration
-#      seconds. This applies ONLY when anti-fraud is enabled for that scan kind.
-# The old code used a single frozen value (anti_fraude_duration, computed once at
-# init), so disabling anti-fraud still blocked re-entry for the stale 30s. This
-# debounce floor is the cooldown when anti-fraud is off.
+# C3 event-burst debounce. One scan on a C3 panel reaches the RTLog as several events (one per
+# door); the same scanned string inside this window is dropped so the relay is not pulsed twice.
+# It is the ONLY drop before a decision and never reads anti_fraude_*: a member's repeat entries are
+# the member block's job (repeat_guard.py, PC-decided entries, refused with a reason) and the
+# panel's own Intertime (device_sync, C3 doors with a preset). 3.0 s is the value ULTRA has always
+# used here; the field measurement of the C3 burst (spec 2026-10-02 section 12) is what sets it.
 _ULTRA_CARD_DEBOUNCE_SEC = 3.0
-
-# How long a staff member's just-rescued TOTP code stays exempt from the
-# re-entry block. Only needs to span the same code's re-scan window (the code
-# rotates ~every 30s; a fresh code's first scan is never blocked anyway), so a
-# couple of TOTP periods is plenty. The DEBOUNCE floor still applies to staff.
-_ULTRA_STAFF_CODE_TTL_SEC = 120.0
 
 # Minimum spacing between RTLog poll+process passes interleaved into a long
 # device sync (the ``ultra_sync_yield_to_rtlog`` feature). The yield hook fires
@@ -627,15 +617,8 @@ class UltraDeviceWorker(threading.Thread):
         # monotonic() is still < 3600). The startup clock-correction must run.
         self._last_clock_check_mono: float = float("-inf")
         self._device_pc_skew_sec: Optional[float] = None
-        # Card/QR re-scan cooldown state. The effective cooldown is computed
-        # PER EVENT from current settings (see _effective_card_cooldown_sec) so a
-        # dashboard change (e.g. disabling anti-fraud) takes effect immediately
-        # instead of being frozen at the value seen when the worker started.
-        self._card_cooldown: Dict[str, float] = {}  # card_no -> monotonic timestamp
-        # TOTP codes of staff members, exempt from the re-entry block (kept only
-        # for the debounce floor). code -> monotonic expiry. Populated after a
-        # staff TOTP rescue (see _handle_totp_rescue / _effective_card_cooldown_sec).
-        self._staff_codes: Dict[str, float] = {}
+        # C3 event-burst debounce state (see _process_event): card_no -> monotonic timestamp.
+        self._card_cooldown: Dict[str, float] = {}
 
         # Adaptive sleep settings (same as AGENT mode)
         self._busy_min = int(settings.get("busy_sleep_min_ms", 0))
@@ -6160,69 +6143,9 @@ class UltraDeviceWorker(threading.Thread):
         self._seen.append(event_id)
         return False
 
-    def _effective_card_cooldown_sec(self, card_no: str) -> float:
-        """Re-scan cooldown for this card/QR, from CURRENT settings.
-
-        Short debounce by default; the longer anti_fraude_duration only when
-        anti-fraud is enabled for this scan kind (QR vs RFID). Read live each
-        event so a dashboard toggle (disable anti-fraud) takes effect at once.
-        """
-        # Staff exemption (TOTP): a staff member's just-rescued code is exempt
-        # from the long re-entry block — only the short debounce floor applies,
-        # so staff re-enter freely while the C3 multi-event burst is still
-        # deduped. RFID can't be exempted (the controller opens it itself).
-        sc = getattr(self, "_staff_codes", None)
-        if sc:
-            exp = sc.get(card_no)
-            if exp is not None and exp > time.monotonic():
-                return float(_ULTRA_CARD_DEBOUNCE_SEC)
-
-        s = self._settings or {}
-        # Pure format check (independent of the totp enable flags) so we consult
-        # the correct anti-fraud toggle for a QR/TOTP code vs an RFID card.
-        prefix = str(s.get("totp_prefix", "9") or "9")
-        try:
-            digits = int(s.get("totp_digits", 6) or 6)
-        except (TypeError, ValueError):
-            digits = 6
-        is_qr = (
-            len(card_no) == len(prefix) + digits
-            and card_no.startswith(prefix)
-            and card_no[len(prefix):].isdigit()
-        )
-        af_on = bool(s.get("anti_fraude_qr_code") if is_qr else s.get("anti_fraude_card"))
-        try:
-            af_dur = int(s.get("anti_fraude_duration") or 0)
-        except (TypeError, ValueError):
-            af_dur = 0
-        if af_on and af_dur > 0:
-            return max(float(_ULTRA_CARD_DEBOUNCE_SEC), float(af_dur))
+    def _burst_debounce_sec(self) -> float:
+        """The C3 event-burst window (_ULTRA_CARD_DEBOUNCE_SEC). A method so a test can turn it off."""
         return float(_ULTRA_CARD_DEBOUNCE_SEC)
-
-    def _is_staff_rfid_card(self, card_no: str) -> bool:
-        """True if ``card_no`` is an RFID card belonging to a STAFF member.
-
-        Lets a staff card's device-blocked re-entry slip past the software
-        re-scan cooldown so it reaches the rescue path (TOTP is handled
-        separately via _staff_codes). Cheap: cached local state (dict lookup) +
-        the cached staff-plan-id set. Never raises."""
-        try:
-            if self._is_totp_format(card_no):
-                return False
-            if not bool(self._settings.get("ultra_rfid_staff_rescue_enabled", True)):
-                return False
-            _creds, _uam, users_by_card = self._get_cached_local_state()
-            hits = users_by_card.get(card_no) or []
-            staff_ids = get_staff_membership_ids_cached()
-            for u in (hits if isinstance(hits, list) else [hits]):
-                if not isinstance(u, dict):
-                    continue
-                pid = u.get("membershipId")
-                if pid is not None and int(pid) in staff_ids:
-                    return True
-        except Exception:
-            return False
-        return False
 
     # ------------------------------------------------------------------ #
     # Event classification (core ULTRA logic)
@@ -6251,41 +6174,22 @@ class UltraDeviceWorker(threading.Thread):
             logger.debug(f"{self._prefix} SKIP duplicate event_id={event_id}")
             return
 
-        # Card/QR re-scan cooldown. Computed per-event from CURRENT settings:
-        #   - anti-fraud OFF  -> short debounce only (member can re-enter in ~3s)
-        #   - anti-fraud ON   -> anti_fraude_duration (anti-passback)
-        # The C3 fires several events per single scan; the debounce floor stops
-        # the relay re-pulsing without blocking a deliberate re-entry.
-        # A never-seen card is "never", not 0.0: monotonic counts from boot, so a
-        # 0.0 default put every first scan inside the window while uptime < cooldown.
+        # C3 event-burst debounce: one scan reaches the RTLog as several events (one per door), so
+        # the same scanned string inside the window is dropped and the relay is not pulsed twice.
+        # It is the only drop before a decision and never reads anti_fraude_*: repeat entries are
+        # the member block's job (repeat_guard.py, PC-decided entries, refused with a reason) and
+        # the panel's Intertime. A never-seen card is "never", not 0.0: monotonic counts from boot,
+        # so a 0.0 default put every first scan inside the window while uptime was short.
         if card_no:
-            cooldown = self._effective_card_cooldown_sec(card_no)
             now_mono = time.monotonic()
-            last_seen = self._card_cooldown.get(card_no, float("-inf"))
-            elapsed = now_mono - last_seen
-            if elapsed < cooldown:
-                # A re-scan inside the cooldown window — normally skip. EXCEPTION:
-                # a valid STAFF RFID card must reach the rescue path (the device
-                # blocked its re-entry; the PC re-opens for staff). Only the
-                # debounce floor still applies, so the C3's multi-event burst is
-                # still deduped. (TOTP staff use _staff_codes in the cooldown calc.)
-                if (
-                    elapsed >= float(_ULTRA_CARD_DEBOUNCE_SEC)
-                    and self._is_staff_rfid_card(card_no)
-                ):
-                    logger.debug(
-                        f"{self._prefix} staff RFID re-entry past debounce — "
-                        f"allow through to rescue: card={card_no!r} elapsed={elapsed:.1f}s"
-                    )
-                else:
-                    logger.debug(
-                        f"{self._prefix} SKIP card cooldown: card={card_no!r} "
-                        f"elapsed={elapsed:.1f}s < {cooldown}s"
-                    )
-                    return
+            elapsed = now_mono - self._card_cooldown.get(card_no, float("-inf"))
+            if elapsed < self._burst_debounce_sec():
+                logger.debug(
+                    f"{self._prefix} SKIP event burst: card={card_no!r} elapsed={elapsed:.1f}s"
+                )
+                return
             self._card_cooldown[card_no] = now_mono
-            # Prune old entries to avoid unbounded growth. Anything older than the
-            # max possible cooldown window is safe to evict.
+            # Prune old entries to avoid unbounded growth.
             if len(self._card_cooldown) > 2000:
                 cutoff = now_mono - 600.0
                 self._card_cooldown = {k: v for k, v in self._card_cooldown.items() if v > cutoff}
@@ -6806,22 +6710,6 @@ class UltraDeviceWorker(threading.Thread):
         )
 
         if allowed:
-            # Staff exemption: mark this code so a re-scan only pays the debounce
-            # floor, not the re-entry delay. Resolved from the member's plan id
-            # (cached set, no per-scan DB read). RFID is opened by the device
-            # itself, so it can't be exempted this way — TOTP only.
-            try:
-                plan_id = user.get("membershipId") if isinstance(user, dict) else None
-                if plan_id is not None and int(plan_id) in get_staff_membership_ids_cached():
-                    now_m = time.monotonic()
-                    self._staff_codes[code] = now_m + _ULTRA_STAFF_CODE_TTL_SEC
-                    if len(self._staff_codes) > 500:
-                        self._staff_codes = {k: v for k, v in self._staff_codes.items() if v > now_m}
-                    logger.debug(
-                        f"{self._prefix} staff re-entry exemption: plan={plan_id} code={masked_code}"
-                    )
-            except Exception:
-                pass
             # Open door
             logger.info(
                 f"{self._prefix} TOTP_RESCUE opening door: door_id={door_id} "
@@ -7208,7 +7096,8 @@ class UltraDeviceWorker(threading.Thread):
         #
         # THIS NEVER BLOCKS. `allowed`, the door pulse and the access decision were
         # all settled by the caller before we got here; nothing below is read back
-        # into the decision. Blocking re-entry remains anti_fraude_duration only.
+        # into the decision. Blocking re-entry is the member block (repeat_guard.py, PC entries)
+        # and the panel's Intertime.
         _rep_count = 0
         _rep_limit = 0
         _rep_window = 0
