@@ -1590,6 +1590,7 @@ class DeviceSyncEngine:
             device=normalized_device,
             default_door_id=default_door_id,
             stats_out=filter_stats,
+            apply_card_mode=True,
         )
         desired_user = desired.get(pin)
 
@@ -2025,6 +2026,9 @@ class DeviceSyncEngine:
             # _filter_users_for_device. Dropping the key here would silently derive
             # MEMBERSHIP pins for a device the backend switched to ACCOUNT.
             "pinScheme": g("pinScheme", "pin_scheme", default=None),
+            # CARD CHOICE (ULTRA merge): OFF / TURNSTILE / PC -- the push paths write no card for
+            # OFF or PC (device_push_rules.roster_for_card_mode). Guide 6.2.
+            "cardDecision": g("cardDecision", "card_decision", default=None),
             "doorPresets": list(g("doorPresets", "door_presets", default=None) or []),
             "fingerprintEnabled": _boolish(g("fingerprintEnabled", "fingerprint_enabled", default=False), False),
             # Per-device fingerprint template-version override (9 or 10) parsed
@@ -2054,6 +2058,7 @@ class DeviceSyncEngine:
         default_door_id: int,
         stats_out: Dict[str, Any] | None = None,
         quiet: bool = False,
+        apply_card_mode: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
         """
         Returns dict(pin -> user).
@@ -2246,6 +2251,10 @@ class DeviceSyncEngine:
             stats_out["skipped_offline_projections"] = offline_projections
             stats_out["dropped_cards"] = dropped_cards
 
+        # The card choice (ULTRA merge): OFF / PC write no card, and nothing at all without
+        # fingerprints. Only the paths that WRITE ask for it; a caller that names members does not.
+        if apply_card_mode:
+            out = _push_rules.roster_for_card_mode(out, device)
         return out
 
     def _collect_templates_for_pin(
@@ -2968,6 +2977,7 @@ class DeviceSyncEngine:
             users=users,
             device=normalized_device,
             default_door_id=default_door_id,
+            apply_card_mode=True,
         )
 
         if local_fp_index is None:
@@ -3212,6 +3222,7 @@ class DeviceSyncEngine:
             desired = self._filter_users_for_device(
                 users=users, device=device, default_door_id=default_door_id,
                 stats_out=filter_stats,
+                apply_card_mode=True,
             )
         desired_pins = set(desired.keys())
         pin_scheme = filter_stats.get("pin_scheme") or device_pin_scheme(device)

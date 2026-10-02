@@ -2159,6 +2159,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         roster_stats: Dict[str, Any] = {}
         by_pin = engine._filter_users_for_device(
             users=users_all, device=device, default_door_id=1, stats_out=roster_stats,
+            apply_card_mode=True,
         )
         # Read by _run_standalone_full_sync to refuse removals on an incomplete roster.
         self._last_standalone_roster_stats = roster_stats

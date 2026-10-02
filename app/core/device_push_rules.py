@@ -100,3 +100,34 @@ def panel_param_items(device: Mapping[str, Any]) -> Tuple[List[str], str]:
             if dn > 0:
                 af_params.append(f"Door{dn}Intertime={af_duration}")
     return drivertime, (",".join(af_params) if af_params else "AntiPassback=0")
+
+
+# Every member-row key that carries a card number (access_verification.load_local_state indexes
+# the same ones); the push itself writes firstCardId (device_sync._compute_desired_hash / user row).
+_CARD_KEYS = frozenset({"firstCardId", "secondCardId", "cardId", "cardNo", "rfid", "rfidCard",
+                        "rfidCardNo", "cardNumber", "cards"})
+
+
+def roster_for_card_mode(desired: Dict[str, Any], device: Mapping[str, Any]) -> Dict[str, Any]:
+    """The roster this device's card choice lets the PC write (spec section 3, D3; plan 2 SD-1/SD-2).
+
+    TURNSTILE (also: absent, unknown, or PC on a non-PullSDK driver, D10): unchanged. OFF and PC:
+    no card is ever written -- the turnstile must hold none, so it refuses every card (PC: and
+    reports it for the PC to decide, card_decision.decide_pc_card). With fingerprints on, each
+    member is written without its card numbers (the fingers need the user row); with fingerprints
+    off nothing is written at all: an AGENT turnstile converted to OFF or PC holds nobody and some
+    cannot hold members (spec section 1, D5), exactly as AGENT left it.
+
+    Applied only by the paths that WRITE (device_sync._filter_users_for_device(apply_card_mode=True)).
+    An empty roster removes nobody in bulk: push_safety.check_bulk_removal refuses every bulk removal
+    against an empty desired roster ("empty_roster"), and the MB2000 MIRROR reconcile stops on an
+    empty roster (ultra_engine._maybe_mirror_reconcile, MIRROR_SKIP_EMPTY_ROSTER).
+    """
+    if effective_card_decision(device) == CARDS_TURNSTILE:
+        return desired
+    if not _boolish(device.get("fingerprintEnabled", device.get("fingerprint_enabled")), False):
+        return {}
+    return {
+        pin: ({k: v for k, v in user.items() if k not in _CARD_KEYS} if isinstance(user, dict) else user)
+        for pin, user in desired.items()
+    }

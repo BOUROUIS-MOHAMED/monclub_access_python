@@ -80,3 +80,102 @@ def test_an_out_of_service_device_is_never_pushed():
     for device in ({"id": 5, "active": False}, {"id": 5, "accessDevice": False}):
         assert eng._run_single_device_sync(cache=cache, device=device, source="t", changed_ids=None,
                                            sync_run_id=None, sdk=object()) is False
+
+
+# ------------------------------------------------------------------ Task 15: roster by card choice
+USERS = [{"activeMembershipId": 5, "userId": 105, "mainAccountId": 700, "membershipId": 7,
+          "fullName": "Alice", "firstCardId": "1005", "fingerprints": []}]
+
+
+def _dev(**extra):
+    d = {"id": 9, "name": "e", "accessDataMode": "ULTRA", "deviceProtocol": "ZK_PULLSDK",
+         "doorIds": [1], "allowedMemberships": []}
+    d.update(extra)
+    return d
+
+
+def test_turnstile_cards_keep_the_roster_unchanged():
+    desired = {"5": {"firstCardId": "1005", "fullName": "Alice"}}
+    assert rules.roster_for_card_mode(desired, _dev()) is desired
+    assert rules.roster_for_card_mode(desired, _dev(cardDecision="TURNSTILE")) is desired
+
+
+@pytest.mark.parametrize("choice", ["PC", "OFF"])
+def test_pc_or_off_without_fingerprints_writes_nothing(choice):
+    desired = {"5": {"firstCardId": "1005"}}
+    assert rules.roster_for_card_mode(desired, _dev(cardDecision=choice, fingerprintEnabled=False)) == {}
+
+
+@pytest.mark.parametrize("choice", ["PC", "OFF"])
+def test_pc_or_off_with_fingerprints_writes_members_without_cards(choice):
+    user = {"firstCardId": "1005", "secondCardId": "2", "cards": ["3"], "fullName": "Alice",
+            "fingerprints": [{"fingerId": 1}]}
+    out = rules.roster_for_card_mode({"5": user}, _dev(cardDecision=choice, fingerprintEnabled=True))
+    assert out == {"5": {"fullName": "Alice", "fingerprints": [{"fingerId": 1}]}}
+    assert user["firstCardId"] == "1005"            # the cached member row is not touched
+
+
+def test_pc_on_a_standalone_terminal_keeps_the_cards_d10():
+    desired = {"5": {"firstCardId": "1005"}}
+    assert rules.roster_for_card_mode(desired, _dev(cardDecision="PC", deviceProtocol="ZK_STANDALONE")) is desired
+
+
+def test_normalize_device_keeps_the_card_decision():
+    assert _engine()._normalize_device(_dev(cardDecision="PC"))["cardDecision"] == "PC"
+
+
+def test_the_push_filter_applies_the_card_choice_only_when_asked():
+    eng = _engine()
+    pc = eng._normalize_device(_dev(cardDecision="PC", fingerprintEnabled=False))
+    assert eng._filter_users_for_device(users=list(USERS), device=dict(pc), default_door_id=15,
+                                        apply_card_mode=True) == {}
+    assert set(eng._filter_users_for_device(users=list(USERS), device=dict(pc), default_door_id=15)) == {"5"}
+    off_fp = eng._normalize_device(_dev(cardDecision="OFF", fingerprintEnabled=True))
+    row = eng._filter_users_for_device(users=list(USERS), device=dict(off_fp), default_door_id=15,
+                                       apply_card_mode=True)["5"]
+    assert "firstCardId" not in row and row["fullName"] == "Alice"
+
+
+def test_every_push_path_asks_for_the_card_choice():
+    import inspect
+
+    import app.core.ultra_engine as ue
+
+    assert "apply_card_mode=True" in inspect.getsource(DeviceSyncEngine._sync_one_device)
+    assert "apply_card_mode=True" in inspect.getsource(DeviceSyncEngine.sync_member_on_connected_sdk)
+    assert "apply_card_mode=True" in inspect.getsource(DeviceSyncEngine.build_device_sync_fingerprint)
+    assert "apply_card_mode=True" in inspect.getsource(ue.UltraDeviceWorker._build_standalone_roster)
+
+
+def test_a_card_choice_change_moves_the_device_hash():
+    hashes = {_fingerprint(_dev(), USERS),
+              _fingerprint(_dev(cardDecision="OFF", fingerprintEnabled=True), USERS),
+              _fingerprint(_dev(cardDecision="PC"), USERS)}
+    assert len(hashes) == 3
+
+
+def test_the_mb2000_roster_writes_no_card_when_cards_are_off():
+    from tests.test_ultra_engine import _make_settings, _make_worker
+
+    off = _make_worker(device=_dev(cardDecision="OFF", fingerprintEnabled=True),
+                       settings=_make_settings(fingerprint_enabled=False))
+    users, _tpl, _hashes = off._build_standalone_roster(SimpleNamespace(users=list(USERS)))
+    assert users == [{"pin": "5", "name": "Alice", "card": ""}]
+    turnstile = _make_worker(device=_dev(), settings=_make_settings(fingerprint_enabled=False))
+    users, _tpl, _hashes = turnstile._build_standalone_roster(SimpleNamespace(users=list(USERS)))
+    assert users == [{"pin": "5", "name": "Alice", "card": "1005"}]
+
+
+def test_the_erase_wizard_still_counts_the_members_of_a_pc_device():
+    from app.core.erase_wizard import refill_roster
+
+    roster = refill_roster(_dev(cardDecision="PC", fingerprintEnabled=False), SimpleNamespace(users=list(USERS)))
+    assert roster["members"] == 1
+
+
+def test_the_worker_still_names_the_member_of_an_account_pin_on_a_pc_device():
+    from tests.test_ultra_engine import _make_worker
+
+    w = _make_worker(device=_dev(cardDecision="PC", fingerprintEnabled=False, pinScheme="ACCOUNT"))
+    alice = dict(USERS[0])
+    assert w._user_for_device_pin("700", {5: alice}) is alice
