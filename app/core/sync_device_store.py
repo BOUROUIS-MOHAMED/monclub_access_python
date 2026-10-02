@@ -150,7 +150,10 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
 
             pin_scheme,
 
-            device_capabilities
+            device_capabilities,
+
+            card_decision, member_block_seconds, fingerprint_erase_request_id,
+            card_removal_request_id
         )
         VALUES (
             ?, ?, ?, ?,
@@ -176,7 +179,8 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             ?,
             ?,
             ?,
-            ?
+            ?,
+            ?, ?, ?, ?
         )
         """,
         (
@@ -260,6 +264,13 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             stored_pin_scheme,
 
             _device_capabilities_to_text(d.get("deviceCapabilities") or d.get("device_capabilities")),
+
+            _card_decision_to_text(d.get("cardDecision", d.get("card_decision"))),
+            _to_int_or_none(d.get("memberBlockSeconds", d.get("member_block_seconds"))),
+            (_safe_str(d.get("fingerprintEraseRequestId") or d.get("fingerprint_erase_request_id"), "")
+             .strip() or None),
+            (_safe_str(d.get("cardRemovalRequestId") or d.get("card_removal_request_id"), "")
+             .strip() or None),
         ),
     )
 
@@ -334,6 +345,13 @@ def _coerce_device_row_to_payload(d: Dict[str, Any]) -> Dict[str, Any]:
         "deviceCapabilities": _device_capabilities_from_stored(
             g("deviceCapabilities", "device_capabilities")
         ),
+
+        # ULTRA merge (backend plan 1 contract). None when the server sent none -- an older
+        # backend or a row stored before this release: settings_reader reads None safely.
+        "cardDecision": g("cardDecision", "card_decision"),
+        "memberBlockSeconds": _to_int_or_none(g("memberBlockSeconds", "member_block_seconds")),
+        "fingerprintEraseRequestId": g("fingerprintEraseRequestId", "fingerprint_erase_request_id"),
+        "cardRemovalRequestId": g("cardRemovalRequestId", "card_removal_request_id"),
 
         "model": g("model"),
         "installedModels": installed,
@@ -422,3 +440,60 @@ def _record_device_pin_scheme_switch(cur: sqlite3.Cursor, d: dict) -> bool:
     from app.core import db as _db
 
     return _db._record_device_pin_scheme_switch(cur, d)
+
+
+def _card_decision_to_text(v: Any) -> Optional[str]:
+    """The card choice as stored: upper-cased, None when absent or blank. Not validated here --
+    an unknown value is kept for diagnosis and read as TURNSTILE (settings_reader)."""
+    s = _safe_str(v, "").strip().upper()
+    return s or None
+
+
+# ULTRA merge (backend plan 1, "What plan 2 relies on"): the device keys the server sends from its
+# release on. All nullable: absent/null has a defined meaning (settings_reader).
+_ULTRA_MERGE_DEVICE_COLUMNS = (
+    ("card_decision", "card_decision TEXT"),
+    ("member_block_seconds", "member_block_seconds INTEGER"),
+    ("fingerprint_erase_request_id", "fingerprint_erase_request_id TEXT"),
+    ("card_removal_request_id", "card_removal_request_id TEXT"),
+)
+
+
+def ensure_ultra_merge_device_columns(conn: sqlite3.Connection, *, table_existed: bool) -> bool:
+    """Add the ULTRA-merge columns to ``sync_devices``; on an EXISTING table, drop ``devicesVersion`` once.
+
+    WHY. The backend fills the new columns with a hand-run backfill that moves no
+    ``devicesVersion`` (plan 1, V127), so an upgraded PC keeps answering ``refreshDevices=false``
+    and would read NULL for values the server holds. NULL is read safely (TURNSTILE, the spec
+    section 3 derivation), but the server's own values must arrive: dropping the device section's
+    only progress token makes the next getSyncData send every device in full -- what
+    ``db._ensure_pin_scheme_column`` does for ``pin_scheme``.
+
+    ATOMIC like that helper: the token DELETE runs before the ALTERs, inside the one transaction
+    ``init_db`` commits, with no ``try``: an error leaves ``init_db`` and rolls both back, and the
+    start stops (guide section 3.2d). The column check reads ``PRAGMA table_info`` directly, which
+    raises on a read error (``db._table_columns`` answers [] instead). A fresh database (no table
+    before ``init_db``) is not an upgrade and keeps its tokens. Returns True when the token was
+    dropped.
+    """
+    present = {str(row[1]) for row in conn.execute("PRAGMA table_info(sync_devices)").fetchall()}
+    missing = [(name, ddl) for name, ddl in _ULTRA_MERGE_DEVICE_COLUMNS if name not in present]
+    if not missing:
+        return False
+    dropped = 0
+    if table_existed:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS sync_version_tokens (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+        )
+        dropped = int(conn.execute(
+            "DELETE FROM sync_version_tokens WHERE key = ?", ("devicesVersion",),
+        ).rowcount or 0)
+    for _name, ddl in missing:
+        conn.execute(f"ALTER TABLE sync_devices ADD COLUMN {ddl}")
+    if table_existed:
+        logging.getLogger(__name__).warning(
+            "[DB] sync_devices gained %s; dropped %d devicesVersion token(s) so the next getSyncData "
+            "re-sends every device (ULTRA merge, plan 2).",
+            ", ".join(name for name, _ in missing), dropped,
+        )
+    return bool(table_existed)

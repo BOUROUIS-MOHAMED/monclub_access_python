@@ -34,6 +34,7 @@ from app.core.sync_device_store import (
     _device_capabilities_from_stored,
     _device_capabilities_to_text,
     _insert_device_row,
+    ensure_ultra_merge_device_columns,
 )
 from shared.auth_state import AuthTokenState, protect_auth_token, unprotect_auth_token
 
@@ -2594,6 +2595,9 @@ def init_db() -> None:
             table_existed=_sync_devices_existed_before,
             column_was_present=_pin_scheme_col_before,
         )
+        # ULTRA merge (plan 2): cardDecision, memberBlockSeconds and the two removal-request ids. On an
+        # existing table devicesVersion is dropped once (sync_device_store), no try (guide 3.2d).
+        ensure_ultra_merge_device_columns(conn, table_existed=_sync_devices_existed_before)
 
         # Opaque per-device capability descriptor (backend deviceCapabilities JSON,
         # e.g. {"fingerprintTemplateVersion": 9}). Stored as the raw JSON string and

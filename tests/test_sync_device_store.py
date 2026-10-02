@@ -69,3 +69,84 @@ def test_a_device_survives_ingest_and_projection(db):
     assert (p["deviceProtocol"], p["pinScheme"]) == ("ZK_PULLSDK", "MEMBERSHIP")
     assert p["deviceCapabilities"] == {"fingerprintTemplateVersion": 9}
     assert [x["doorNumber"] for x in p["doorPresets"]] == [1]
+
+
+# ---------------------------------------------------------------- Task 2: the ULTRA-merge keys
+def test_the_four_ultra_merge_keys_survive_ingest_and_projection(db):
+    _ingest(db, _device(cardDecision="pc", memberBlockSeconds=45,
+                        fingerprintEraseRequestId="0f0e0d0c-0b0a-4908-8706-050403020100",
+                        cardRemovalRequestId="1a2b3c4d-0000-4000-8000-000000000001"))
+
+    [p] = db.list_sync_devices_payload()
+
+    assert p["cardDecision"] == "PC"
+    assert p["memberBlockSeconds"] == 45
+    assert p["fingerprintEraseRequestId"] == "0f0e0d0c-0b0a-4908-8706-050403020100"
+    assert p["cardRemovalRequestId"] == "1a2b3c4d-0000-4000-8000-000000000001"
+    single = db.get_sync_device_payload(42)
+    assert (single["cardDecision"], single["cardRemovalRequestId"]) == ("PC", "1a2b3c4d-0000-4000-8000-000000000001")
+
+
+def test_absent_keys_read_back_as_none(db):
+    _ingest(db, _device())
+
+    [p] = db.list_sync_devices_payload()
+
+    assert (p["cardDecision"], p["memberBlockSeconds"], p["fingerprintEraseRequestId"],
+            p["cardRemovalRequestId"]) == (None, None, None, None)
+
+
+def test_a_zero_member_block_is_kept_as_zero_not_none(db):
+    _ingest(db, _device(memberBlockSeconds=0, cardDecision="TURNSTILE"))
+
+    [p] = db.list_sync_devices_payload()
+
+    assert (p["memberBlockSeconds"], p["cardDecision"]) == (0, "TURNSTILE")
+
+
+def test_init_db_creates_the_columns(db):
+    with db.get_conn() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sync_devices)").fetchall()}
+    assert {"card_decision", "member_block_seconds", "fingerprint_erase_request_id",
+            "card_removal_request_id"} <= cols
+
+
+def _old_table(conn):
+    conn.execute("CREATE TABLE sync_devices (id INTEGER, name TEXT)")
+    conn.execute("CREATE TABLE sync_version_tokens (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute("INSERT INTO sync_version_tokens VALUES ('devicesVersion', 'd1'), ('membersVersion', 'm1')")
+
+
+def _tokens(conn):
+    return dict(conn.execute("SELECT key, value FROM sync_version_tokens").fetchall())
+
+
+def test_an_existing_table_gains_the_columns_and_drops_devices_version_once():
+    import sqlite3
+
+    from app.core.sync_device_store import ensure_ultra_merge_device_columns
+
+    conn = sqlite3.connect(":memory:")
+    _old_table(conn)
+
+    assert ensure_ultra_merge_device_columns(conn, table_existed=True) is True
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sync_devices)").fetchall()}
+    assert {"card_decision", "member_block_seconds", "fingerprint_erase_request_id",
+            "card_removal_request_id"} <= cols
+    assert _tokens(conn) == {"membersVersion": "m1"}
+
+    conn.execute("INSERT INTO sync_version_tokens VALUES ('devicesVersion', 'd2')")
+    assert ensure_ultra_merge_device_columns(conn, table_existed=True) is False
+    assert _tokens(conn) == {"membersVersion": "m1", "devicesVersion": "d2"}
+
+
+def test_a_fresh_table_keeps_its_tokens():
+    import sqlite3
+
+    from app.core.sync_device_store import ensure_ultra_merge_device_columns
+
+    conn = sqlite3.connect(":memory:")
+    _old_table(conn)
+
+    assert ensure_ultra_merge_device_columns(conn, table_existed=False) is False
+    assert _tokens(conn) == {"devicesVersion": "d1", "membersVersion": "m1"}
