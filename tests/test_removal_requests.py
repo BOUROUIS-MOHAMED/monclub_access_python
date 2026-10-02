@@ -287,3 +287,22 @@ def test_the_runner_thread_is_started_once_and_ends_with_the_engine(monkeypatch)
     engine._stop_event.set()
     first.join(timeout=2)
     assert not first.is_alive()
+
+
+# ------------------------------------------------------------------ Task 7: the engine starts it
+def test_the_engine_start_starts_the_removal_runner(monkeypatch):
+    import logging
+
+    import app.core.ultra_engine as ue
+    from tests.test_ultra_worker_pool import _dev, _FakeWorker
+
+    eng = ue.UltraEngine(cfg=None, logger_inst=logging.getLogger("test.removal"))
+    started = []
+    monkeypatch.setattr(eng, "_new_worker", lambda **kw: _FakeWorker([], **kw))
+    monkeypatch.setattr(ue.UltraSyncScheduler, "start", lambda self, devices: None)
+    monkeypatch.setattr(rr, "start_runner", lambda engine: started.append(engine))
+    eng.start([_dev(1)])
+    try:
+        assert started == [eng]
+    finally:
+        eng.stop()

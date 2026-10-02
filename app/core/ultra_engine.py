@@ -51,6 +51,7 @@ from app.sdk.device_driver import DeviceProtocol, get_driver, resolve_device_pro
 from app.core import card_decision as _card_decision
 from app.core import device_service_gate as _service_gate
 from app.core import desk_alerts as _desk_alerts
+from app.core import removal_requests as _removal_requests
 from app.core.ultra_pc_entry import PcEntryMixin, _scan_mode_for_event, _uid_for_alert
 from app.core import ultra_worker_pool as _worker_pool
 
@@ -8531,6 +8532,8 @@ class UltraEngine:
             name="UltraWatchdog",
         )
         self._watchdog_thread.start()
+        # One-shot removal requests (D11, D13): run here when this PC drives the turnstile.
+        _removal_requests.start_runner(self)
 
     def refresh_devices(self, devices: List[Dict[str, Any]], *, update_scheduler: bool = True) -> int:
         """Refresh each running worker's device row in place (ultra_worker_pool.refresh_copies):
