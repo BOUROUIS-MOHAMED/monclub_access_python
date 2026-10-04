@@ -536,6 +536,12 @@ def _stub_heavy_init(monkeypatch) -> None:
     monkeypatch.setattr(app_module, "AgentRealtimeEngine", lambda **kwargs: SimpleNamespace())
     monkeypatch.setattr(app_module, "UltraEngine", lambda **kwargs: SimpleNamespace())
     monkeypatch.setattr(app_module.MainApp, "_sync_startup_registration", lambda self: None)
+    # init_db is stubbed, so the real erase-hold load raises (no device_write_hold table) and fails
+    # closed for the rest of the process: every turnstile held, every later device push skipped.
+    # Callers that record the load set their own stub after this one.
+    from app.core import device_hold
+
+    monkeypatch.setattr(device_hold, "load", lambda **kw: frozenset())
 
 
 def test_init_applies_the_startup_flip_before_the_first_sync_tick(tmp_path, monkeypatch) -> None:
