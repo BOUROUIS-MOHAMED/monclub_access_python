@@ -5628,7 +5628,9 @@ installer through the wrapper below; `updater_exe_name`, `_launch_installer_exe`
   `signedManifest` string must verify (pure-Python Ed25519, `shared/ed25519.py`, RFC 8032
   vectors in `tests/test_updater_v2_ed25519.py`) with a key from
   `shared/release_keys.py::trusted_keys()`, then — parsed only after verification — name
-  this target / platform / channel and the offered version. A normal manifest needs a
+  this target / platform / channel and the offered version, with an `installerName` of
+  the form `monclub_<target>_<version...>.exe` (the name the Setup-running check knows,
+  always a plain file name inside `downloads\`). A normal manifest needs a
   version above the installed one; a rollback manifest (`allowDowngrade=true`) only applies
   when `rollbackFrom` equals the installed version exactly (D8). Versions:
   `shared/update_versions.py`, SemVer precedence with pre-releases (D29, D38), shared table
@@ -5661,9 +5663,11 @@ handler answers 500 with the reason (`local_access_api_v2.py::_handle_component_
 The wrapper (`shared/update_wrapper.py::build_install_script`): wait up to 90 s for the app
 pid → `Start-Process <setup> -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART
 /LOG="{app}\logs\update-<ver>-<utc>.log"' -WorkingDirectory {app}\state -PassThru` and
-`WaitForExit()` on the Setup stub (not `-Wait`, which would also wait for the app Setup
-starts) → on a non-zero exit with no fresh `last_update.json`, write `ABORTED
-setup_exit_<code>` → if Setup left a journal, run the journal restore → if no
+`WaitForExit(30 min)` on the Setup stub (not `-Wait`, which would also wait for the app
+Setup starts; a Setup still running after 30 min is stopped, with every Setup-pattern
+process) → on a non-zero exit with no fresh `last_update.json`, write `ABORTED
+setup_exit_<code>` → if Setup left a journal, run the journal restore (it backs off while
+any Setup-pattern process runs) → if no
 `<exe>` runs from `{app}\current`, start `{app}\current\<exe>` with that working directory. `[TEST: test_updater_v2_files_and_wrapper.py::test_install_wrapper_runs_for_real_writes_aborted_and_relaunches_the_old_app, ::test_install_wrapper_restores_a_journal_setup_left_behind_before_relaunching — real PowerShell, stand-in Setup]`
 `[UNVERIFIED]` that the hidden PowerShell survives the app's exit when the app was started
 by the watchdog's scheduled task (L4 E2E).
@@ -5677,11 +5681,15 @@ by the watchdog's scheduled task (L4 E2E).
    `verifying` / `restoring` → start the restore helper and exit; `backing_up` → delete it,
    `current` is intact. The helper claims the journal (rename to
    `install_journal.restoring-<pid>.json`; a failed rename = another restorer owns it, back
-   off), copies `previous\*` back, writes `ROLLED_BACK interrupted`, restarts the app. Only
-   in a frozen build running from `{app}\current`. `[TEST: test_updater_v2_startup_journal.py, test_updater_v2_files_and_wrapper.py::test_restore_helper_runs_for_real_and_puts_previous_back]`
+   off), copies `previous\*` back, writes `ROLLED_BACK interrupted`, restarts the app. A
+   claim whose `<pid>` still runs means a restore is in progress: the app exits without
+   starting from `current` (the restorer restarts it); a claim whose pid is gone is renamed
+   back to the journal. Only in a frozen build running from `{app}\current`. The Setup
+   pattern allows `_` after the version (L2's `..._TESTFAIL_<x>` builds). `[TEST: test_updater_v2_startup_journal.py, test_updater_v2_files_and_wrapper.py::test_restore_helper_runs_for_real_and_puts_previous_back]`
 2. `MainApp.__init__` (Access), right after `_init_scheduler()` and before any engine is
    built, the date flip, the hold load or the first `_sync_tick`; `TvApp.__init__` before the
-   shell is scheduled: `startup_gate` consumes `last_update.json`, then — frozen builds only —
+   shell is scheduled: `startup_gate` consumes `last_update.json`, then — frozen builds run
+   from `{app}\current` only —
    installs a verified, downloaded, not-banned pending update after a 5 s server re-check
    (still offered → install; paused / withdrawn / replaced → discard; no answer → install,
    it was signed and offered). It raises `UpdateInstallStarted`, which `run_access_app` /
@@ -5703,8 +5711,16 @@ by the watchdog's scheduled task (L4 E2E).
 - Loop guard (`update_state.json` `versions`): result reasons `crash`, `setup_failed`,
   `restore_failed` ban the version from **automatic** install at once; any other failure
   (`health_timeout`, `backup_failed`, `interrupted`, `setup_exit_<n>`, an attempt that left
-  no result at all) is a strike, two strikes ban. `same_version` is no strike. "Restart to
-  update" still works on a banned version; the page warns. `[TEST: ::test_a_crash_bans_the_version_from_auto_install_but_not_from_the_button, ::test_a_health_timeout_gets_exactly_one_automatic_retry, ::test_an_install_that_left_no_result_counts_as_one_strike]`
+  no result at all) is a strike, two strikes ban. A struck version is retried
+  automatically only after the next Windows boot (or 24 h later on a PC never switched
+  off) — not when Setup relaunches the old version seconds after the failure.
+  `same_version` is no strike. "Restart to update" still works on a banned version; the
+  page warns.
+- **Direction of `last_update.json`** (L2's `UpdWriteLastUpdate`, the restore helper, the
+  wrapper): `ROLLED_BACK` from = the version that failed, to = the one restored;
+  `INSTALLED` / `ABORTED` from = before, to = tried. The engine strikes the TRIED version
+  (`_result_versions`); telemetry and the Update page always show before → tried.
+  `[TEST: ::test_regression_l2_rolled_back_json_bans_the_failed_version_not_the_running_one]` `[TEST: ::test_a_crash_bans_the_version_from_auto_install_but_not_from_the_button, ::test_a_health_timeout_gets_exactly_one_automatic_retry, ::test_an_install_that_left_no_result_counts_as_one_strike]`
 
 ### 11.6 Telemetry (D19)
 
