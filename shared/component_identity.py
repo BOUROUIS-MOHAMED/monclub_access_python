@@ -16,7 +16,6 @@ class DesktopComponentIdentity:
     artifact_name: str
     installer_slug: str
     main_exe_name: str
-    updater_exe_name: str
     default_install_root_name: str
     legacy_install_root_names: tuple[str, ...]
     default_local_api_host: str
@@ -30,7 +29,6 @@ _COMPONENTS: dict[DesktopComponentId, DesktopComponentIdentity] = {
         artifact_name="MonClubAccess",
         installer_slug="monclub_access",
         main_exe_name="MonClubAccess.exe",
-        updater_exe_name="MonClubAccessUpdater.exe",
         default_install_root_name="MonClubAccess",
         legacy_install_root_names=("MonClubAccess", "MonClub Access"),
         default_local_api_host="127.0.0.1",
@@ -42,7 +40,6 @@ _COMPONENTS: dict[DesktopComponentId, DesktopComponentIdentity] = {
         artifact_name="MonClubTV",
         installer_slug="monclub_tv",
         main_exe_name="MonClubTV.exe",
-        updater_exe_name="MonClubTVUpdater.exe",
         default_install_root_name="MonClubTV",
         legacy_install_root_names=("MonClubTV", "MonClub TV"),
         default_local_api_host="127.0.0.1",

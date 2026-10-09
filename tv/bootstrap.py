@@ -53,7 +53,12 @@ def create_tv_app():
 
 
 def run_tv_app() -> None:
-    app = create_tv_app()
+    from shared.update_runtime import UpdateInstallStarted
+
+    try:
+        app = create_tv_app()
+    except UpdateInstallStarted:
+        return  # the update wrapper waits for this process to exit (updater v2)
     app.mainloop()
 
 

@@ -96,35 +96,31 @@ class _Api:
         return outcome
 
 
-def _manager(outcomes):
+def _manager(outcomes, install_root):
     import logging
-    import threading
 
+    from shared.component_identity import get_component_identity
     from shared.update_runtime import ComponentUpdateManager
 
     app = _FakeApp()
     api = _Api(outcomes)
-    mgr = ComponentUpdateManager.__new__(ComponentUpdateManager)
-    mgr.cfg = AppConfig()
-    mgr.app = app
-    mgr.logger = logging.getLogger("test.update")
-    mgr._api_factory = lambda: api
-    mgr._lock = threading.RLock()
+    mgr = ComponentUpdateManager(
+        component=get_component_identity("access"),
+        app=app,
+        cfg=AppConfig(),
+        logger=logging.getLogger("test.update"),
+        api_factory=lambda: api,
+        install_root=install_root,
+        keys_provider=lambda: {},
+        auto_install_allowed=False,
+        setup_running=lambda: False,
+    )
     mgr._running = True
-    mgr._after_id = None
-    mgr._worker_running = False
     mgr._token = "tok"
-    mgr._force_download_once = False
-    mgr._check_fail_streak = 0
-    from shared.component_identity import get_component_identity
-    from shared.update_runtime import UpdateStatus
-
-    mgr.component = get_component_identity("access")
-    mgr.status = UpdateStatus()
     mgr.get_current_version = lambda: "1.4.35"
     mgr.get_current_release_id = lambda: "rid"
     mgr.get_current_codename = lambda: ""
-    mgr._set_update_available = lambda *a, **k: None
+    app.scheduled.clear()
     return mgr, app
 
 
@@ -150,9 +146,9 @@ def _run_tick(mgr, app, monkeypatch):
     return app.scheduled[0][1]
 
 
-def test_a_failed_check_is_retried_after_60s_then_5min_then_15min_then_the_interval(monkeypatch):
+def test_a_failed_check_is_retried_after_60s_then_5min_then_15min_then_the_interval(monkeypatch, tmp_path):
     boom = RuntimeError("network down")
-    mgr, app = _manager([boom, boom, boom, boom, {"version": "1.4.35"}, boom])
+    mgr, app = _manager([boom, boom, boom, boom, {"version": "1.4.35"}, boom], tmp_path)
     assert _run_tick(mgr, app, monkeypatch) == 60 * 1000
     assert _run_tick(mgr, app, monkeypatch) == 5 * 60 * 1000
     assert _run_tick(mgr, app, monkeypatch) == 15 * 60 * 1000
@@ -161,6 +157,6 @@ def test_a_failed_check_is_retried_after_60s_then_5min_then_15min_then_the_inter
     assert _run_tick(mgr, app, monkeypatch) == 60 * 1000  # a new failure starts over
 
 
-def test_a_successful_check_keeps_the_normal_interval(monkeypatch):
-    mgr, app = _manager([{"version": "1.4.35"}])
+def test_a_successful_check_keeps_the_normal_interval(monkeypatch, tmp_path):
+    mgr, app = _manager([{"version": "1.4.35"}], tmp_path)
     assert _run_tick(mgr, app, monkeypatch) == THREE_HOURS * 1000

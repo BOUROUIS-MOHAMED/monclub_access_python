@@ -9,48 +9,42 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# _launch_installer_exe
+# The installer always runs silently, through the v2 wrapper (D36)
 # ---------------------------------------------------------------------------
 
-def _call_launch(silent: bool, exe_path: str = r"C:\fake\setup.exe"):
-    """Helper: call _launch_installer_exe and return the Popen call args."""
-    from shared.update_runtime import _launch_installer_exe
-    with patch("shared.update_runtime.subprocess.Popen") as mock_popen:
-        _launch_installer_exe(Path(exe_path), silent=silent)
-        return mock_popen.call_args
+def _wrapper_script() -> str:
+    from shared.update_wrapper import build_install_script
+
+    root = Path(r"C:\Users\x\AppData\Local\MonClubAccess")
+    return build_install_script(
+        app_pid=1,
+        installer=root / "downloads" / "monclub_access_1.5.1.exe",
+        install_root=root,
+        exe_name="MonClubAccess.exe",
+        from_version="1.5.0",
+        to_version="1.5.1",
+        setup_log=root / "logs" / "update-1.5.1-x.log",
+        wrapper_log=root / "logs" / "update-wrapper.log",
+    )
 
 
-def _cmd_contains(call, flag: str) -> bool:
-    """Return True if *flag* appears anywhere in the Popen command list."""
-    cmd = call[0][0]   # first positional arg = the command list
-    return any(flag in part for part in cmd if isinstance(part, str))
+def test_the_wrapper_runs_setup_with_all_silent_flags_and_a_log():
+    script = _wrapper_script()
+    for flag in ("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG="):
+        assert flag in script
 
 
-def test_launch_installer_exe_silent_adds_flags():
-    """Default silent=True must pass /VERYSILENT and /SUPPRESSMSGBOXES.
+def test_the_zip_and_csharp_updater_path_is_gone():
+    """D2: the ZIP path could never work (no --manifest, no updater exe installed)."""
+    import shared.update_runtime as ur
+    from shared.component_identity import get_component_identity
 
-    With the PowerShell wrapper the flags live inside the PS command string
-    rather than as top-level list elements, so we search all parts.
-    """
-    call = _call_launch(silent=True)
-    assert _cmd_contains(call, "/VERYSILENT")
-    assert _cmd_contains(call, "/SUPPRESSMSGBOXES")
-
-
-def test_launch_installer_exe_not_silent_omits_flags():
-    """silent=False must NOT pass silent flags."""
-    call = _call_launch(silent=False)
-    assert not _cmd_contains(call, "/VERYSILENT")
-    assert not _cmd_contains(call, "/SUPPRESSMSGBOXES")
-
-
-def test_launch_installer_exe_default_is_silent():
-    """Calling _launch_installer_exe without silent kwarg must be silent."""
-    from shared.update_runtime import _launch_installer_exe
-    with patch("shared.update_runtime.subprocess.Popen") as mock_popen:
-        _launch_installer_exe(Path(r"C:\fake\setup.exe"))
-        call = mock_popen.call_args
-    assert _cmd_contains(call, "/VERYSILENT")
+    assert not hasattr(ur, "_launch_installer_exe")
+    assert not hasattr(ur, "_updater_exe_path")
+    assert not hasattr(ur.ComponentUpdateManager, "launch_updater_and_exit")
+    assert not hasattr(get_component_identity("access"), "updater_exe_name")
+    source = Path(ur.__file__).read_text(encoding="utf-8")
+    assert "--zip" not in source and "Updater.exe" not in source
 
 
 # ---------------------------------------------------------------------------

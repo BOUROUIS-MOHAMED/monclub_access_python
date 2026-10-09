@@ -27,6 +27,7 @@ from tv.config import (
 from tv.auth_bridge import load_tv_auth_for_runtime
 from tv.store import get_tv_storage_status
 from tv.update_runtime import TvUpdateManager, UpdateStatus
+from shared.update_runtime import UpdateInstallStarted
 
 WINDOWS_STARTUP_ARG = "--monclub-windows-startup"
 
@@ -97,6 +98,10 @@ class TvApp:
         self._update_status: UpdateStatus | None = None
         self._started_from_windows_startup = WINDOWS_STARTUP_ARG in sys.argv[1:]
 
+        # Updater v2 (O1): install a verified pending update before the TV shell starts.
+        if self._run_update_startup_gate():
+            raise UpdateInstallStarted()
+
         self.after(200, self._poll_logs)
         self._sync_startup_registration()
         schedule_tv_shell_startup(self)
@@ -158,6 +163,19 @@ class TvApp:
 
     def _api(self) -> MonClubApi:
         return MonClubApi(endpoints=build_tv_api_endpoints(self.cfg), logger=self.logger)
+
+    def _run_update_startup_gate(self) -> bool:
+        """True = the update wrapper is running and this process must exit now."""
+        try:
+            auth = load_tv_auth_for_runtime()
+            tok = str(getattr(auth, "token", None) or "").strip() if auth else ""
+            if not self._update_manager.startup_gate(token=tok):
+                return False
+            self.logger.info("TV shutting down for a start-up update. pid=%s", os.getpid())
+            return True
+        except Exception:
+            self.logger.exception("[TV Update] start-up update gate failed; starting normally")
+            return False
 
     def _ensure_update_manager_started(self, *, check_now: bool) -> None:
         try:
@@ -286,6 +304,8 @@ class TvApp:
         self._local_api.start()
         start_tv_runtime(self, trigger_source="TV_LOCAL_API_START")
         self.logger.info("TV local API started on %s:%s", host, port)
+        # Health marker for Setup (updater v2): API listening + main loop running.
+        self.after(0, self._update_manager.on_local_api_ready)
 
     def stop_local_api_server(self) -> None:
         if self._local_api:

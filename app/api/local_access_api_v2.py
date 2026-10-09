@@ -6558,14 +6558,10 @@ def _build_update_status_payload(app) -> Dict[str, Any]:
         data["currentReleaseId"] = getattr(um, "get_current_release_id", lambda: "dev")()
         component = getattr(um, "component", None)
         install_root = Path(getattr(um, "install_root", "")) if getattr(um, "install_root", None) else None
-        updater_name = getattr(component, "updater_exe_name", None)
-        updater_path = install_root / "updater" / updater_name if install_root and updater_name else None
         data["componentId"] = getattr(component, "component_id", None)
         data["componentDisplayName"] = getattr(component, "display_name", None)
         data["artifactName"] = getattr(component, "artifact_name", None)
         data["mainExecutable"] = getattr(component, "main_exe_name", None)
-        data["updaterExecutable"] = updater_name
-        data["updaterInstalled"] = bool(updater_path and updater_path.exists())
         data["installRoot"] = str(install_root) if install_root else None
         data["updateEnabled"] = bool(getattr(getattr(app, "cfg", None), "update_enabled", True))
         data["channel"] = getattr(getattr(app, "cfg", None), "update_channel", None)
@@ -6586,6 +6582,15 @@ def _build_update_status_payload(app) -> Dict[str, Any]:
         data["releaseNotes"] = getattr(st, "release_notes", None)
         data["downloadUrl"] = getattr(st, "download_url", None)
         data["minCompatibleVersion"] = getattr(st, "min_compatible_version", None)
+        # Updater v2: why an offer was refused, the loop guard, the installer's last result.
+        data["rollback"] = bool(getattr(st, "rollback", False))
+        data["verifyError"] = getattr(st, "verify_error", None)
+        data["autoInstallBlocked"] = bool(getattr(st, "auto_install_blocked", False))
+        data["autoInstallBlockedReason"] = getattr(st, "auto_install_blocked_reason", None)
+        data["pendingSince"] = getattr(st, "pending_since", None)
+        data["installing"] = bool(getattr(st, "installing", False))
+        last_result = getattr(st, "last_result", None)
+        data["lastResult"] = dict(last_result) if isinstance(last_result, dict) else None
         # Legacy latestRelease block for backward compat
         lr = getattr(st, "latest_release", None)
         if isinstance(lr, dict):
@@ -6628,26 +6633,27 @@ def _handle_component_update_download(ctx: _Ctx) -> None:
 
 
 def _handle_component_update_install(ctx: _Ctx) -> None:
+    """"Restart to update" (updater v2, D1): verify the installer again and start the
+    wrapper FIRST; answer 200 and quit only when it runs. Any failure answers an error and
+    the app keeps running -- it never quits on a failed launch."""
     um = getattr(ctx.app, "_update_manager", None)
     if not um:
         ctx.send_json(400, {"ok": False, "error": "update manager not available"})
         return
     can, reason = um.can_install_now()
     if not can:
-        ctx.send_json(400, {"ok": False, "error": reason})
+        ctx.send_json(409, {"ok": False, "error": reason})
         return
-    ctx.send_json(200, {"ok": True, "message": "launching installer and exiting"})
-    # Schedule quit after response is sent
-    def _do_install():
-        try:
-            um.launch_updater_and_exit()
-        except Exception:
-            pass
-        try:
-            ctx.app.after(0, ctx.app.quit_app)
-        except Exception:
-            pass
-    threading.Timer(0.5, _do_install).start()
+    try:
+        um.launch_install(mode="manual")
+    except Exception as exc:
+        ctx.send_json(500, {"ok": False, "error": str(exc) or "the installer could not be started"})
+        return
+    ctx.send_json(200, {"ok": True, "message": "installer started; the app restarts on the new version"})
+    try:
+        ctx.app.after(500, ctx.app.quit_app)  # let the response reach the UI first
+    except Exception:
+        pass
 
 
 def _handle_update_status(ctx: _Ctx) -> None:
