@@ -23,6 +23,7 @@ from shared.update_files import (
     UpdatePaths,
     journal_decision,
     last_boot_epoch,
+    live_restore_claims,
     previous_is_complete,
     read_json,
     setup_is_running,
@@ -35,11 +36,9 @@ TEST_OVERRIDE_ENV = "MONCLUB_UPDATER_JOURNAL_ROOT"
 
 def _install_root_for(exe_name: str) -> Optional[Path]:
     """``{app}`` when this process is the installed exe in ``{app}\\current``, else None."""
-    override = os.environ.get(TEST_OVERRIDE_ENV)
-    if override:
-        return Path(override)
     if not getattr(sys, "frozen", False):
-        return None
+        override = os.environ.get(TEST_OVERRIDE_ENV)  # tests / source runs only
+        return Path(override) if override else None
     exe = Path(sys.executable)
     if exe.name.lower() != exe_name.lower() or exe.parent.name.lower() != "current":
         return None
@@ -69,6 +68,12 @@ def check_install_journal(
     if root is None:
         return False
     paths = UpdatePaths(Path(root))
+    live = live_restore_claims(paths)
+    if live:
+        # Another restorer (watchdog, wrapper, an earlier start) is rewriting current right
+        # now and restarts the app when done: do not start from a half-restored folder.
+        _note(paths, f"restore in progress ({live[0].name}); exiting without starting")
+        return True
     if not paths.journal.exists():
         return False
     journal = read_json(paths.journal) or {}  # unreadable: phase unknown, "at" unknown = stale

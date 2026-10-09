@@ -27,6 +27,10 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 APP_EXIT_WAIT_MS = 90_000
+# Setup's own worst case: backup + copy + a 300 s health wait + a restore.
+SETUP_WAIT_MS = 30 * 60 * 1000
+# shared/update_files.py::SETUP_IMAGE_RE for PowerShell -match (case-insensitive by default).
+SETUP_IMAGE_PS_RE = r"^monclub_(access|tv)_[0-9][0-9A-Za-z._\-]*\.(exe|tmp)$"
 
 
 def _ps(value: object) -> str:
@@ -92,6 +96,7 @@ def build_install_script(
     to_version: str,
     setup_log: Path,
     wrapper_log: Path,
+    setup_image_re: str = SETUP_IMAGE_PS_RE,
 ) -> str:
     state_dir = install_root / "state"
     current_dir = install_root / "current"
@@ -103,7 +108,7 @@ def build_install_script(
         '{"result":"ABORTED","from":' + _json_str(from_version) + ',"to":' + _json_str(to_version)
         + ',"log":' + _json_str(setup_log) + ',"reason":"setup_exit_'
     )
-    lines = _prelude(wrapper_log) + _restore_function(install_root, exe_name) + [
+    lines = _prelude(wrapper_log) + _setup_functions(setup_image_re) + _restore_function(install_root, exe_name) + [
         f"W ('wrapper start: app pid {int(app_pid)}, installer ' + {_ps(installer)})",
     ] + _wait_for_pid(app_pid) + [
         "$started = (Get-Date).ToUniversalTime()",
@@ -113,9 +118,13 @@ def build_install_script(
         # Touch Handle so ExitCode is kept after exit; WaitForExit on the Setup stub only
         # (Start-Process -Wait would also wait for the app Setup starts).
         "  $null = $p.Handle",
-        "  $p.WaitForExit()",
-        "  $code = $p.ExitCode",
-        "  W ('setup exit ' + $code)",
+        # Bounded: a hung Setup must not keep the gym without its app forever.
+        f"  if ($p.WaitForExit({SETUP_WAIT_MS})) {{ $code = $p.ExitCode; W ('setup exit ' + $code) }}",
+        "  else {",
+        f"    W 'setup still running after {SETUP_WAIT_MS // 60000} min: stopping it'",
+        "    Stop-Setups",
+        "    $code = -2",
+        "  }",
         "} catch { W ('setup did not start: ' + $_); $code = -1 }",
         "if ($code -ne 0) {",
         f"  $lu = {_ps(last_update)}",
@@ -135,6 +144,17 @@ def build_install_script(
     return "\n".join(lines)
 
 
+def _setup_functions(setup_image_re: str) -> List[str]:
+    """``Get-Setups`` / ``Stop-Setups``: MonClub Setup processes by image name, the rule of
+    shared/update_files.py::SETUP_IMAGE_RE (the stub .exe and Inno's .tmp worker)."""
+    return [
+        "function Get-Setups { try { @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { "
+        f"$_.Name -match {_ps(setup_image_re)} }}) }} catch {{ @() }} }}",
+        "function Stop-Setups { foreach ($q in (Get-Setups)) { try { Stop-Process -Id $q.ProcessId -Force -ErrorAction Stop; "
+        "W ('stopped ' + $q.Name + ' pid ' + $q.ProcessId) } catch {} } }",
+    ]
+
+
 def _restore_function(install_root: Path, exe_name: str) -> List[str]:
     """PowerShell ``Restore-Journal`` -- the journal contract of design 8.0 (L2/L3 2026-10-09).
 
@@ -151,6 +171,7 @@ def _restore_function(install_root: Path, exe_name: str) -> List[str]:
         f"  $prev = {_ps(install_root / 'previous')}",
         "  $journal = Join-Path $state 'install_journal.json'",
         "  if (-not (Test-Path -LiteralPath $journal)) { return 'none' }",
+        "  if (@(Get-Setups).Count -gt 0) { W 'a Setup is still running; leaving the journal to it'; return 'backoff' }",
         "  $claimName = 'install_journal.restoring-' + $PID + '.json'",
         "  $claim = Join-Path $state $claimName",
         "  try { Rename-Item -LiteralPath $journal -NewName $claimName -ErrorAction Stop }",
@@ -190,10 +211,17 @@ def _restore_function(install_root: Path, exe_name: str) -> List[str]:
     ]
 
 
-def build_restore_script(*, app_pid: int, install_root: Path, exe_name: str, restore_log: Path) -> str:
+def build_restore_script(
+    *,
+    app_pid: int,
+    install_root: Path,
+    exe_name: str,
+    restore_log: Path,
+    setup_image_re: str = SETUP_IMAGE_PS_RE,
+) -> str:
     """The start-up journal check's external half: the running app cannot overwrite its
     own locked files in current. Waits for the app to exit, restores, relaunches."""
-    lines = _prelude(restore_log) + _restore_function(install_root, exe_name) + [
+    lines = _prelude(restore_log) + _setup_functions(setup_image_re) + _restore_function(install_root, exe_name) + [
         f"W ('restore helper start: app pid {int(app_pid)}')",
     ] + _wait_for_pid(app_pid) + [
         "$outcome = Restore-Journal",

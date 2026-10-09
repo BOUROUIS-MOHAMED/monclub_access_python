@@ -28,8 +28,11 @@ from typing import Any, Callable, Dict, Iterable, Optional
 JOURNAL_STALE_SEC = 10 * 60
 
 # Inno Setup runs as monclub_<target>_<ver>.exe, which starts the real work as
-# %TEMP%\is-XXXXX.tmp\monclub_<target>_<ver>.tmp (L2, 2026-10-09; the watchdog uses the same rule).
-SETUP_IMAGE_RE = re.compile(r"^monclub_(access|tv)_[0-9][0-9A-Za-z.\-]*\.(exe|tmp)$", re.IGNORECASE)
+# %TEMP%\is-XXXXX.tmp\monclub_<target>_<ver>.tmp (L2, 2026-10-09; the watchdog uses the same
+# rule). "_" is allowed after the version for L2's failure-injection test builds
+# (monclub_access_<ver>_TESTFAIL_<x>.exe), which must also count as a running Setup.
+SETUP_IMAGE_RE = re.compile(r"^monclub_(access|tv)_[0-9][0-9A-Za-z._\-]*\.(exe|tmp)\Z", re.IGNORECASE)
+CLAIM_GLOB = "install_journal.restoring-*.json"
 
 
 @dataclass(frozen=True)
@@ -259,6 +262,39 @@ def consume_marker(data: Dict[str, Any]) -> str:
     return json.dumps(data, sort_keys=True, ensure_ascii=True)
 
 
+def live_restore_claims(paths: UpdatePaths, processes: Optional[Dict[int, str]] = None) -> list[Path]:
+    """Claimed journals (``install_journal.restoring-<pid>.json``) whose restorer still runs.
+
+    While one exists, ``current`` is being rewritten: nothing may start from it. A claim whose
+    pid is gone is a restorer that died -- it is handed back as a journal (renamed back)."""
+    live: list[Path] = []
+    procs = running_process_names() if processes is None else processes
+    for claim in sorted(paths.state_dir.glob(CLAIM_GLOB)) if paths.state_dir.is_dir() else []:
+        m = re.match(r"^install_journal\.restoring-(\d+)\.json\Z", claim.name)
+        pid = int(m.group(1)) if m else -1
+        if procs is None:
+            # Unknown process list: trust a fresh claim only (a restore takes seconds),
+            # never block start-up forever on an old one.
+            try:
+                fresh = (time.time() - claim.stat().st_mtime) < JOURNAL_STALE_SEC
+            except OSError:
+                fresh = False
+            if fresh:
+                live.append(claim)
+                continue
+        elif pid in procs:
+            live.append(claim)
+            continue
+        try:
+            if not paths.journal.exists():
+                os.replace(claim, paths.journal)
+            else:
+                claim.unlink()
+        except OSError:
+            live.append(claim)
+    return live
+
+
 def find_setup_names(names: Iterable[str]) -> list[str]:
     return [n for n in names if SETUP_IMAGE_RE.match(n or "")]
 
@@ -270,6 +306,7 @@ __all__ = [
     "consume_marker",
     "find_setup_names",
     "journal_decision",
+    "live_restore_claims",
     "last_boot_epoch",
     "parse_utc_iso",
     "previous_is_complete",

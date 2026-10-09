@@ -103,6 +103,7 @@ def env(tmp_path, monkeypatch):
     app, api, session = FakeApp(), FakeApi(), FakeSession()
     launched: List[Dict[str, Any]] = []
     clock = {"now": 1_800_000_000.0}
+    boot = {"epoch": 1_799_000_000.0}
 
     def launcher(script, *, cwd):
         launched.append({"script": script, "cwd": cwd})
@@ -116,6 +117,7 @@ def env(tmp_path, monkeypatch):
             api_factory=lambda: api, install_root=tmp_path / target, keys_provider=lambda: TEST_KEYRING,
             auto_install_allowed=True, launcher=launcher, setup_running=lambda: False,
             clock=lambda: clock["now"], pc_key_provider=lambda: "pc-uuid-1",
+            boot_epoch=lambda: boot["epoch"],
         )
         params.update(kw)
         mgr = ur.ComponentUpdateManager(**params)
@@ -124,7 +126,7 @@ def env(tmp_path, monkeypatch):
         return mgr
 
     return SimpleNamespace(make=make, app=app, api=api, session=session, launched=launched,
-                           installed=installed, clock=clock, root=tmp_path)
+                           installed=installed, clock=clock, boot=boot, root=tmp_path)
 
 
 class _Logger:
@@ -407,11 +409,22 @@ def test_startup_skips_while_a_setup_is_running(env):
 
 # ------------------------------------------------------------------ results + loop guard
 
-def _write_result(mgr, **fields):
-    data = {"from": "1.5.0", "to": "1.5.1", "log": "C:\\x.log", "at": utc_now_iso()}
+def _write_result(mgr, *, result, reason="", tried="1.5.1", before="1.5.0", **fields):
+    """A result in the writers' real field order (L2 update_safety.iss UpdWriteLastUpdate,
+    the restore helper, the wrapper): ROLLED_BACK names the transition back, so from = the
+    version that failed, to = the one restored; INSTALLED / ABORTED from = before, to = tried."""
+    if result == "ROLLED_BACK":
+        data = {"result": result, "from": tried, "to": before}
+    else:
+        data = {"result": result, "from": before, "to": tried}
+    data.update({"reason": reason, "log": "C:\\x.log", "at": utc_now_iso()})
     data.update(fields)
     mgr.paths.state_dir.mkdir(parents=True, exist_ok=True)
     mgr.paths.last_update.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _new_boot(env):
+    env.boot["epoch"] = env.clock["now"] + 1
 
 
 def test_a_crash_bans_the_version_from_auto_install_but_not_from_the_button(env):
@@ -419,30 +432,88 @@ def test_a_crash_bans_the_version_from_auto_install_but_not_from_the_button(env)
     mgr.launch_install(mode="startup")
     _write_result(mgr, result="ROLLED_BACK", reason="crash")
     assert mgr.startup_gate(token="tok") is False
+    _new_boot(env)
+    assert mgr.startup_gate(token="tok") is False  # not at the next boot either
     assert len(env.launched) == 1
     assert mgr.status.auto_install_blocked is True and "crash" in mgr.status.auto_install_blocked_reason
+    assert _state(mgr)["versions"]["1.5.1"]["banned"] is True and "1.5.0" not in _state(mgr)["versions"]
     assert not mgr.paths.last_update.exists() and mgr.paths.last_update_consumed.exists()
     assert mgr.launch_install(mode="manual") == 4321  # the button still works
 
 
-def test_a_health_timeout_gets_exactly_one_automatic_retry(env):
+def test_regression_l2_rolled_back_json_bans_the_failed_version_not_the_running_one(env):
+    """Review C1: the literal JSON of UpdWriteLastUpdate(..., 'ROLLED_BACK', '{#AppVersion}',
+    UpdFromVersion, 'crash') -- from = the new (failed) version. Without an open attempt."""
+    mgr = _pending_ready(env)
+    mgr.paths.last_update.write_text(
+        '{"result":"ROLLED_BACK","from":"1.5.1","to":"1.5.0","reason":"crash",'
+        '"log":"C:\\\\Users\\\\x\\\\MonClubAccess\\\\logs\\\\update-1.5.1.log","at":"2026-10-10T07:01:02Z"}',
+        encoding="ascii",
+    )
+    assert mgr.startup_gate(token="tok") is False
+    assert env.launched == []
+    st = _state(mgr)
+    assert st["versions"]["1.5.1"]["banned"] is True and "1.5.0" not in st["versions"]
+    assert (st["lastResult"]["from"], st["lastResult"]["to"]) == ("1.5.0", "1.5.1")
+    event = [e for e in st["outbox"] if e["result"] == "ROLLED_BACK"][0]
+    assert (event["fromVersion"], event["toVersion"]) == ("1.5.0", "1.5.1")
+
+
+def test_regression_restore_helper_json_strikes_the_abandoned_version(env):
+    """Review C1: the restore helper writes from = journal.to (abandoned), to = journal.from."""
+    mgr = _pending_ready(env)
+    mgr.paths.last_update.write_text(
+        '{"result":"ROLLED_BACK","from":"1.5.1","to":"1.5.0","reason":"interrupted","log":"x","at":"2026-10-10T07:01:02Z"}',
+        encoding="ascii",
+    )
+    mgr.consume_results(at_boot=True)
+    assert _state(mgr)["versions"]["1.5.1"]["strikes"] == 1 and "1.5.0" not in _state(mgr)["versions"]
+
+
+def test_a_health_timeout_is_retried_once_at_the_next_pc_start_not_at_the_relaunch(env):
     mgr = _pending_ready(env)
     mgr.launch_install(mode="startup")
     _write_result(mgr, result="ROLLED_BACK", reason="health_timeout")
-    assert mgr.startup_gate(token="tok") is True  # retry once
+    assert mgr.startup_gate(token="tok") is False  # Setup relaunched the old version: same boot
+    _new_boot(env)
+    assert mgr.startup_gate(token="tok") is True  # next morning: one retry
     _write_result(mgr, result="ROLLED_BACK", reason="health_timeout", at="2026-10-10T08:00:01Z")
-    assert mgr.startup_gate(token="tok") is False
+    _new_boot(env)
+    assert mgr.startup_gate(token="tok") is False  # second failure: banned
     assert mgr.status.auto_install_blocked is True
+
+
+def test_a_struck_version_is_retried_after_24h_on_a_pc_never_switched_off(env):
+    mgr = _pending_ready(env)
+    mgr.launch_install(mode="startup")
+    _write_result(mgr, result="ROLLED_BACK", reason="health_timeout")
+    assert mgr.startup_gate(token="tok") is False
+    env.clock["now"] += 24 * 3600
+    assert mgr._auto_install(token="tok", mode="fallback") is True
 
 
 def test_an_install_that_left_no_result_counts_as_one_strike(env):
     mgr = _pending_ready(env)
     mgr.launch_install(mode="startup")
     env.clock["now"] += 600
-    assert mgr.startup_gate(token="tok") is True  # first: no result -> one retry
+    assert mgr.startup_gate(token="tok") is False  # no result: one strike, retry next boot
+    _new_boot(env)
     env.clock["now"] += 600
+    assert mgr.startup_gate(token="tok") is True
+    env.clock["now"] += 600
+    _new_boot(env)
     assert mgr.startup_gate(token="tok") is False  # second: banned
     assert [e["result"] for e in _state(mgr)["outbox"]].count("ABORTED") == 2
+
+
+def test_a_result_racing_with_itself_counts_once(env):
+    mgr = _pending_ready(env)
+    data = {"result": "ROLLED_BACK", "from": "1.5.1", "to": "1.5.0", "reason": "health_timeout", "at": "x"}
+    from shared.update_files import consume_marker
+
+    assert mgr._apply_result(data, consume_marker(data)) is not None
+    assert mgr._apply_result(data, consume_marker(data)) is None  # the second thread sees it applied
+    assert _state(mgr)["versions"]["1.5.1"]["strikes"] == 1
 
 
 def test_installed_result_clears_pending_reports_and_measures_duration(env):
@@ -450,7 +521,7 @@ def test_installed_result_clears_pending_reports_and_measures_duration(env):
     mgr.launch_install(mode="startup")
     env.clock["now"] += 95
     env.installed["version"] = "1.5.1"
-    _write_result(mgr, result="INSTALLED")
+    _write_result(mgr, result="INSTALLED", reason="")
     mgr.consume_results()
     st = _state(mgr)
     assert "pending" not in st and "attempt" not in st
@@ -547,3 +618,12 @@ def test_the_outbox_is_bounded(env):
     for i in range(ur.OUTBOX_MAX + 10):
         mgr.emit_event("DOWNLOAD_FAILED", to_version=f"1.5.{i}", flush=False)
     assert len(_state(mgr)["outbox"]) == ur.OUTBOX_MAX
+
+
+def test_a_frozen_exe_outside_current_never_auto_installs(env, monkeypatch, tmp_path):
+    """Review M2: the wrapper would relaunch {root}/current/<exe>, which is not there."""
+    monkeypatch.setattr(ur, "is_frozen", lambda: True)
+    monkeypatch.setattr(ur, "runtime_base_dir", lambda: tmp_path / "copied-build")
+    assert env.make(auto_install_allowed=None)._auto_install_allowed is False
+    monkeypatch.setattr(ur, "runtime_base_dir", lambda: tmp_path / "MonClubAccess" / "current")
+    assert env.make(auto_install_allowed=None)._auto_install_allowed is True

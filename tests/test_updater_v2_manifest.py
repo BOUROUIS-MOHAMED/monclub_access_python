@@ -110,6 +110,9 @@ def test_allow_downgrade_without_rollback_from_is_refused():
         {"installerName": "..\\evil.exe"},
         {"installerName": "C:/x/setup.exe"},
         {"installerName": "setup.msi"},
+        {"installerName": "setup.exe"},
+        {"installerName": "monclub_tv_1.5.1.exe"},  # another target's installer
+        {"installerName": "monclub_access_1.5.1.exe\n"},
         {"installerSha256": "ABC"},
         {"installerSha256": "A" * 64},
         {"installerSize": 0},
@@ -132,3 +135,16 @@ def test_installer_url_must_be_https_or_this_pc():
 def test_canonical_manifest_is_sorted_compact_ascii():
     text = canonical_manifest({"b": 1, "a": "\u00e9"})
     assert text == '{"a":"\\u00e9","b":1}'
+
+
+def test_a_failure_injection_test_build_name_is_accepted():
+    offer = make_offer(fields=manifest_fields(name="monclub_access_1.5.1_TESTFAIL_health.exe"))
+    assert _verify(offer).installer_name == "monclub_access_1.5.1_TESTFAIL_health.exe"
+
+
+def test_a_signature_with_a_trailing_newline_is_refused():
+    offer = make_offer()
+    offer["manifestSignature"] = offer["manifestSignature"] + "\n"
+    assert _verify(offer)  # stripped by the reader: still the same 128 hex
+    offer["manifestSignature"] = offer["manifestSignature"].strip() + "0"
+    assert _refused(offer).code == "BAD_SIGNATURE"

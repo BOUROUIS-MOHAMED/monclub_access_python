@@ -81,6 +81,18 @@ def test_setup_detection_by_image_name_and_pid():
     assert uf.setup_is_running({1: "explorer.exe", 2: "MonClubAccess.exe"}) is False
     assert uf.setup_is_running({4242: "monclub_access_1.5.1.tmp"}, setup_pid=4242) is True
     assert uf.setup_is_running({}) is False
+    # L2's failure-injection builds must count too (review H1).
+    assert uf.setup_is_running({7: "monclub_access_1.5.1_TESTFAIL_health.tmp"}) is True
+    assert uf.setup_is_running({7: "monclub_access_1.5.1.exe.bak"}) is False
+
+
+def test_a_live_restore_claim_is_reported_and_a_dead_one_is_handed_back(tmp_path):
+    paths = uf.UpdatePaths(tmp_path)
+    paths.state_dir.mkdir()
+    (paths.state_dir / "install_journal.restoring-111.json").write_text("{}", encoding="ascii")
+    assert [p.name for p in uf.live_restore_claims(paths, {111: "powershell.exe"})] == ["install_journal.restoring-111.json"]
+    assert uf.live_restore_claims(paths, {222: "powershell.exe"}) == []
+    assert paths.journal.exists() and not (paths.state_dir / "install_journal.restoring-111.json").exists()
 
 
 def test_an_unreadable_process_list_counts_as_setup_running(monkeypatch):
@@ -130,7 +142,8 @@ def test_wrapper_runs_setup_silently_with_a_quoted_log_and_neutral_cwd(tmp_path)
     assert str(root / "logs" / "update-1.5.1-20261010080000.log") in script
     assert f"-WorkingDirectory '{root / 'state'}' -PassThru" in script
     assert "Get-Process -Id 1234" in script
-    assert "$p.WaitForExit()" in script and " -Wait " not in script
+    assert f"$p.WaitForExit({uw.SETUP_WAIT_MS})" in script and " -Wait " not in script
+    assert "Stop-Setups" in script  # a hung Setup is stopped, then the journal restore runs
     # The relaunch starts current\<exe> from current, only when not already running.
     assert f"'{root / 'current' / 'MonClubAccess.exe'}'" in script
     assert f"-WorkingDirectory '{root / 'current'}'" in script
@@ -186,6 +199,11 @@ def test_setup_log_path_is_under_logs_with_version_and_utc_stamp(tmp_path):
 
 # ------------------------------------------------------------------ real PowerShell runs
 
+# Real runs must not depend on a MonClub Setup that happens to run on this PC (lane L2 tests
+# real installers here): they use an image pattern no process has.
+NO_SETUP = r"^monclub_never_running_test_pattern$"
+
+
 def _run(script: str, cwd: Path) -> None:
     subprocess.run(uw.powershell_command(script), cwd=str(cwd), timeout=90, check=False,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -207,7 +225,7 @@ def test_install_wrapper_runs_for_real_writes_aborted_and_relaunches_the_old_app
     setup.parent.mkdir(parents=True)
     shutil.copy(WHOAMI, setup)  # rejects /VERYSILENT: exit code 1, writes no result
     script = uw.build_install_script(
-        app_pid=_dead_pid(), installer=setup, install_root=root, exe_name="FakeApp.exe",
+        setup_image_re=NO_SETUP, app_pid=_dead_pid(), installer=setup, install_root=root, exe_name="FakeApp.exe",
         from_version="1.5.0", to_version="1.5.1",
         setup_log=root / "logs" / "update-1.5.1-x.log", wrapper_log=root / "logs" / "update-wrapper.log",
     )
@@ -232,7 +250,7 @@ def test_install_wrapper_keeps_a_result_setup_wrote_itself(tmp_path):
         encoding="ascii",
     )
     script = uw.build_install_script(
-        app_pid=_dead_pid(), installer=fake_setup, install_root=root, exe_name="Missing.exe",
+        setup_image_re=NO_SETUP, app_pid=_dead_pid(), installer=fake_setup, install_root=root, exe_name="Missing.exe",
         from_version="1.5.0", to_version="1.5.1",
         setup_log=root / "logs" / "s.log", wrapper_log=root / "logs" / "w.log",
     )
@@ -257,7 +275,7 @@ def test_restore_helper_runs_for_real_and_puts_previous_back(tmp_path):
     (root / "state" / "install_journal.json").write_text(
         '{"phase":"copying","from":"1.5.0","to":"1.5.1","at":"2026-10-10T08:00:00Z","setupPid":1}', encoding="ascii")
     script = uw.build_restore_script(
-        app_pid=_dead_pid(), install_root=root, exe_name="FakeApp.exe", restore_log=root / "logs" / "restore.log",
+        setup_image_re=NO_SETUP, app_pid=_dead_pid(), install_root=root, exe_name="FakeApp.exe", restore_log=root / "logs" / "restore.log",
     )
     _run(script, root / "state")
     names = sorted(str(p.relative_to(root / "current")) for p in (root / "current").rglob("*"))
@@ -276,7 +294,7 @@ def test_restore_helper_only_deletes_a_backing_up_journal(tmp_path):
     (root / "previous").mkdir()
     (root / "state").mkdir()
     (root / "state" / "install_journal.json").write_text('{"phase":"backing_up","from":"1.5.0","to":"1.5.1"}', encoding="ascii")
-    script = uw.build_restore_script(app_pid=_dead_pid(), install_root=root, exe_name="Missing.exe",
+    script = uw.build_restore_script(setup_image_re=NO_SETUP, app_pid=_dead_pid(), install_root=root, exe_name="Missing.exe",
                                      restore_log=root / "logs" / "r.log")
     _run(script, root / "state")
     assert (root / "current" / "intact.txt").read_text(encoding="ascii") == "current"
@@ -301,7 +319,7 @@ def test_install_wrapper_restores_a_journal_setup_left_behind_before_relaunching
         encoding="ascii",
     )
     script = uw.build_install_script(
-        app_pid=_dead_pid(), installer=fake_setup, install_root=root, exe_name="FakeApp.exe",
+        setup_image_re=NO_SETUP, app_pid=_dead_pid(), installer=fake_setup, install_root=root, exe_name="FakeApp.exe",
         from_version="1.5.0", to_version="1.5.1",
         setup_log=root / "logs" / "s.log", wrapper_log=root / "logs" / "w.log",
     )
@@ -311,3 +329,23 @@ def test_install_wrapper_restores_a_journal_setup_left_behind_before_relaunching
     assert (result["result"], result["reason"]) == ("ROLLED_BACK", "interrupted")
     log = (root / "logs" / "w.log").read_text(encoding="utf-8", errors="replace")
     assert "journal after Setup: restored" in log and "relaunched" in log
+
+
+@pytest.mark.skipif(not WINDOWS or not WHOAMI.exists(), reason="needs Windows PowerShell")
+def test_restore_helper_backs_off_while_a_setup_runs(tmp_path):
+    """The restore checks for a running Setup itself (review L4); here 'Setup' = the
+    helper's own powershell.exe, which is certainly running."""
+    root = tmp_path / "root"
+    (root / "current").mkdir(parents=True)
+    (root / "current" / "new.dll").write_text("new", encoding="ascii")
+    (root / "previous").mkdir()
+    shutil.copy(WHOAMI, root / "previous" / "FakeApp.exe")
+    (root / "previous" / "version.json").write_text("{}", encoding="ascii")
+    (root / "state").mkdir()
+    (root / "state" / "install_journal.json").write_text('{"phase":"copying"}', encoding="ascii")
+    script = uw.build_restore_script(setup_image_re=r"^powershell\.exe$", app_pid=_dead_pid(), install_root=root,
+                                     exe_name="FakeApp.exe", restore_log=root / "logs" / "r.log")
+    _run(script, root / "state")
+    assert (root / "state" / "install_journal.json").exists()
+    assert (root / "current" / "new.dll").exists()
+    assert "a Setup is still running" in (root / "logs" / "r.log").read_text(encoding="utf-8", errors="replace")

@@ -22,9 +22,11 @@ from urllib.parse import urlsplit
 from shared import ed25519
 from shared.update_versions import compare_versions, parse_version
 
-_HEX64 = re.compile(r"^[0-9a-f]{64}$")
-_HEX128 = re.compile(r"^[0-9a-fA-F]{128}$")
-_INSTALLER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,150}\.exe$")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_HEX128 = re.compile(r"[0-9a-fA-F]{128}")
+# monclub_<target>_<version...>.exe: the name the "Setup running" check knows
+# (shared/update_files.py::SETUP_IMAGE_RE) and a plain file name inside downloads\.
+_INSTALLER_NAME = re.compile(r"monclub_(access|tv)_[0-9][0-9A-Za-z._-]{0,120}\.exe", re.IGNORECASE)
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
@@ -124,7 +126,7 @@ def verify_offer(
         raise OfferRefused("UNSIGNED", f"release {offered_version or '?'} has no signed manifest; refusing to install it")
     if not manifest_text.isascii():
         raise OfferRefused("BAD_MANIFEST", "signed manifest is not ASCII")
-    if not _HEX128.match(signature_hex):
+    if not _HEX128.fullmatch(signature_hex):
         raise OfferRefused("BAD_SIGNATURE", "manifest signature is not 128 hex characters")
     public_hex = keys.get(key_id)
     if not public_hex:
@@ -162,9 +164,10 @@ def verify_offer(
     name = manifest.get("installerName")
     sha = manifest.get("installerSha256")
     size = manifest.get("installerSize")
-    if not isinstance(name, str) or not _INSTALLER_NAME.match(name):
-        raise OfferRefused("BAD_MANIFEST", "manifest installerName is not a plain .exe file name")
-    if not isinstance(sha, str) or not _HEX64.match(sha):
+    name_match = _INSTALLER_NAME.fullmatch(name) if isinstance(name, str) else None
+    if not name_match or name_match.group(1).lower() != m_target:
+        raise OfferRefused("BAD_MANIFEST", "manifest installerName is not monclub_<target>_<version>.exe")
+    if not isinstance(sha, str) or not _HEX64.fullmatch(sha):
         raise OfferRefused("BAD_MANIFEST", "manifest installerSha256 is not 64 lowercase hex")
     if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
         raise OfferRefused("BAD_MANIFEST", "manifest installerSize is not a positive integer")

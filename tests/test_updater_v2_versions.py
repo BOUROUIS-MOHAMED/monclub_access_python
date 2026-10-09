@@ -43,3 +43,7 @@ def test_installed_version_text_drops_a_codename():
     assert installed_version_text("1.4.35 Orion") == "1.4.35"
     assert installed_version_text("  1.5.0  ") == "1.5.0"
     assert installed_version_text(None) == ""
+
+
+def test_a_trailing_newline_is_not_a_version():
+    assert parse_version("1.5.0\n") is None

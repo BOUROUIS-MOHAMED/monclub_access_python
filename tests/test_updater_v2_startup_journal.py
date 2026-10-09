@@ -89,6 +89,16 @@ def test_if_the_helper_cannot_start_the_app_starts_anyway(tmp_path):
     assert _check(_root(tmp_path), [], launcher=broken) is False
 
 
+def test_a_restore_in_progress_makes_the_app_exit_without_starting(tmp_path, monkeypatch):
+    """Review M1: a claimed journal whose restorer still runs = current is being rewritten."""
+    import os as _os
+
+    root = _root(tmp_path, journal=False)
+    (root / "state" / f"install_journal.restoring-{_os.getpid()}.json").write_text("{}", encoding="ascii")
+    launched = []
+    assert _check(root, launched) is True and launched == []
+
+
 def test_a_source_run_never_restores(monkeypatch):
     monkeypatch.delenv(us.TEST_OVERRIDE_ENV, raising=False)
     assert us._install_root_for("MonClubAccess.exe") is None

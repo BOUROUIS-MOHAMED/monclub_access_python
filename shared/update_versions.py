@@ -22,7 +22,7 @@ def parse_version(value: object) -> Optional[ParsedVersion]:
     """(major, minor, patch, pre-release identifiers) or None when not a valid version."""
     if not isinstance(value, str):
         return None
-    m = _VERSION_RE.match(value)
+    m = _VERSION_RE.fullmatch(value)
     if not m:
         return None
     pre = tuple(m.group(4).split(".")) if m.group(4) else ()

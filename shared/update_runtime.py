@@ -44,6 +44,7 @@ from shared.runtime_support import is_frozen, runtime_base_dir
 from shared.update_files import (
     UpdatePaths,
     consume_marker,
+    last_boot_epoch,
     parse_utc_iso,
     read_json,
     setup_is_running,
@@ -71,6 +72,8 @@ OUTBOX_MAX = 50
 # Anything else (health_timeout, interrupted, no result, Setup exit) gets one retry.
 _BAN_REASONS = {"crash", "after_copy_failed", "setup_failed", "copy_failed", "post_install_failed", "restore_failed"}
 TELEMETRY_RESULTS = {"PENDING", "INSTALLED", "ROLLED_BACK", "ABORTED", "VERIFY_FAILED", "DOWNLOAD_FAILED"}
+# GetTickCount64-derived boot times drift by a second or two between reads.
+_BOOT_EPOCH_SLACK_SEC = 120
 # Delays before retrying a FAILED update check: 60 s, 5 min, then 15 min until one succeeds.
 _CHECK_RETRY_DELAYS_SEC = (60, 5 * 60, 15 * 60)
 _CHUNK = 256 * 1024
@@ -259,6 +262,7 @@ class ComponentUpdateManager:
         launcher: Callable[..., int] = launch_hidden_powershell,
         setup_running: Callable[[], bool] = setup_is_running,
         clock: Callable[[], float] = time.time,
+        boot_epoch: Callable[[], Optional[float]] = last_boot_epoch,
     ) -> None:
         self.component = component
         self.app = app
@@ -270,10 +274,15 @@ class ComponentUpdateManager:
         self._keys_provider = keys_provider
         # Start-up and 24 h auto-install only in a frozen build: a source run must never
         # launch a real Setup by itself. Tests pass True.
-        self._auto_install_allowed = is_frozen() if auto_install_allowed is None else bool(auto_install_allowed)
+        # A frozen exe outside {app}\current (a copied folder, a test build) never
+        # auto-installs either: the wrapper would relaunch an exe that is not there.
+        if auto_install_allowed is None:
+            auto_install_allowed = is_frozen() and runtime_base_dir().name.lower() == "current"
+        self._auto_install_allowed = bool(auto_install_allowed)
         self._launcher = launcher
         self._setup_running = setup_running
         self._clock = clock
+        self._boot_epoch = boot_epoch
 
         self._lock = threading.RLock()
         self._running = False
@@ -883,6 +892,23 @@ class ComponentUpdateManager:
 
     # ------------------------------------------------------------------ loop guard
 
+    def _retry_wait_reason(self, version: str) -> Optional[str]:
+        """A struck (not banned) version is retried automatically only at the NEXT start-up
+        of the PC (design 7: "one automatic retry at the next start-up"), not when Setup
+        relaunches the old version seconds later -- or, on a PC never switched off, 24 h
+        after the failure."""
+        entry = (self.state.load().get("versions") or {}).get(version) or {}
+        if not entry.get("strikes") or entry.get("banned"):
+            return None
+        failed_at = float(entry.get("lastFailureAt") or 0)
+        if failed_at and self._clock() - failed_at >= FALLBACK_PENDING_SEC:
+            return None
+        failed_boot = entry.get("lastFailureBoot")
+        boot = self._boot_epoch()
+        if failed_boot is not None and boot is not None and boot > float(failed_boot) + _BOOT_EPOCH_SLACK_SEC:
+            return None
+        return "failed once; retried at the next PC start-up"
+
     def _ban_reason(self, version: str) -> Optional[str]:
         entry = (self.state.load().get("versions") or {}).get(version) or {}
         if entry.get("banned"):
@@ -892,6 +918,8 @@ class ComponentUpdateManager:
     def _record_failure(self, d: Dict[str, Any], version: str, reason: str) -> None:
         versions = d.setdefault("versions", {})
         entry = versions.setdefault(version, {})
+        entry["lastFailureAt"] = self._clock()
+        entry["lastFailureBoot"] = self._boot_epoch()
         if reason in _BAN_REASONS:
             entry["banned"] = True
             entry["banReason"] = reason
@@ -913,9 +941,7 @@ class ComponentUpdateManager:
         result = read_json(self.paths.last_update)
         processed: Optional[Dict[str, Any]] = None
         if result is not None:
-            marker = consume_marker(result)
-            if self.state.load().get("lastConsumed") != marker:
-                processed = self._apply_result(result, marker)
+            processed = self._apply_result(result, consume_marker(result))
             try:
                 os.replace(self.paths.last_update, self.paths.last_update_consumed)
             except OSError:
@@ -927,49 +953,77 @@ class ComponentUpdateManager:
             self._notify()
         return processed
 
-    def _apply_result(self, result: Dict[str, Any], marker: str) -> Dict[str, Any]:
+    @staticmethod
+    def _result_versions(kind: str, raw_from: str, raw_to: str, attempt: Optional[Mapping[str, Any]]) -> Tuple[str, str]:
+        """(version before the install, version the install tried) of one result.
+
+        The writers name the TRANSITION (L2 update_safety.iss UpdWriteLastUpdate, and this
+        lane's restore helper / wrapper): ``ROLLED_BACK`` from = the version that failed,
+        to = the one restored; ``INSTALLED`` / ``ABORTED`` from = before, to = the version
+        tried. The open install attempt, when there is one, names the tried version."""
+        if kind == "ROLLED_BACK":
+            before, tried = raw_to, raw_from
+        else:
+            before, tried = raw_from, raw_to
+        if attempt and attempt.get("version") and str(attempt["version"]) in (raw_from, raw_to, ""):
+            tried = str(attempt["version"])
+            before = before if before and before != tried else _safe_str(attempt.get("from"), "")
+        return before, tried
+
+    def _apply_result(self, result: Dict[str, Any], marker: str) -> Optional[Dict[str, Any]]:
+        """Apply one installer result exactly once (the check runs under the state lock, so
+        the 30 s rescan and the check thread cannot both count it). None when already done."""
         kind = _safe_str(result.get("result"), "").upper()
         reason = _lower(result.get("reason"))
-        from_v = _safe_str(result.get("from"), "")
-        to_v = _safe_str(result.get("to"), "")
+        raw_from = _safe_str(result.get("from"), "")
+        raw_to = _safe_str(result.get("to"), "")
         now = self._clock()
         installed = self.get_current_version()
         detail_parts = [p for p in (f"reason={reason}" if reason else "", _safe_str(result.get("log"), "")) if p]
+        outcome: Dict[str, Any] = {}
 
         def apply(d: Dict[str, Any]) -> None:
+            if d.get("lastConsumed") == marker:
+                return
             attempt = d.get("attempt") if isinstance(d.get("attempt"), dict) else None
-            if attempt and attempt.get("version") == to_v:
+            before, tried = self._result_versions(kind, raw_from, raw_to, attempt)
+            if attempt and attempt.get("version") == tried:
                 started = float(attempt.get("at") or 0)
                 if started:
                     took = max(0.0, now - started)
                     detail_parts.append(f"mode={attempt.get('mode')} took={took:.0f}s")
-                    self._log("info", "install %s -> %s (%s) took %.0f s from launch to result", from_v, to_v, attempt.get("mode"), took)
-                d.pop("attempt", None)
+                    self._log("info", "install %s -> %s (%s) took %.0f s from launch to result", before, tried, attempt.get("mode"), took)
+            d.pop("attempt", None)
             if kind == "INSTALLED":
                 pending = d.get("pending")
-                if isinstance(pending, dict) and pending.get("version") == to_v:
+                if isinstance(pending, dict) and pending.get("version") == tried:
                     d.pop("pending", None)
             elif kind == "ABORTED" and reason == "same_version":
                 pass
-            elif kind in ("ROLLED_BACK", "ABORTED") and to_v:
-                self._record_failure(d, to_v, reason or "unknown")
+            elif kind in ("ROLLED_BACK", "ABORTED") and tried and tried != installed:
+                self._record_failure(d, tried, reason or "unknown")
             d["lastConsumed"] = marker
             d["lastResult"] = {
                 "result": kind or "UNKNOWN",
-                "from": from_v,
-                "to": to_v,
+                "from": before,
+                "to": tried,
                 "reason": reason,
                 "at": _safe_str(result.get("at"), "") or utc_now_iso(now),
                 "installedNow": installed,
             }
+            outcome.update(before=before, tried=tried)
 
         self.state.update(apply)
-        self._log("info", "installer result: %s %s -> %s reason=%s", kind, from_v, to_v, reason or "-")
+        if not outcome:
+            return None
+        before, tried = outcome["before"], outcome["tried"]
+        self._log("info", "installer result: %s (tried %s, before %s) reason=%s; running %s", kind, tried, before, reason or "-", installed)
         telemetry_kind = kind if kind in TELEMETRY_RESULTS else "ABORTED"
+        # Telemetry always says fromVersion = before the install, toVersion = the version tried.
         self.emit_event(
             telemetry_kind,
-            from_version=from_v,
-            to_version=to_v or installed,
+            from_version=before,
+            to_version=tried or installed,
             detail="; ".join(detail_parts) or None,
             occurred_at=_safe_str(result.get("at"), "") or None,
             id_seed=marker,
@@ -1214,7 +1268,7 @@ class ComponentUpdateManager:
         if not pending:
             return False
         version = str(pending.get("version"))
-        ban = self._ban_reason(version)
+        ban = self._ban_reason(version) or self._retry_wait_reason(version)
         if ban:
             self._log("info", "pending %s not auto-installed: %s (Update page button still works)", version, ban)
             return False
