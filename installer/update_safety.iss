@@ -344,10 +344,13 @@ begin
   UpdFinalized := True;
   if RC = 3 then
   begin
-    // current\ is half-restored: starting it would hang on an error box. The kept journal
-    // makes the watchdog / the wrapper / the next start restore it (review #12).
+    // current\ may be half-restored. The kept journal makes the watchdog (journal rule FIRST,
+    // it stops whatever runs from current\ before restoring), the v2 wrapper or the next
+    // start-up restore it. Still start the app: on TV (no watchdog), on the 1.4.35 hop (no
+    // wrapper) and on watchdog-off PCs it is the only way the app comes back (design 1).
     UpdWriteLastUpdate(UpdInstallRoot, 'ABORTED', UpdFromVersion, '{#AppVersion}', 'restore_failed');
-    Log('NOT relaunching: current\ could not be put back; the install journal is kept for recovery.');
+    Log('current\ could not be put back; the install journal is kept for recovery; relaunching anyway.');
+    UpdRelaunch(UpdInstallRoot);
   end
   else
   begin
@@ -381,11 +384,13 @@ begin
   end
   else
   begin
-    // The journal stays (phase restoring) and current\ is half-restored: do NOT start it
-    // (review #12). The watchdog, the v2 wrapper (after Setup exits) or the next start-up
-    // restores from the journal and starts the app.
+    // The journal stays (phase restoring): the watchdog (journal rule first), the v2 wrapper
+    // (after Setup exits) or the next start-up restores from it. Start the app anyway -- see
+    // the same case in UpdPrepareBackup: for TV / the 1.4.35 hop / watchdog-off PCs it is the
+    // only way back, and a hung half-restored exe no longer blocks the watchdog's recovery.
     UpdWriteLastUpdate(UpdInstallRoot, 'ROLLED_BACK', '{#AppVersion}', UpdFromVersion, 'restore_failed');
-    Log('NOT relaunching: current\ could not be restored; the install journal is kept for recovery.');
+    Log('current\ could not be restored; the install journal is kept for recovery; relaunching anyway.');
+    UpdRelaunch(UpdInstallRoot);
   end;
   UpdClearPauseSentinel(UpdInstallRoot);
   UpdFinalized := True;

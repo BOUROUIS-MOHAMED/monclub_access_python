@@ -348,9 +348,17 @@ def test_setup_recovers_a_leftover_journal_and_repairs_an_incomplete_current():
         assert "if SameVersionInstalled() and UpdCurrentComplete(ExistingInstallRoot) then" in text(iss)
 
 
-def test_a_failed_restore_is_retried_once_and_never_relaunches_a_half_restored_tree():
+def test_a_failed_restore_is_retried_once_keeps_the_journal_and_still_relaunches():
+    """Design 1 / D24: every silent path ends with the app started. The journal stays, and the
+    watchdog's journal rule (run before its is-running check) recovers a half-restored tree."""
     src = text(SAFETY)
     rb = src[src.index("procedure UpdRollback("):src.index("procedure UpdPostInstall();")]
     assert rb.count("UpdRunHelper('restore'") == 2
     failed = rb[rb.index("'restore_failed'"):]
-    assert "UpdRelaunch" not in failed
+    assert "UpdRelaunch(UpdInstallRoot)" in failed and "UpdDeleteJournal" not in failed
+    prep = src[src.index("function UpdPrepareBackup(): string;"):src.index("procedure UpdRollback(")]
+    rf = prep[prep.index("'restore_failed'"):prep.index("'backup_failed'")]
+    assert "UpdRelaunch(UpdInstallRoot)" in rf
+    # Only a live restorer's claim skips the relaunch (that restorer starts the app).
+    rip = prep[prep.index("'restore_in_progress'"):prep.index("if not PathHasInstalledPayload")]
+    assert "UpdRelaunch" not in rip
