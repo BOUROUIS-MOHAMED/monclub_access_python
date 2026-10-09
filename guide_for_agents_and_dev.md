@@ -58,7 +58,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The one-shot credentials re-send at startup — what it drops, its marker table, its place and catch in `init_db` (`db.py::_force_one_credentials_resend`, `::_run_one_shot_credentials_resend`, `local_one_shot_steps`; `tools/bench_credential_resend.py`) | §3.1b "The upgrade window" |
 | What happens when an `init_db` step fails — the five schema migrations and the inline `device_write_hold.pin_scheme` `ALTER` that stop startup, the steps that log and go on, a `try` or an `import logging` added inside `init_db` (`db.py::init_db`, `::_relax_firmware_profiles_not_null`, `::_rebuild_sync_users_without_legacy_fingerprint`, `::_ensure_main_account_id_column`, `::_ensure_pin_scheme_column`, `sync_device_store.py::ensure_ultra_merge_device_columns`, `::_run_one_shot_credentials_resend`) | §3.2d "A failing migration stops startup", §3.1b "The upgrade window" |
 | Anything in `app/core/v2/` (the server clock, the v2 client, the notice socket, leases, commands, ownership backup, problem reports, loss re-add), `access/v2_routes.py`, or a lease-gate call site (`ultra_engine.py::_v2_writes_blocked` and the `_lease_gate` calls, `device_sync.py`, `realtime_agent.py`, `device_attendance.py`, `ultra_worker_pool.py::devices_to_drive`, `access/local_api_routes.py::LEASE_GATED_HANDLERS` / `SCANNER_GATED_HANDLERS`) | §3.9 |
-| The software updater client — check / verify / download / install / start-up gate / journal restore / loop guard / telemetry / update pages (`shared/update_runtime.py`, `shared/release_manifest.py`, `shared/ed25519.py`, `shared/release_keys.py`, `shared/update_versions.py`, `shared/update_files.py`, `shared/update_wrapper.py`, `shared/update_startup.py`, `access/update_runtime.py`, the update handlers in `local_access_api_v2.py`, `UpdatePage.tsx` / `TvUpdatePage.tsx`) | §11 Software updates |
+| The software updater client — check / verify / download / install / start-up gate / journal restore / loop guard / telemetry / update pages (`shared/update_runtime.py`, `shared/release_manifest.py`, `shared/ed25519.py`, `shared/release_keys.py`, `shared/update_versions.py`, `shared/update_files.py`, `shared/update_wrapper.py`, `shared/update_startup.py`, `access/update_runtime.py`, the update handlers in `local_access_api_v2.py`, `UpdatePage.tsx` / `TvUpdatePage.tsx`); the installer half — the safe swap, journal, health wait, same-version / zkemkeeper rules, uninstall data (`installer/MonClubAccess.iss`, `installer/MonClubTV.iss`, `installer/update_safety.iss`, `installer/update_helper.ps1`), the watchdog's journal rule (`packaging/watchdog/monclub_access_watchdog.ps1`), the build / sign / publish gates (`build_release.ps1`, `tools/release_sign.py`, `publish_github_release.ps1`) | §11 Software updates |
 | What `push_safety.check_bulk_removal` defers (`add_only`, `handover_release`) or lets through (a Confirm-removal approval) | §3.2g, §3.9 |
 | The removal log (`db.py::_log_v2_removal` in `clear_device_revocation_state` / `delete_device_sync_state`) | §3.4a, §3.9 |
 | The Erase-content wizard or the write hold (`app/core/erase_wizard.py` — incl. `::refill_roster`, `::held_waiting_count`, `EraseWizard._refill_check`, and since lane 1c `::_sync_staleness` / `::_sync_max_age_sec` with `app.py`'s `_last_sync_ok_mono` stamp, `::terminal_people` / `::not_refilled` / `::_bind_not_refilled` / `KEEP_MARK`, `::_refill_recheck`, `::_prune_now` / `::_folder_times`, `::_no_answer`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s codes —, `app/core/device_hold.py` — incl. `load(release_unstarted=)` and the `erase-prep`/`erase` phases —, `db.py::set_device_write_hold` / `::clear_device_write_hold` / `::list_device_write_holds`, `::begin_device_erase`, `::release_unstarted_erase_holds`, `::undo_device_erase_record` / `::device_list_is_authoritative` (lane 1f), `erase_wizard.py::check_erase_switch` / `monclub_api.py::get_erase_wizard_switch` (the gym's server switch), `erase_wizard.py::prune_erase_backups` (30-day retention), `::retire_device_records`, `::invalidate_device_records`, `device_sync.py::_filter_users_for_device(quiet=)`, `PullSDKDevice.ERASABLE_TABLES`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s offline answer, the hold in `ultra_engine.py::_v2_writes_blocked`, the worker's `_connected_addr` (`::_connect` / `::_disconnect`), `device_sync.py`'s three hold checks, `v2/handlers.py::device_reconcile`, `app.py`'s start-up `device_hold.load()` and `_sync_tick`'s `device_hold.ensure_loaded()`, `ownership.py::OwnershipSync._worker_idle`, the `erase` routes and handlers, `local_access_api_v2.py::_refuse_held_or_frozen`, `PullSDKDevice.count_table_strict` / `::read_table_strict` / `::erase_table`, `ZKStandaloneDevice.read_device_status` / `::read_user_templates` and the listing's `privilege`, `tauri-ui/src/components/EraseWizardDialog.tsx`) | §3.2h, pullsdk_guide §5, zkemkeeper_guide §4 |
@@ -2528,15 +2528,17 @@ drop stays for folders an earlier build wrote. Residual `[CODE]`: a power cut be
 command keeps a backup for good for a run that erased nobody -- no device command runs between the two. `[TEST:
 test_erase_wizard_lane1e.py::TestTheKeepMarkComesAfterTheEraseRecord]`
 
-**An uninstall deletes the hold and the backups** (lane 1b, review C2, verified): `installer/MonClubAccess.iss`
-`[UninstallDelete]` removes `{commonappdata}\MonClub Access` (and the LocalAppData / AppData copies), which is the data
+**An uninstall deletes the hold and the backups** (lane 1b, review C2, verified; narrowed by updater v2 D26, §11.10):
+an Access uninstall removes Access's folders of the data root (all of it when TV is not installed, else `data\`,
+`access\`, `backups\`, `versions\` only), which is the data
 root (`app/core/utils.py::_candidate_data_roots`: `%ProgramData%\MonClub Access`, else `%LOCALAPPDATA%\MonClub
 Access`) holding `access.db` — the `device_write_hold` row — and `access\erase_backups\`. An Access installed after an
 uninstall has no hold: its first pass refills the turnstile under whatever scheme the server then sends, and the only
 backup of the erased content is gone. **Never uninstall Access while a turnstile is held**: press Refill first (or
 finish the switch). Runbook A7 already says "never uninstall first" for another reason. `[CODE]`
 An installer run OVER the install is another matter (the master review of lane 1c, F5; runbook part F): it replaces only
-the program folder (`PrepareToInstall` → `DeleteTreeIfExists({app}\current)`) and keeps the data root `[CODE]` -- the
+the program folder (since updater v2: `PrepareToInstall` backs `current\` up into `previous\` and empties it, never a
+delete of the tree, §11.8) and keeps the data root `[CODE]` -- the
 SAME version then honours the hold (the repair of the autostart checklist §6, never tried on a gym PC `[UNVERIFIED]`); an
 OLDER version has no hold code and refills the turnstile at its first pass (every tag up to 1.4.33 with membership pins),
 so never over a held turnstile's data root. The runbook's rollback rows that go back to an older version move the whole
@@ -5089,8 +5091,9 @@ scenario (a store another system fills), not as a re-diagnosis of that incident.
   PyInstaller build ran and the frozen app started (DLLs resolved, local API up) on the dev PC.
   `[TEST — 2026-09-29, dev PC; no gym hardware attached]`
 - **Windows 10 or newer is required**: Python 3.14 supports Windows 10+ only (3.13 was the last
-  for 8.1). Both Inno installers carry `MinVersion=10.0`. `[CODE: installer/*.iss]` Updates apply by
-  zip (`MonClubAccessUpdater`), which the installer check does not cover; the owner confirmed on
+  for 8.1). Both Inno installers carry `MinVersion=10.0`. `[CODE: installer/*.iss]` Since updater v2
+  every update is the full Inno installer run silently (§11; the zip / `MonClubAccessUpdater` path
+  is deleted), so `MinVersion` now covers updates too `[CODE]`; the owner confirmed on
   2026-09-29 that every client PC runs Windows 10+. The heartbeat's Windows version (Access PCs
   page) is reported only by builds from 1.4.35 on, the same build that needs Windows 10, so it
   cannot survey the fleet beforehand: a PC that never shows 1.4.35 after the update window is the
@@ -5592,12 +5595,12 @@ A single-line grep finds 63 of the 134 names. `[CODE]`
 
 ---
 
-## 11. Software updates — the client (updater v2)
+## 11. Software updates (updater v2)
 
-Design and defect IDs: `D:\Monclub\docs\access-updater-v2\design.md` (sections 5, 7, 8).
-This section is the **client** half (lane L3). The installer half (`installer/*.iss`, the
-watchdog, `build_release.ps1`) is reconciled into this section by L4 from L2's facts in
-`docs/access-updater-v2/progress.md`. One engine serves both targets:
+Design and defect IDs: `D:\Monclub\docs\access-updater-v2\design.md` (sections 5, 7, 8);
+lane reports and the E2E evidence: `docs/access-updater-v2/progress.md`, `.../e2e/`.
+§11.1-11.7 are the **client** (lane L3), §11.8-11.11 the **installer, watchdog and build**
+(lane L2), reconciled by L4 on 2026-10-09. One engine serves both targets:
 `shared/update_runtime.py::ComponentUpdateManager`, wrapped by `access/update_runtime.py`
 (target `access`) and `tv/update_runtime.py` (target `tv`). `[CODE]`
 
@@ -5682,10 +5685,17 @@ by the watchdog's scheduled task (L4 E2E).
    `current` is intact. The helper claims the journal (rename to
    `install_journal.restoring-<pid>.json`; a failed rename = another restorer owns it, back
    off), copies `previous\*` back, writes `ROLLED_BACK interrupted`, restarts the app. A
-   claim whose `<pid>` runs `powershell.exe` / `pwsh.exe` and that was made since the last
-   Windows boot means a restore is in progress: the app exits without starting from
-   `current` (the restorer restarts it). Any other claim (pid gone, pid reused by another
-   program, claim older than the boot) is renamed back to the journal. A rename keeps the
+   claim whose `<pid>` runs `powershell.exe` / `pwsh.exe`, whose process started no later
+   than the claim's LastWriteTime + 5 s, and that was made since the last Windows boot means
+   a restore is in progress: the app exits without starting from `current` (the restorer
+   restarts it). Any other claim (pid gone, pid reused by another program or by a PowerShell
+   started after the claim, claim older than the boot) is renamed back to the journal. The
+   start-time rule is what holds under Fast Startup (§11.5: a shutdown does not move the
+   boot time, so a claim left by a restorer killed at shutdown passes the boot rule and the
+   watchdog's PowerShell may reuse its pid); an unreadable start time skips the rule. Python
+   (`update_files.py::live_restore_claims`, `::process_creation_epoch` = OpenProcess +
+   GetProcessTimes) and the helper (`update_helper.ps1::Test-ClaimLive`) apply the same rule.
+   `[TEST: test_updater_v2_files_and_wrapper.py::test_a_claim_is_dead_when_its_pid_is_a_powershell_that_started_after_the_claim; test_updater_v2_install_helper.py::test_a_claim_*]` A rename keeps the
    journal's old LastWriteTime, so every restorer sets the claim's LastWriteTimeUtc to now
    right after claiming it; the helpers write every timestamp with the invariant culture
    (under ar-SA, PowerShell's `ToString(fmt)` writes a Hijri year).
@@ -5723,9 +5733,17 @@ by the watchdog's scheduled task (L4 E2E).
   no result at all) is a strike, two strikes ban. A struck version is retried
   automatically only after the next Windows boot (or 24 h later on a PC never switched
   off) — not when Setup relaunches the old version seconds after the failure. "Boot" is
-  `GetTickCount64`: `[UNVERIFIED]` whether a nightly shutdown with Windows Fast Startup
-  (hibernated kernel, on by default) resets it; if it does not, gym PCs get the retry
-  through the 24 h path only — later, never sooner.
+  `GetTickCount64`. **A shutdown with Windows Fast Startup (on by default) does NOT reset it**:
+  on the dev PC (`HiberbootEnabled=1`) the System log shows Fast Startup power-ons
+  (Kernel-Boot 27, boot type `0x1`) on 2026-10-04 09:13 and 10-07 07:40 with no Kernel-General
+  12 "OS started" event, while the full boots (`0x0`) each have one; `now - GetTickCount64`
+  equals `LastBootUpTime` (2026-10-08 10:14 UTC, the last `0x0` boot) to the second, so a Fast
+  Startup power-on keeps the previous full boot's time. `[FIELD: dev PC event log, read
+  2026-10-09 by L4]` Consequence: on a gym PC that is shut down every night (Fast Startup on) a
+  struck version is retried through the 24 h path only — later, never sooner; a restart (not a
+  shutdown) or a PC with Fast Startup off retries at the next start. Journal staleness does
+  not depend on the boot rule alone (10 min / dead `setupPid` also make it stale), and claim
+  liveness uses the restorer's start time (§11.4).
   `same_version` is no strike. "Restart to update" still works on a banned version; the
   page warns.
 - **Direction of `last_update.json`** (L2's `UpdWriteLastUpdate`, the restore helper, the
@@ -5753,3 +5771,135 @@ notes through `src/lib/releaseNotes.ts` (allowlist p/br/ul/ol/li/strong/b/em/i/h
 no attributes, links as text, script/style/iframe dropped) — never `dangerouslySetInnerHTML`
 (D33) — and show the last result, a refused offer, the loop-guard warning and an install
 error (`src/components/update/UpdateNotices.tsx`). `[TEST: tauri-ui src/lib/releaseNotes.test.ts; tests/test_updater_v2_app_wiring.py::test_release_notes_are_never_injected_as_raw_html]`
+
+### 11.8 The installer — safe swap, health wait, results (D21-D24)
+
+Updates are the full Inno installer (`installer/MonClubAccess.iss`, `installer/MonClubTV.iss`,
+shared Pascal `installer/update_safety.iss`, file work in `installer/update_helper.ps1`,
+extracted to `{tmp}` and also installed into `{app}\watchdog`). `[CODE]`
+
+- **`{app}` layout:** `current\` (the running version; `[Files]` still target it, which keeps
+  Inno's uninstall log valid), `previous\` (the version before the last update — a manual
+  rollback is copying it back), `state\` (§11.1), `logs\`, `downloads\`, `watchdog\` (watchdog
+  scripts + `update_helper.ps1`). `[CODE]`
+- **`PrepareToInstall`:** pause sentinel → stop the app → `update_helper -Action recover
+  -InSetup` (a journal or claim found now was left by a dead Setup or restorer: it is restored
+  first, whatever its age, so re-running an installer repairs a half-written PC) → backup:
+  journal `backing_up` → robocopy `/MIR` `current` → `previous` → verify (exe + `version.json`
+  + same file count and bytes) → journal `copying` → empty `current` **files only** (up to
+  15 s of retries per locked item). `current` is never deleted as a tree and never renamed
+  (a live process's working directory cannot be renamed; the 1.4.35 client starts Setup with
+  its cwd inside `current`). Any backup failure puts `current` back, writes `ABORTED
+  backup_failed`, starts the old app and makes Setup exit with code 7. `[CODE; TEST:
+  test_updater_v2_install_helper.py::test_backup_*, ::test_restore_*;
+  test_updater_v2_installer_scripts.py::test_current_is_never_deleted_wholesale,
+  ::test_the_helper_never_renames_current; E2E L2 01/F01, 06]`
+- **Copy order:** the new watchdog + helper are copied into `{app}\watchdog` before `current`
+  is emptied; `version.json` and then the exe are the last two payload files. `[CODE; TEST:
+  ::test_version_json_and_then_the_exe_are_the_last_payload_files; E2E L2 F01 setup log]`
+- **Health wait (silent installs):** `ssPostInstall` deletes `boot_ok.json`, starts the new exe
+  with working directory `{app}\current` (as gyms do) and waits up to **300 s** for
+  `boot_ok.json` carrying the new version → `INSTALLED`. The process gone → `ROLLED_BACK
+  crash`; timeout → kill it, `ROLLED_BACK health_timeout`. Rollback = restore `previous` →
+  `current`, uninstall entry put back to the old version, old app started. A failure after
+  the backup that Pascal sees in `DeinitializeSetup` → restore, `ROLLED_BACK setup_failed`.
+  `[Run]` starts the app only for interactive installs (`Check: not WizardSilent`). `[CODE;
+  TEST: test_updater_v2_install_helper.py::test_launch_wait_tells_healthy_crash_and_timeout_apart;
+  E2E L2 03-08]`
+- **Every Setup end after the app was stopped writes `last_update.json` FIRST, then starts an
+  app** (old or healthy new). A failed restore is retried once; if it still fails the journal
+  is KEPT (the watchdog's journal-first rule recovers the tree) and the app is still started;
+  only `restore_in_progress` (another restorer holds a live claim) skips the start. `[CODE;
+  TEST: ::test_a_failed_restore_is_retried_once_keeps_the_journal_and_still_relaunches]`
+- **Same version (D22):** silently, no message box — `ABORTED same_version`, the installed
+  app started, exit code 1. It counts as same version only when `current\` has the exe AND
+  `version.json` and there is no journal or claim; an incomplete `current\` with no journal is
+  installed over without a backup (`INSTALLED repair`). Every `MsgBox` is guarded by
+  `WizardSilent()`. `[CODE; TEST: ::test_every_message_box_is_guarded_by_a_silent_check,
+  ::test_same_version_*; E2E L2 02, F02, F05]`
+- **zkemkeeper (D23):** a silent install or uninstall never elevates (`runas`). **The app has
+  no zkemkeeper self-heal** (no `regsvr32` / registration call in `app/`, `shared/`, `tv/`). A
+  registered PC loses nothing: the registration points at `{app}\current\sdk\zkemkeeper.dll`
+  (or another product's DLL) and the update refills that path. A PC where it was never
+  registered stays unregistered after a silent update (as before): one interactive install or
+  the logged `regsvr32` line as admin. `[CODE; TEST: ::test_zkemkeeper_registration_never_elevates_in_silent_mode,
+  ::test_no_regsvr32_self_heal_exists_in_the_app; E2E L2 09]` The unregistered silent branch was
+  never executed `[UNVERIFIED]`.
+- **Result reasons** Setup writes: `backup_failed`, `setup_failed`, `crash`, `health_timeout`,
+  `same_version`, `restore_failed`, `restore_in_progress`; `INSTALLED` carries `""` (update),
+  `fresh_install`, `repair` or `interactive`. The client tolerates unknown ones. `[CODE]`
+- **Exit codes seen:** 0 installed — or rolled back after the copy (read `last_update.json`,
+  it is the truth); 1 same version; 7 `PrepareToInstall` refused (backup failed / restore in
+  progress). `[E2E L2]`
+- **Setup's own log:** the `/LOG` path when given (the v2 wrapper always gives
+  `{app}\logs\update-<ver>-<utc>.log`), else `%TEMP%\Setup Log <date> #<n>.txt`;
+  `last_update.json.log` names it and every helper line is copied into it. `[CODE]`
+- **The 1.4.35 → 1.5.0 bootstrap hop** (old client, no wrapper, Setup started from inside
+  `current\`) works with this installer. `[E2E L2 01/F01]` Residual: a Setup that aborts before
+  any Pascal runs (corrupt download, Windows < 10) on that hop leaves the PC without Access
+  until the watchdog (if ticked) or a person starts it — only the v2 client's wrapper covers
+  that, from the second hop on.
+- **Failure injection (tests only):** `ISCC /DUPDATER_TEST_FAIL=after_copy|health|crash`
+  (any other value: compile error) builds `<base>_<ver>_TESTFAIL_<mode>.exe`;
+  `build_release.ps1` refuses it without `-E2ETestKeys`. `[CODE; TEST: ::test_test_fail_define_is_test_only_everywhere]`
+
+### 11.9 The watchdog's journal rule
+
+`packaging/watchdog/monclub_access_watchdog.ps1` runs `{app}\watchdog\update_helper.ps1 -Action
+recover` **first** on every tick — before its "is it running" check (a half-written windowed exe
+can sit alive on PyInstaller's error box) and before the sentinel and exe-missing guards — and
+logs to `{app}\logs\update-recover.log`. The helper path is resolved in the body: under Windows
+PowerShell 5.1 `$PSScriptRoot` is empty inside a `param()` default (every tick died that way in
+L2's first E2E). The watchdog is not rolled back with the app (it works with any version).
+`[CODE; TEST: test_updater_v2_watchdog_journal.py; E2E L2 10/F10 — a power cut during the health
+wait, one tick of the installed watchdog → ROLLED_BACK interrupted]` The watchdog task is still
+unticked by default on existing installs (D39, owner product choice). It is a scheduled task
+(`register_watchdog.ps1`: at logon + every few minutes, `ExecutionTimeLimit` 5 min,
+`MultipleInstances IgnoreNew`) `[CODE]`; the app's own start-at-logon is the HKCU `Run` value
+`MonClubAccess` written by `app/ui/app.py` when `start_on_system_startup` is set `[CODE]`.
+
+### 11.10 Uninstall and data (D26)
+
+The data root (`%ProgramData%\MonClub Access`, else `%LOCALAPPDATA%\MonClub Access`,
+`app/core/utils.py`) is shared. Access owns `data\` (legacy `app.db`; TV only reads it,
+`tv/auth_bridge.py`), `access\`, `backups\`, `versions\`; TV owns `tv\` (`tv/storage.py`,
+`app/core/tv_local_cache.py`); both use `shared\`. An Access uninstall removes the whole root
+only when TV is not installed (TV's uninstall key), else only its four folders. A TV uninstall
+removes `tv\`, and `shared\` + empty folders + the empty root only when Access is not installed.
+Data is never touched by an update. `UninstallLogMode=overwrite`: Inno appends uninstall logs
+across updates, so 1.4.x's `{commonappdata}\MonClub Access` delete kept replaying (it wiped TV's
+data in L2's E2E 21); after one v2 update it is gone. `[CODE; TEST:
+test_updater_v2_installer_scripts.py::test_access_uninstall_keeps_tv_data_while_tv_is_installed,
+::test_tv_uninstall_deletes_only_its_own_data_folder,
+::test_the_uninstall_log_is_overwritten_so_old_data_deletes_do_not_replay; E2E L2 20-23, F09]`
+Residuals: a PC uninstalled while still on 1.4.x runs the old log (deletes all data); TV
+detection reads the uninstalling user's HKCU only; an Access installed in the legacy root
+`{localappdata}\MonClub Access` shares that folder with the fallback data root. `[CODE]`
+`[UninstallDelete]` also removes `previous`, `current.failed`, `state`, `downloads` under `{app}`.
+
+### 11.11 Build, sign, publish (D3, D20, D30, D31)
+
+- `build_release.ps1` runs its gates **before** the Tauri build and PyInstaller: dirty tree,
+  SQL arity, trusted keys (`release_sign.py check-trust`: refuses an empty `PROD_KEYS` or a
+  `test-` key), signing key present, then `pytest tests/ -q --ignore=tests/_pydeps` (any
+  non-zero exit refuses). `-SkipTests` is explicit, recorded as `testsSkipped`, never
+  publishable. Then it builds, stages, compiles the installer, runs the optional `-SignTool`
+  (Authenticode hook, O2) and only then computes the SHA-256, signs the manifest and writes
+  `release-<target>-<version>.json` (design 5.3, plus `githubRepo`, `githubTag`,
+  `buildCommit`, `testsSkipped`, `publishable`, `signedWith`). `[CODE; TEST:
+  test_updater_v2_installer_scripts.py::test_build_release_gates_run_before_the_tauri_build_and_pyinstaller]`
+- `-E2ETestKeys` rewrites the one-line `PROD_KEYS` of `shared/release_keys.py` to the test key
+  for the PyInstaller run only (restored in `finally`) and signs with the test key; `-TestFail`
+  is accepted only with it; neither is ever publishable. `[CODE]`
+- `tools/release_sign.py` (Ed25519 from `shared/ed25519.py`, the only implementation):
+  `sign` (canonical ASCII manifest, non-ASCII refused, self-verify), `--rollback-from` for a
+  rollback manifest, `keygen` (owner only; never prints the private key, never overwrites;
+  `%USERPROFILE%\.monclub\release-signing\<keyId>.key`), `check-trust`, `check-key`,
+  `verify`. `[TEST: test_updater_v2_release_sign.py]`
+- `publish_github_release.ps1`: `gh release create <tag> <installer> <release file> --target
+  <full built SHA>`; refuses a release file that does not verify against the prod keys, is not
+  publishable, does not match the installer bytes / URL, an existing tag, or a commit on no
+  remote branch. `[CODE; TEST: ::test_publish_tags_the_built_commit_and_uploads_the_release_file]`
+  Only `-DryRun` was ever executed (it refused a test-key file before any `gh` call).
+- The C# zip updater (`updater/`, `installer/updater/*.exe`, `build_updater.ps1`) is deleted
+  (D2, D27, D28). `[TEST: ::test_the_zip_updater_is_gone]`
