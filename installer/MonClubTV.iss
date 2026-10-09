@@ -450,6 +450,11 @@ var
 begin
   // NeedsRestart is never set: the 1.4.35 client starts Setup without /NORESTART.
   Root := RemoveBackslashUnlessRoot(ExpandConstant('{app}'));
+  if UpdAnotherSetupRunning(Root) then
+  begin
+    Result := '{#AppName}: another installer is already running; try again when it has finished.';
+    exit;
+  end;
   UpdSetPauseSentinel(Root);
 
   KillRunningMonClubProcesses();

@@ -409,3 +409,17 @@ def test_build_release_try_run_really_reads_the_commit_and_the_dirty_state(tmp_p
     head = _sp.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=str(REPO)).stdout.strip()
     assert f"ok=True out={head}" in r.stdout, r.stdout + r.stderr
 
+
+def test_a_second_installer_run_stops_before_the_sentinel_and_the_process_kill():
+    """L4 delta review H1: the second Setup's kill (taskkill /IM) would stop the app the first Setup is
+    health-checking -> 'crash' -> a good release banned; and its stand-down cleared the first one's sentinel."""
+    for name in ("MonClubAccess.iss", "MonClubTV.iss"):
+        text = (REPO / "installer" / name).read_text(encoding="utf-8")
+        prep = text[text.index("function PrepareToInstall"):]
+        prep = prep[: prep.index("\nend;")]
+        assert prep.index("UpdAnotherSetupRunning") < prep.index("UpdSetPauseSentinel") < prep.index("KillRunningMonClubProcesses"), name
+    safety = (REPO / "installer" / "update_safety.iss").read_text(encoding="utf-8")
+    fn = safety[safety.index("function UpdAnotherSetupRunning"):]
+    fn = fn[: fn.index("\nend;")]
+    assert "'other-setup'" in fn and "UpdFinalized := True" in fn and "UpdWriteLastUpdate" not in fn
+

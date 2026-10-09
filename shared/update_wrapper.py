@@ -37,6 +37,9 @@ SETUP_IMAGE_PS_RE = r"^monclub_(access|tv)_[0-9][0-9A-Za-z._\-]*\.(exe|tmp)$"
 # lock current\ui\, so a restore stops it too (update_helper.ps1 -UiExe).
 UI_EXE_FOR = {"monclubaccess.exe": "monclub-access-ui.exe", "monclubtv.exe": "monclub-tv-ui.exe"}
 HELPER_WAIT_MS = 15 * 60 * 1000
+# On 'backoff' (another restorer / Setup owns current\\): re-check every 30 s for up to 15 min.
+BACKOFF_TRIES = 30
+BACKOFF_INTERVAL_SEC = 30
 
 
 def setup_image_ps_re(target: Optional[str]) -> str:
@@ -90,6 +93,17 @@ def _wait_for_pid(pid: int) -> List[str]:
     ]
 
 
+def _backoff_wait(tries: int = BACKOFF_TRIES, interval_sec: int = BACKOFF_INTERVAL_SEC) -> List[str]:
+    # L4 review M1: 'backoff' = a live restorer or a running Setup owns current\ right now. It usually
+    # finishes within minutes and then starts the app itself -- but if it ends without doing so (an
+    # interactive Setup closed, a restorer killed), nobody would; TV has no watchdog. So keep checking
+    # for up to 15 min; once the journal is gone the relaunch-if-not-running step below runs.
+    return [
+        f"for ($b = 0; $b -lt {int(tries)} -and $outcome -eq 'backoff'; $b++) {{ Start-Sleep -Seconds {int(interval_sec)}; $outcome = Restore-Journal }}",
+        "if ($b -gt 0) { W ('after waiting on another restorer: ' + $outcome) }",
+    ]
+
+
 def _relaunch_if_not_running(current_dir: Path, exe_name: str) -> List[str]:
     exe = current_dir / exe_name
     return [
@@ -119,6 +133,8 @@ def build_install_script(
     setup_log: Path,
     wrapper_log: Path,
     setup_image_re: str = SETUP_IMAGE_PS_RE,
+    backoff_tries: int = BACKOFF_TRIES,
+    backoff_interval_sec: int = BACKOFF_INTERVAL_SEC,
 ) -> str:
     state_dir = install_root / "state"
     current_dir = install_root / "current"
@@ -165,7 +181,8 @@ def build_install_script(
         # current (design 8.0 claim rule).
         "$outcome = Restore-Journal",
         "if ($outcome -ne 'none') { W ('journal after Setup: ' + $outcome) }",
-        "if ($outcome -eq 'backoff') { W 'another restorer starts the app'; W 'wrapper end'; exit 0 }",
+    ] + _backoff_wait(backoff_tries, backoff_interval_sec) + [
+        "if ($outcome -eq 'backoff') { W 'still backing off: another restorer / Setup starts the app'; W 'wrapper end'; exit 0 }",
     ] + _relaunch_if_not_running(current_dir, exe_name) + ["W 'wrapper end'"]
     return "\n".join(lines)
 
@@ -290,6 +307,8 @@ def build_restore_script(
     exe_name: str,
     restore_log: Path,
     setup_image_re: str = SETUP_IMAGE_PS_RE,
+    backoff_tries: int = BACKOFF_TRIES,
+    backoff_interval_sec: int = BACKOFF_INTERVAL_SEC,
 ) -> str:
     """The start-up journal check's external half: the running app cannot overwrite its
     own locked files in current. Waits for the app to exit, restores, relaunches."""
@@ -298,7 +317,8 @@ def build_restore_script(
     ] + _wait_for_pid(app_pid) + [
         "$outcome = Restore-Journal",
         "W ('journal: ' + $outcome)",
-        "if ($outcome -eq 'backoff') { W 'another restorer starts the app'; W 'restore end'; exit 0 }",
+    ] + _backoff_wait(backoff_tries, backoff_interval_sec) + [
+        "if ($outcome -eq 'backoff') { W 'still backing off: another restorer / Setup starts the app'; W 'restore end'; exit 0 }",
     ] + _relaunch_if_not_running(install_root / "current", exe_name) + ["W 'restore end'"]
     return "\n".join(lines)
 

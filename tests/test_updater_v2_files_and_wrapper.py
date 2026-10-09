@@ -296,8 +296,8 @@ def test_setup_log_path_is_under_logs_with_version_and_utc_stamp(tmp_path):
 NO_SETUP = r"^monclub_never_running_test_pattern$"
 
 
-def _run(script: str, cwd: Path) -> None:
-    subprocess.run(uw.powershell_command(script), cwd=str(cwd), timeout=90, check=False,
+def _run(script: str, cwd: Path, timeout: float = 90) -> None:
+    subprocess.run(uw.powershell_command(script), cwd=str(cwd), timeout=timeout, check=False,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -436,11 +436,13 @@ def test_restore_helper_backs_off_while_a_setup_runs(tmp_path):
     (root / "state").mkdir()
     (root / "state" / "install_journal.json").write_text('{"phase":"copying"}', encoding="ascii")
     script = uw.build_restore_script(setup_image_re=r"^powershell\.exe$", app_pid=_dead_pid(), install_root=root,
-                                     exe_name="FakeApp.exe", restore_log=root / "logs" / "r.log")
+                                     exe_name="FakeApp.exe", restore_log=root / "logs" / "r.log",
+                                     backoff_tries=1, backoff_interval_sec=1)
     _run(script, root / "state")
     assert (root / "state" / "install_journal.json").exists()
     assert (root / "current" / "new.dll").exists()
-    assert "a Setup is still running" in (root / "logs" / "r.log").read_text(encoding="utf-8", errors="replace")
+    rlog = (root / "logs" / "r.log").read_text(encoding="utf-8", errors="replace")
+    assert "a Setup is still running" in rlog and "still backing off" in rlog and "relaunched" not in rlog
 
 
 def test_a_claim_gets_a_fresh_timestamp_right_after_the_rename(tmp_path):
@@ -517,12 +519,13 @@ def test_install_wrapper_restores_through_the_installed_update_helper(tmp_path):
 
 
 @pytest.mark.skipif(not WINDOWS or not WHOAMI.exists(), reason="needs Windows PowerShell")
-def test_install_wrapper_stands_down_on_a_live_restore_claim_and_starts_nothing(tmp_path):
-    """L4 review H1(a): another restorer holds a live claim (a PowerShell that started before it) --
-    e.g. Setup exited 7 with ABORTED restore_in_progress. The wrapper must neither restore nor start
-    the app from the half-copied current/."""
+def test_install_wrapper_waits_on_a_live_restore_claim_then_takes_over_and_relaunches(tmp_path):
+    """L4 reviews H1(a) + delta M1: another restorer holds a live claim (a PowerShell that started before
+    it) -- e.g. Setup exited 7 with ABORTED restore_in_progress. The wrapper must not restore or start the
+    app from the half-copied current/ while it lives; when that restorer dies without finishing (no
+    watchdog on TV), the wrapper's next check takes the journal over, restores and relaunches."""
     root = _root_with_installed_helper(tmp_path)
-    restorer = subprocess.Popen([uw.powershell_exe(), "-NoProfile", "-Command", "Start-Sleep -Seconds 120"])
+    restorer = subprocess.Popen([uw.powershell_exe(), "-NoProfile", "-Command", "Start-Sleep -Seconds 12"])
     try:
         time.sleep(1.5)
         claim = root / "state" / f"install_journal.restoring-{restorer.pid}.json"
@@ -534,11 +537,13 @@ def test_install_wrapper_stands_down_on_a_live_restore_claim_and_starts_nothing(
             from_version="1.5.0", to_version="1.5.1",
             setup_log=root / "logs" / "s.log", wrapper_log=root / "logs" / "w.log",
         )
-        _run(script, root / "state")
+        _run(script, root / "state", timeout=150)
         wlog = (root / "logs" / "w.log").read_text(encoding="utf-8", errors="replace")
-        assert "update_helper recover exit 22" in wlog and "another restorer starts the app" in wlog
-        assert "relaunched" not in wlog
-        assert claim.exists() and (root / "current" / "half.dll").exists()
+        first_backoff = wlog.index("update_helper recover exit 22")
+        assert "after waiting on another restorer: restored" in wlog[first_backoff:]
+        assert wlog.index("relaunched") > wlog.index("after waiting on another restorer")
+        assert not claim.exists()
+        assert sorted(p.name for p in (root / "current").iterdir()) == ["FakeApp.exe", "version.json"]
     finally:
         restorer.kill()
 

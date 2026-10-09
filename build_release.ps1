@@ -83,14 +83,17 @@ function Get-Sha256($Path) {
 # every build until L4's real run (2026-10-09).
 function Try-Run($Cmd, $CmdArgs) {
   try {
+    # Own temp files per call: two builds at once must not read each other's git output.
+    $outFile = [IO.Path]::GetTempFileName(); $errFile = [IO.Path]::GetTempFileName()
     $p = Start-Process -FilePath $Cmd -ArgumentList $CmdArgs -NoNewWindow -PassThru -Wait `
-      -RedirectStandardOutput "$env:TEMP\mc_out.txt" -RedirectStandardError "$env:TEMP\mc_err.txt"
+      -RedirectStandardOutput $outFile -RedirectStandardError $errFile
     $out = ""
     $err = ""
     # Get-Content -Raw gives NOTHING for an empty file (a quiet stderr: every successful git call), and
     # $null.Trim() threw, so every probe read as failed. Keep "" then.
-    if (Test-Path "$env:TEMP\mc_out.txt") { $o = Get-Content "$env:TEMP\mc_out.txt" -Raw; if ($null -ne $o) { $out = $o } }
-    if (Test-Path "$env:TEMP\mc_err.txt") { $e = Get-Content "$env:TEMP\mc_err.txt" -Raw; if ($null -ne $e) { $err = $e } }
+    $o = Get-Content $outFile -Raw; if ($null -ne $o) { $out = $o }
+    $e = Get-Content $errFile -Raw; if ($null -ne $e) { $err = $e }
+    Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
     return @{ ok = ($p.ExitCode -eq 0); code = $p.ExitCode; out = $out.Trim(); err = $err.Trim() }
   } catch {
     return @{ ok = $false; code = -1; out = ""; err = "$($_.Exception.Message)" }
@@ -278,7 +281,7 @@ if (-not $SkipChecks) {
   # Rationale: the 1.4.20/1.4.21 artifacts were built from a dirty tree, so the
   # shipped binary corresponded to no commit and could not be reproduced or
   # reviewed. $git.dirty was already computed here and then silently discarded.
-  if ($git.available -and ($git.dirty -eq $true)) {
+  if ($git.available -and ($git.dirty -ne $false)) {
     Write-Host "" 
     Write-Host "BUILD BLOCKED - the working tree has uncommitted changes." -ForegroundColor Red
     Write-Host "  The artifact would correspond to no commit and be unreproducible." -ForegroundColor Red
@@ -354,7 +357,7 @@ if ($SkipTests) {
   }
 }
 
-$publishable = -not ($SkipTests -or $SkipChecks -or $E2ETestKeys -or $TestFail -or ($git.dirty -eq $true))
+$publishable = -not ($SkipTests -or $SkipChecks -or $E2ETestKeys -or $TestFail -or ($git.dirty -ne $false))
 if ($publishable -and ($git.commit -notmatch '^[0-9a-f]{40}$')) {
   throw "A publishable build needs git: the release file records the built commit (publish tags it, D31)."
 }

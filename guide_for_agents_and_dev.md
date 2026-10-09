@@ -5674,8 +5674,10 @@ setup_exit_<code>` (a result the relaunched app already consumed, `last_update.c
 newer than the start, counts as written) → run the journal restore: the INSTALLED
 `{app}\watchdog\update_helper.ps1 -Action recover` (the same code Setup and the watchdog run: live-claim
 stand-down, stop the app + UI running from `current\`, robocopy `/MIR` `previous` → `current`); exit 22
-(a live claim / a running Setup) = stand down and start nothing; the inline PowerShell copy is only a
-fallback for a root without the helper → if no
+(a live claim / a running Setup) = back off and re-check every 30 s for up to 15 min (the other restorer
+usually finishes and starts the app; if it dies without doing so the next check takes over — TV has no
+watchdog), then start nothing; the inline PowerShell copy is only a fallback for a root without the helper
+→ if no
 `<exe>` runs from `{app}\current`, start `{app}\current\<exe>` with that working directory. `[TEST: test_updater_v2_files_and_wrapper.py::test_install_wrapper_runs_for_real_writes_aborted_and_relaunches_the_old_app, ::test_install_wrapper_restores_a_journal_setup_left_behind_before_relaunching — real PowerShell, stand-in Setup]`
 `[TEST: ::test_install_wrapper_restores_through_the_installed_update_helper,
 ::test_install_wrapper_stands_down_on_a_live_restore_claim_and_starts_nothing — real PowerShell + the real helper]`
@@ -5734,10 +5736,11 @@ by the watchdog's scheduled task (L4 E2E).
   the app quits. An unknown idle time never counts as idle. TV has no doors: 24 h alone
   (**default awaiting the owner**). DEVICE-mode rows are recorded at the attendance pull, so
   for them "15 min" is measured from the pull. `[CODE: access/update_runtime.py::seconds_since_last_door_event; TEST: ::test_fallback_waits_24h_and_15_minutes_without_a_door_event]`
-- Loop guard (`update_state.json` `versions`): a `ROLLED_BACK` with reason `crash`, `setup_failed`,
-  `restore_failed` bans the version from **automatic** install at once (an `ABORTED` with those
-  reasons never ran the new version: a strike, `::test_an_aborted_setup_failed_is_a_strike_not_a_ban`); any other failure
-  (`health_timeout`, `backup_failed`, `interrupted`, `setup_exit_<n>`, an attempt that left
+- Loop guard (`update_state.json` `versions`): a `ROLLED_BACK` with reason `crash` or `setup_failed`
+  bans the version from **automatic** install at once (an `ABORTED` with those reasons never ran the
+  new version: a strike, `::test_an_aborted_setup_failed_is_a_strike_not_a_ban`); any other failure
+  (`health_timeout`, `backup_failed`, `interrupted`, `restore_failed` — a restore can fail on a version
+  that never ran —, `setup_exit_<n>`, an attempt that left
   no result at all) is a strike, two strikes ban. A struck version is retried
   automatically only after the next Windows boot (or 24 h later on a PC never switched
   off) — not when Setup relaunches the old version seconds after the failure. "Boot" is
@@ -5794,12 +5797,14 @@ extracted to `{tmp}` and also installed into `{app}\watchdog`). `[CODE]`
   Inno's uninstall log valid), `previous\` (the version before the last update — a manual
   rollback is copying it back), `state\` (§11.1), `logs\`, `downloads\`, `watchdog\` (Access: watchdog
   scripts + `update_helper.ps1`; TV: `update_helper.ps1` only — the client's wrapper runs it). `[CODE]`
-- **`PrepareToInstall`:** pause sentinel → stop the app → `update_helper -Action recover
+- **`PrepareToInstall`:** FIRST `update_helper -Action other-setup`: another process with this product's
+  Setup image name that is not our own Setup (`.exe` stub / `.tmp` ancestors) = a second installer run
+  (staff starting it by hand during the morning auto-install) → this Setup ends at once with exit 7 and
+  changes nothing (no sentinel, no `last_update.json`, nothing stopped), so it can never kill the app the
+  first Setup is health-checking or clear its sentinel `[CODE; TEST: test_updater_v2_install_helper.py::test_other_setup_reports_another_installer_of_the_product_and_recover_ignores_it,
+  test_updater_v2_installer_scripts.py::test_a_second_installer_run_stops_before_the_sentinel_and_the_process_kill]` → pause sentinel → stop the app → `update_helper -Action recover
   -InSetup` (a journal or claim found now was left by a dead Setup or restorer: it is restored
-  first, whatever its age, so re-running an installer repairs a half-written PC — unless another
-  process with this product's Setup image name, not our own Setup, is running: then it stands down
-  and Setup ends `ABORTED restore_in_progress`, exit 7, so a second installer run never restores or
-  backs up under the first; `test_updater_v2_install_helper.py::test_recover_in_setup_stands_down_while_another_setup_of_the_product_runs`) → backup:
+  first, whatever its age, so re-running an installer repairs a half-written PC) → backup:
   journal `backing_up` → robocopy `/MIR` `current` → `previous` → verify (exe + `version.json`
   + same file count and bytes) → journal `copying` → empty `current` **files only** (up to
   15 s of retries per locked item). `current` is never deleted as a tree and never renamed

@@ -221,6 +221,20 @@ begin
   Log('update_helper ' + Action + ' exit=' + IntToStr(Result));
 end;
 
+// L4 review: a second installer run of the same product (staff starting it by hand during the
+// morning auto-install) must not stop the app or touch current\ under the first one. Checked FIRST in
+// PrepareToInstall -- before the pause sentinel and the process kill -- by Setup image name (never a
+// bare pid). On True, Setup ends quietly: no sentinel, no last_update.json, nothing stopped.
+function UpdAnotherSetupRunning(const Root: string): Boolean;
+begin
+  Result := UpdRunHelper('other-setup', Root, '') = 22;
+  if Result then
+  begin
+    UpdFinalized := True;
+    Log('Another installer of {#AppName} is running: this one stops here and changes nothing.');
+  end;
+end;
+
 // Start the installed app from current\ unless it already runs from there. Falls back to a
 // direct start when PowerShell is unusable, so this never depends on the helper alone.
 procedure UpdRelaunch(const Root: string);

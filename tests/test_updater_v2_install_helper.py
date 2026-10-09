@@ -474,10 +474,11 @@ def test_a_claim_older_than_its_powershell_process_is_a_reused_pid_not_a_live_re
         ps.wait()
 
 
-def test_recover_in_setup_stands_down_while_another_setup_of_the_product_runs(root: Path, tmp_path: Path):
-    """L4 review M2: a second installer run (by hand, during the morning auto-install) must not restore
-    or back up under the first. Detected by the Setup IMAGE NAME (a reused pid never has it), excluding
-    our own Setup -- here the helper's parent is pytest, so any monclub_access_* process is "another"."""
+def test_other_setup_reports_another_installer_of_the_product_and_recover_ignores_it(root: Path, tmp_path: Path):
+    """L4 reviews: a second installer run (by hand, during the morning auto-install) must not stop the app or
+    touch current/ under the first. Setup asks `-Action other-setup` FIRST in PrepareToInstall; it matches the
+    Setup IMAGE NAME (a reused pid never has it) and excludes our own Setup's ancestors -- here the helper's
+    parent is pytest, so any monclub_access_* process is "another". recover -InSetup keeps L2's rule."""
     import shutil
 
     write_payload(root / "previous", "1.0.0")
@@ -488,14 +489,14 @@ def test_recover_in_setup_stands_down_while_another_setup_of_the_product_runs(ro
     p = subprocess.Popen([str(other), "-n", "60", "127.0.0.1"], stdout=subprocess.DEVNULL)
     try:
         time.sleep(1)
-        r = run_helper("recover", root, "-InSetup")
+        r = run_helper("other-setup", root)
         assert r.returncode == 22, r.stdout + r.stderr
         assert "another access Setup is running" in r.stdout
         assert (root / "state" / "install_journal.json").exists()
-        assert tree(root / "current") != tree(root / "previous")
     finally:
         p.kill()
         p.wait()
+    assert run_helper("other-setup", root).returncode == 0
     r = run_helper("recover", root, "-InSetup")
     assert r.returncode == 20, r.stdout + r.stderr
 

@@ -34,7 +34,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('backup', 'restore', 'launch-wait', 'relaunch', 'recover')]
+    [ValidateSet('backup', 'restore', 'launch-wait', 'relaunch', 'recover', 'other-setup')]
     [string] $Action,
 
     [Parameter(Mandatory = $true)]
@@ -431,14 +431,18 @@ try {
             }
         }
 
-        'recover' {
-            if ($InSetup) {
-                $others = @(Get-OtherSetupPids)
-                if ($others.Count -gt 0) {
-                    Write-HelperLog ("another {0} Setup is running (pid {1}) -- standing down" -f $SetupTarget, ($others -join ', '))
-                    exit 22
-                }
+        'other-setup' {
+            # Called by Setup FIRST in PrepareToInstall, before it sets the sentinel or stops the app:
+            # 22 = another installer run of this product is working on this PC right now.
+            $others = @(Get-OtherSetupPids)
+            if ($others.Count -gt 0) {
+                Write-HelperLog ("another {0} Setup is running (pid {1})" -f $SetupTarget, ($others -join ', '))
+                exit 22
             }
+            exit 0
+        }
+
+        'recover' {
             # A claim left by a restorer (app start-up, wrapper, watchdog, us): alive = a restore
             # is in progress, stand down; dead = it died mid-restore, hand the journal back.
             foreach ($claim in @(Get-ChildItem -LiteralPath $StateDir -Filter 'install_journal.restoring-*.json' -ErrorAction SilentlyContinue)) {

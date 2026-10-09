@@ -74,7 +74,9 @@ OUTBOX_MAX = 50
 _TELEMETRY_RETRY_CODES = (401, 403, 408, 428, 429)
 # Results after which a version is never auto-installed again (design 7 loop guard).
 # Anything else (health_timeout, interrupted, no result, Setup exit) gets one retry.
-_BAN_REASONS = {"crash", "after_copy_failed", "setup_failed", "copy_failed", "post_install_failed", "restore_failed"}
+# restore_failed is NOT here (L4 review M2): a restore can fail on a version that never ran (a backup or a
+# power cut interrupted before the copy, then an antivirus lock) -- it is a strike.
+_BAN_REASONS = {"crash", "after_copy_failed", "setup_failed", "copy_failed", "post_install_failed"}
 TELEMETRY_RESULTS = {"PENDING", "INSTALLED", "ROLLED_BACK", "ABORTED", "VERIFY_FAILED", "DOWNLOAD_FAILED"}
 # GetTickCount64-derived boot times drift by a second or two between reads.
 _BOOT_EPOCH_SLACK_SEC = 120
@@ -1281,6 +1283,18 @@ class ComponentUpdateManager:
         if not pending:
             return False
         version = str(pending.get("version"))
+        installed = self.get_current_version()
+        if pending.get("rollback"):
+            stale_pending = installed != _safe_str(pending.get("rollbackFrom"), "")
+        else:
+            order = compare_versions(version, installed)
+            stale_pending = order is not None and order <= 0
+        if stale_pending:
+            # Installed already (or older): with the server unreachable it would run Setup -> same
+            # version -> relaunch at every start (L4 review M3).
+            self._discard_pending(f"{version} is not newer than the running {installed}")
+            self._refresh_status_from_state()
+            return False
         ban = self._ban_reason(version) or self._retry_wait_reason(version)
         if ban:
             self._log("info", "pending %s not auto-installed: %s (Update page button still works)", version, ban)

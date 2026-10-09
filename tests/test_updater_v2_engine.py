@@ -668,3 +668,34 @@ def test_an_aborted_setup_failed_is_a_strike_not_a_ban(env):
     mgr._record_failure(d, "1.5.2", "setup_failed", "ROLLED_BACK")
     assert d["versions"]["1.5.2"]["banned"] is True
 
+
+def test_a_failed_restore_is_a_strike_not_a_ban(env):
+    """L4 delta review M2: ROLLED_BACK restore_failed can come from a version that never ran (a backup or
+    power cut interrupted before the copy, then one restore blocked by an antivirus lock)."""
+    mgr = env.make()
+    d = {}
+    mgr._record_failure(d, "1.5.1", "restore_failed", "ROLLED_BACK")
+    assert not d["versions"]["1.5.1"].get("banned") and d["versions"]["1.5.1"]["strikes"] == 1
+
+
+def test_a_pending_that_is_not_newer_than_the_running_version_is_discarded_not_installed(env):
+    """L4 delta review M3: with the server unreachable the gate installed 'still offered' -- a pending equal
+    to the running version would run Setup -> same version -> relaunch at every start."""
+    mgr = _pending_ready(env, version="1.5.1")
+    env.installed["version"] = "1.5.1"
+    env.api.raise_on_get = RuntimeError("no network at 07:00")
+    assert mgr.startup_gate(token="tok") is False
+    assert env.launched == [] and "pending" not in _state(mgr)
+
+
+def test_a_rollback_pending_is_installed_only_on_its_rollback_from_version(env):
+    mgr = env.make()
+    env.installed["version"] = "1.5.1"
+    _serve(env, make_offer(version="1.5.0", rollback_from="1.5.1"), version="1.5.0")
+    _check(mgr)
+    assert _state(mgr)["pending"]["version"] == "1.5.0"
+    env.installed["version"] = "1.5.2"  # the PC moved on meanwhile: the rollback no longer applies
+    env.api.raise_on_get = RuntimeError("no network")
+    assert mgr.startup_gate(token="tok") is False
+    assert "pending" not in _state(mgr)
+
