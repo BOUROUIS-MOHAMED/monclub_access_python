@@ -48,12 +48,21 @@ $tvIconMap = [ordered]@{
 }
 $iconRestoreDir = $null
 
+# Both shells compile from the one tauri.conf.json, which names Access. tauri-build and
+# generate_context! merge TAURI_CONFIG into it: productName becomes the exe's ProductName
+# and FileDescription (Task Manager), identifier names the WebView2 data folder
+# (%LOCALAPPDATA%\<identifier>). Without this the TV shell said "MonClub Access" and shared
+# Access's WebView2 folder. Set for both components so an inherited value cannot leak in.
+$tauriConfigOverride = @{ productName = $meta.DisplayName; identifier = $meta.TauriIdentifier } | ConvertTo-Json -Compress
+$previousTauriConfig = $env:TAURI_CONFIG
+
 Write-Host "== Build Tauri shell ==" -ForegroundColor Cyan
 Write-Host "Component : $($meta.DisplayName)"
 Write-Host "Profile   : $Profile"
 Write-Host "Version   : $($versionInfo.Version)"
 Write-Host "Source EXE: $sourceExe"
 Write-Host "Staged EXE: $stagedExe"
+Write-Host "Identity  : $tauriConfigOverride"
 
 if ($DryRun) {
   Write-Host "DryRun enabled. Target resolution only." -ForegroundColor Yellow
@@ -129,12 +138,14 @@ try {
     }
     $cargoArgs += "--features"
     $cargoArgs += "custom-protocol"
+    $env:TAURI_CONFIG = $tauriConfigOverride
     cargo @cargoArgs
     if ($LASTEXITCODE -ne 0) {
       throw "cargo build ($Profile) failed with exit code $LASTEXITCODE"
     }
   }
   finally {
+    $env:TAURI_CONFIG = $previousTauriConfig
     Pop-Location
   }
 }
