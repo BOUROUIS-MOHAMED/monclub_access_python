@@ -33,6 +33,12 @@ SETUP_WAIT_MS = 30 * 60 * 1000
 SETUP_IMAGE_PS_RE = r"^monclub_(access|tv)_[0-9][0-9A-Za-z._\-]*\.(exe|tmp)$"
 
 
+# The Tauri UI that runs beside each app (installer/*.iss TauriExe): it can outlive the app and
+# lock current\ui\, so a restore stops it too (update_helper.ps1 -UiExe).
+UI_EXE_FOR = {"monclubaccess.exe": "monclub-access-ui.exe", "monclubtv.exe": "monclub-tv-ui.exe"}
+HELPER_WAIT_MS = 15 * 60 * 1000
+
+
 def setup_image_ps_re(target: Optional[str]) -> str:
     """SETUP_IMAGE_PS_RE for one product (an Access wrapper never waits for / stops TV's Setup)."""
     if not target:
@@ -73,9 +79,14 @@ def _prelude(log_path: Path) -> List[str]:
 
 
 def _wait_for_pid(pid: int) -> List[str]:
+    # The wrapper is the app's child and Setup will be the wrapper's: Setup's
+    # "taskkill /F /T /IM <exe>" on a still-running app would kill this whole tree, Setup's
+    # own .tmp included, before any journal exists (L4 review M1). So an app that has not
+    # exited after 90 s is stopped here -- that pid only -- before Setup starts.
     return [
         f"$app = Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue",
-        f"if ($app) {{ if (-not $app.WaitForExit({APP_EXIT_WAIT_MS})) {{ W 'app pid {int(pid)} still running after {APP_EXIT_WAIT_MS // 1000} s; continuing' }} }}",
+        f"if ($app) {{ if (-not $app.WaitForExit({APP_EXIT_WAIT_MS})) {{ W 'app pid {int(pid)} still running after {APP_EXIT_WAIT_MS // 1000} s; stopping that pid only'; "
+        f"try {{ Stop-Process -Id {int(pid)} -Force -ErrorAction Stop }} catch {{ W ('stop failed: ' + $_) }}; $null = $app.WaitForExit(10000) }} }}",
     ]
 
 
@@ -141,6 +152,10 @@ def build_install_script(
         f"  $lu = {_ps(last_update)}",
         "  $fresh = $false",
         "  if (Test-Path -LiteralPath $lu) { $fresh = ((Get-Item -LiteralPath $lu).LastWriteTimeUtc -ge $started) }",
+        # The relaunched old app may already have consumed Setup's result (renamed to
+        # last_update.consumed.json, which keeps the mtime): it is fresh too (L4 review M3).
+        f"  $luc = {_ps(state_dir / 'last_update.consumed.json')}",
+        "  if (-not $fresh -and (Test-Path -LiteralPath $luc)) { $fresh = ((Get-Item -LiteralPath $luc).LastWriteTimeUtc -ge $started) }",
         "  if (-not $fresh) {",
         f"    $j = {_ps(aborted_json_head)} + $code + '\",\"at\":\"' + (NowZ) + '\"}}'",
         "    try { [IO.File]::WriteAllText($lu, $j); W 'wrote ABORTED result' } catch { W ('could not write result: ' + $_) }",
@@ -161,13 +176,51 @@ def _setup_functions(setup_image_re: str) -> List[str]:
     return [
         "function Get-Setups { try { @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { "
         f"$_.Name -match {_ps(setup_image_re)} }}) }} catch {{ @() }} }}",
-        "function Stop-Setups { foreach ($q in (Get-Setups)) { try { Stop-Process -Id $q.ProcessId -Force -ErrorAction Stop; "
-        "W ('stopped ' + $q.Name + ' pid ' + $q.ProcessId) } catch {} } }",
+        # Stop each Setup and its child processes (Setup's update_helper PowerShell and its robocopy
+        # would keep writing current), then wait for them to be gone before any restore (L4 review L4).
+        "function Stop-Setups { $ids = @(); foreach ($q in (Get-Setups)) { $ids += [int]$q.ProcessId; "
+        "try { foreach ($c in @(Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $q.ProcessId) -ErrorAction Stop)) { "
+        "$ids += [int]$c.ProcessId; foreach ($g in @(Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $c.ProcessId) -ErrorAction SilentlyContinue)) { $ids += [int]$g.ProcessId } } } catch {} }; "
+        "foreach ($i in $ids) { try { Stop-Process -Id $i -Force -ErrorAction Stop; W ('stopped pid ' + $i) } catch {} }; "
+        "foreach ($i in $ids) { try { Wait-Process -Id $i -Timeout 15 -ErrorAction SilentlyContinue } catch {} } }",
     ]
 
 
 def _restore_function(install_root: Path, exe_name: str) -> List[str]:
-    """PowerShell ``Restore-Journal`` -- the journal contract of design 8.0 (L2/L3 2026-10-09).
+    """PowerShell ``Restore-Journal``: run the INSTALLED ``{app}\\watchdog\\update_helper.ps1 -Action
+    recover`` (lane L2, the same code Setup and the watchdog run) and map its exit code -- 0 none, 20
+    restored, 21 deleted (current intact), 22 backoff (a live claim, a running Setup, or not stale),
+    23/other failed. One implementation of design 8.0: live-claim stand-down, stop the app + UI running
+    from current\\, robocopy /MIR previous -> current (L4 review H1: the inline copy below ignored
+    claims and deleted current before copying). The inline function remains only for an install
+    root without the helper (never a v2 install); it now also backs off on any claim and mirrors.
+    """
+    helper = install_root / "watchdog" / "update_helper.ps1"
+    ui_exe = UI_EXE_FOR.get(exe_name.lower(), "")
+    helper_args = (
+        f'-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{helper}" -Action recover '
+        f'-InstallRoot "{install_root}" -AppExe "{exe_name}" -UiExe "{ui_exe}" '
+        f'-LogPath "{install_root / "logs" / "update-recover.log"}"'
+    )
+    return [
+        "function Restore-Journal {",
+        f"  $helper = {_ps(helper)}",
+        "  if (-not (Test-Path -LiteralPath $helper)) { return (Restore-JournalInline) }",
+        "  $rc = -1",
+        "  try {",
+        f"    $hp = Start-Process -FilePath {_ps(powershell_exe())} -ArgumentList {_ps(helper_args)} "
+        f"-WorkingDirectory {_ps(install_root / 'state')} -WindowStyle Hidden -PassThru -ErrorAction Stop",
+        "    $null = $hp.Handle",
+        f"    if ($hp.WaitForExit({HELPER_WAIT_MS})) {{ $rc = $hp.ExitCode }} else {{ W 'recover helper still running; leaving it'; return 'backoff' }}",
+        "  } catch { W ('recover helper did not start: ' + $_); return (Restore-JournalInline) }",
+        "  W ('update_helper recover exit ' + $rc)",
+        "  switch ($rc) { 0 { return 'none' } 20 { return 'restored' } 21 { return 'deleted' } 22 { return 'backoff' } default { return 'failed' } }",
+        "}",
+    ] + _restore_inline_function(install_root, exe_name)
+
+
+def _restore_inline_function(install_root: Path, exe_name: str) -> List[str]:
+    """Fallback ``Restore-JournalInline`` -- the journal contract of design 8.0 (L2/L3 2026-10-09).
 
     Claim first: rename to ``install_journal.restoring-<pid>.json``; a failed rename means
     another restorer (watchdog, Setup, the app) owns it -> back off. ``backing_up`` ->
@@ -176,11 +229,14 @@ def _restore_function(install_root: Path, exe_name: str) -> List[str]:
     restore puts the journal back for the next restorer. Returns
     ``restored`` / ``deleted`` / ``backoff`` / ``failed`` / ``none``."""
     return [
-        "function Restore-Journal {",
+        "function Restore-JournalInline {",
         f"  $state = {_ps(install_root / 'state')}",
         f"  $cur = {_ps(install_root / 'current')}",
         f"  $prev = {_ps(install_root / 'previous')}",
         "  $journal = Join-Path $state 'install_journal.json'",
+        # Any claim: another restorer may be copying right now -- never start the app under it.
+        "  if (@(Get-ChildItem -LiteralPath $state -Filter 'install_journal.restoring-*.json' -ErrorAction SilentlyContinue).Count -gt 0) "
+        "{ W 'a restore claim exists; standing down'; return 'backoff' }",
         "  if (-not (Test-Path -LiteralPath $journal)) { return 'none' }",
         "  if (@(Get-Setups).Count -gt 0) { W 'a Setup is still running; leaving the journal to it'; return 'backoff' }",
         "  $claimName = 'install_journal.restoring-' + $PID + '.json'",
@@ -204,9 +260,11 @@ def _restore_function(install_root: Path, exe_name: str) -> List[str]:
         "  $ok = $false",
         "  for ($i = 0; $i -lt 15 -and -not $ok; $i++) {",
         "    try {",
-        "      if (-not (Test-Path -LiteralPath $cur)) { New-Item -ItemType Directory -Path $cur -Force | Out-Null }",
-        "      Get-ChildItem -LiteralPath $cur -Force | Remove-Item -Recurse -Force -ErrorAction Stop",
-        "      Get-ChildItem -LiteralPath $prev -Force | Copy-Item -Destination $cur -Recurse -Force -ErrorAction Stop",
+        f"      foreach ($q in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {{ $_.ExecutablePath -and $_.ExecutablePath.ToLower().StartsWith(($cur + '\\').ToLower()) }})) "
+        "{ try { Stop-Process -Id $q.ProcessId -Force -ErrorAction Stop; W ('stopped ' + $q.ExecutablePath) } catch {} }",
+        "      $robo = Join-Path $env:SystemRoot 'System32\\robocopy.exe'",
+        "      $null = & $robo $prev $cur /MIR /COPY:DAT /R:2 /W:1 /NP /NFL /NDL /NJH /NJS",
+        "      if ($LASTEXITCODE -ge 8) { throw ('robocopy exit ' + $LASTEXITCODE) }",
         "      $ok = $true",
         "    } catch { W ('restore attempt ' + $i + ' failed: ' + $_); Start-Sleep -Seconds 1 }",
         "  }",

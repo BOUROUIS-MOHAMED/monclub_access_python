@@ -920,12 +920,15 @@ class ComponentUpdateManager:
             return _safe_str(entry.get("banReason"), "failed before")
         return None
 
-    def _record_failure(self, d: Dict[str, Any], version: str, reason: str) -> None:
+    def _record_failure(self, d: Dict[str, Any], version: str, reason: str, kind: str = "ROLLED_BACK") -> None:
         versions = d.setdefault("versions", {})
         entry = versions.setdefault(version, {})
         entry["lastFailureAt"] = self._clock()
         entry["lastFailureBoot"] = self._boot_epoch()
-        if reason in _BAN_REASONS:
+        # A ban needs the new version to have been copied and to have failed (design 7): an ABORTED
+        # result -- even "setup_failed" / "restore_failed" written before anything changed -- never ran
+        # it, so it is a strike (L4 review M4).
+        if reason in _BAN_REASONS and kind == "ROLLED_BACK":
             entry["banned"] = True
             entry["banReason"] = reason
         else:
@@ -1006,7 +1009,7 @@ class ComponentUpdateManager:
             elif kind == "ABORTED" and reason == "same_version":
                 pass
             elif kind in ("ROLLED_BACK", "ABORTED") and tried and tried != installed:
-                self._record_failure(d, tried, reason or "unknown")
+                self._record_failure(d, tried, reason or "unknown", kind)
             d["lastConsumed"] = marker
             d["lastResult"] = {
                 "result": kind or "UNKNOWN",

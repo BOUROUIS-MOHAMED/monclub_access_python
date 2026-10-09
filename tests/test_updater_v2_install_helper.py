@@ -472,3 +472,30 @@ def test_a_claim_older_than_its_powershell_process_is_a_reused_pid_not_a_live_re
     finally:
         ps.kill()
         ps.wait()
+
+
+def test_recover_in_setup_stands_down_while_another_setup_of_the_product_runs(root: Path, tmp_path: Path):
+    """L4 review M2: a second installer run (by hand, during the morning auto-install) must not restore
+    or back up under the first. Detected by the Setup IMAGE NAME (a reused pid never has it), excluding
+    our own Setup -- here the helper's parent is pytest, so any monclub_access_* process is "another"."""
+    import shutil
+
+    write_payload(root / "previous", "1.0.0")
+    write_payload(root / "current", "2.0.0")
+    write_journal(root, "copying", utc(-30))
+    other = tmp_path / "monclub_access_9.9.9.exe"
+    shutil.copy(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "PING.EXE", other)
+    p = subprocess.Popen([str(other), "-n", "60", "127.0.0.1"], stdout=subprocess.DEVNULL)
+    try:
+        time.sleep(1)
+        r = run_helper("recover", root, "-InSetup")
+        assert r.returncode == 22, r.stdout + r.stderr
+        assert "another access Setup is running" in r.stdout
+        assert (root / "state" / "install_journal.json").exists()
+        assert tree(root / "current") != tree(root / "previous")
+    finally:
+        p.kill()
+        p.wait()
+    r = run_helper("recover", root, "-InSetup")
+    assert r.returncode == 20, r.stdout + r.stderr
+

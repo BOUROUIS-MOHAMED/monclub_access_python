@@ -94,6 +94,9 @@ Name: "{app}\state"
 [Files]
 ; Safe-swap helper (updater v2), extracted to {tmp} for Setup's own use.
 Source: "update_helper.ps1"; Flags: dontcopy
+; Also installed: the v2 client's install wrapper and start-up restore run
+; {app}\watchdog\update_helper.ps1 -Action recover (the one journal rule, design 8.0; L4 review H1).
+Source: "update_helper.ps1"; DestDir: "{app}\watchdog"; Flags: ignoreversion
 ; version.json and then the exe are copied LAST (Inno installs [Files] in script order): if
 ; power is cut during the copy, a present exe means the whole payload is there, and a
 ; version.json without the exe is never taken for an installed version (review #3 / #5).

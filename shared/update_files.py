@@ -374,6 +374,8 @@ def live_restore_claims(
                 os.replace(claim, paths.journal)
             else:
                 claim.unlink()
+        except FileNotFoundError:
+            continue  # another restorer handed it back first: not a restore in progress (L4 review L3)
         except OSError:
             live.append(claim)
     return live

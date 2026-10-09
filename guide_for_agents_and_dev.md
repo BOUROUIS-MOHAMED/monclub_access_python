@@ -5664,14 +5664,21 @@ any failure raises `InstallRefused` and the app keeps running — the "Restart t
 handler answers 500 with the reason (`local_access_api_v2.py::_handle_component_update_install`). `[CODE; TEST: test_updater_v2_app_wiring.py::test_install_answers_an_error_and_never_quits_when_the_wrapper_fails]`
 
 The wrapper (`shared/update_wrapper.py::build_install_script`): wait up to 90 s for the app
-pid → `Start-Process <setup> -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+pid, then stop that pid only (Setup's `taskkill /T` on a live app would kill the wrapper's whole
+tree, Setup's own `.tmp` included, before any journal exists) → `Start-Process <setup> -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART
 /LOG="{app}\logs\update-<ver>-<utc>.log"' -WorkingDirectory {app}\state -PassThru` and
 `WaitForExit(30 min)` on the Setup stub (not `-Wait`, which would also wait for the app
 Setup starts; a Setup still running after 30 min is stopped, with every Setup-pattern
 process) → on a non-zero exit with no fresh `last_update.json`, write `ABORTED
-setup_exit_<code>` → if Setup left a journal, run the journal restore (it backs off while
-any Setup-pattern process runs) → if no
+setup_exit_<code>` (a result the relaunched app already consumed, `last_update.consumed.json`
+newer than the start, counts as written) → run the journal restore: the INSTALLED
+`{app}\watchdog\update_helper.ps1 -Action recover` (the same code Setup and the watchdog run: live-claim
+stand-down, stop the app + UI running from `current\`, robocopy `/MIR` `previous` → `current`); exit 22
+(a live claim / a running Setup) = stand down and start nothing; the inline PowerShell copy is only a
+fallback for a root without the helper → if no
 `<exe>` runs from `{app}\current`, start `{app}\current\<exe>` with that working directory. `[TEST: test_updater_v2_files_and_wrapper.py::test_install_wrapper_runs_for_real_writes_aborted_and_relaunches_the_old_app, ::test_install_wrapper_restores_a_journal_setup_left_behind_before_relaunching — real PowerShell, stand-in Setup]`
+`[TEST: ::test_install_wrapper_restores_through_the_installed_update_helper,
+::test_install_wrapper_stands_down_on_a_live_restore_claim_and_starts_nothing — real PowerShell + the real helper]`
 `[UNVERIFIED]` that the hidden PowerShell survives the app's exit when the app was started
 by the watchdog's scheduled task (L4 E2E).
 
@@ -5727,8 +5734,9 @@ by the watchdog's scheduled task (L4 E2E).
   the app quits. An unknown idle time never counts as idle. TV has no doors: 24 h alone
   (**default awaiting the owner**). DEVICE-mode rows are recorded at the attendance pull, so
   for them "15 min" is measured from the pull. `[CODE: access/update_runtime.py::seconds_since_last_door_event; TEST: ::test_fallback_waits_24h_and_15_minutes_without_a_door_event]`
-- Loop guard (`update_state.json` `versions`): result reasons `crash`, `setup_failed`,
-  `restore_failed` ban the version from **automatic** install at once; any other failure
+- Loop guard (`update_state.json` `versions`): a `ROLLED_BACK` with reason `crash`, `setup_failed`,
+  `restore_failed` bans the version from **automatic** install at once (an `ABORTED` with those
+  reasons never ran the new version: a strike, `::test_an_aborted_setup_failed_is_a_strike_not_a_ban`); any other failure
   (`health_timeout`, `backup_failed`, `interrupted`, `setup_exit_<n>`, an attempt that left
   no result at all) is a strike, two strikes ban. A struck version is retried
   automatically only after the next Windows boot (or 24 h later on a PC never switched
@@ -5783,11 +5791,14 @@ extracted to `{tmp}` and also installed into `{app}\watchdog`). `[CODE]`
 
 - **`{app}` layout:** `current\` (the running version; `[Files]` still target it, which keeps
   Inno's uninstall log valid), `previous\` (the version before the last update — a manual
-  rollback is copying it back), `state\` (§11.1), `logs\`, `downloads\`, `watchdog\` (watchdog
-  scripts + `update_helper.ps1`). `[CODE]`
+  rollback is copying it back), `state\` (§11.1), `logs\`, `downloads\`, `watchdog\` (Access: watchdog
+  scripts + `update_helper.ps1`; TV: `update_helper.ps1` only — the client's wrapper runs it). `[CODE]`
 - **`PrepareToInstall`:** pause sentinel → stop the app → `update_helper -Action recover
   -InSetup` (a journal or claim found now was left by a dead Setup or restorer: it is restored
-  first, whatever its age, so re-running an installer repairs a half-written PC) → backup:
+  first, whatever its age, so re-running an installer repairs a half-written PC — unless another
+  process with this product's Setup image name, not our own Setup, is running: then it stands down
+  and Setup ends `ABORTED restore_in_progress`, exit 7, so a second installer run never restores or
+  backs up under the first; `test_updater_v2_install_helper.py::test_recover_in_setup_stands_down_while_another_setup_of_the_product_runs`) → backup:
   journal `backing_up` → robocopy `/MIR` `current` → `previous` → verify (exe + `version.json`
   + same file count and bytes) → journal `copying` → empty `current` **files only** (up to
   15 s of retries per locked item). `current` is never deleted as a tree and never renamed

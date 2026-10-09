@@ -257,12 +257,43 @@ function Start-AppFromCurrent {
     return Start-Process -FilePath $exe -WorkingDirectory $CurrentDir -PassThru
 }
 
+# Setup image processes of this product other than our own Setup (the .tmp that runs this helper and
+# its .exe stub): under -InSetup, another one means a second installer run of the same product is
+# working on this install right now (staff starting the installer by hand during the morning
+# auto-install) -- it must not restore or back up underneath the first (L4 review M2). By image NAME,
+# never by a bare pid: a pid reused after a power cut must not block the repair (L2's -InSetup rule).
+function Get-OtherSetupPids {
+    try {
+        $all = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    } catch { return @() }
+    $byPid = @{}
+    foreach ($p in $all) { $byPid[[int] $p.ProcessId] = $p }
+    $mine = @{}
+    $cur = [int] $PID
+    for ($i = 0; $i -lt 4 -and $byPid.ContainsKey($cur); $i++) {
+        $mine[$cur] = $true
+        $cur = [int] $byPid[$cur].ParentProcessId
+    }
+    $others = @()
+    foreach ($p in $all) {
+        if (([string] $p.Name -match $SetupImageRe) -and -not $mine.ContainsKey([int] $p.ProcessId)) { $others += [int] $p.ProcessId }
+    }
+    return $others
+}
+
 function Test-SetupRunning {
     try {
         foreach ($p in @(Get-CimInstance Win32_Process -ErrorAction Stop)) {
             if ([string] $p.Name -match $SetupImageRe) { return $true }
         }
-    } catch { }
+    } catch {
+        # WMI broken: Get-Process instead of "no Setup" (a restore under a live Setup is the worse
+        # error; Python's update_files.setup_is_running treats an unreadable list as running). L4 review L1.
+        foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+            $n = [string] $p.ProcessName
+            if (($n -match $SetupImageRe) -or (($n + '.exe') -match $SetupImageRe)) { return $true }
+        }
+    }
     return $false
 }
 
@@ -401,6 +432,13 @@ try {
         }
 
         'recover' {
+            if ($InSetup) {
+                $others = @(Get-OtherSetupPids)
+                if ($others.Count -gt 0) {
+                    Write-HelperLog ("another {0} Setup is running (pid {1}) -- standing down" -f $SetupTarget, ($others -join ', '))
+                    exit 22
+                }
+            }
             # A claim left by a restorer (app start-up, wrapper, watchdog, us): alive = a restore
             # is in progress, stand down; dead = it died mid-restore, hand the journal back.
             foreach ($claim in @(Get-ChildItem -LiteralPath $StateDir -Filter 'install_journal.restoring-*.json' -ErrorAction SilentlyContinue)) {

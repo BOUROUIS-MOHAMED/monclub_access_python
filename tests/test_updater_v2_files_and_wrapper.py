@@ -472,3 +472,73 @@ def test_timestamps_stay_gregorian_utc_under_an_arabic_culture(tmp_path):
     assert abs(uf.parse_utc_iso(result["at"]) - time.time()) < 300, result["at"]
     first_log_line = (root / "logs" / "w.log").read_text(encoding="utf-8", errors="replace").splitlines()[0]
     assert first_log_line.startswith(f"{year}-"), first_log_line
+
+
+HELPER = Path(__file__).resolve().parents[1] / "installer" / "update_helper.ps1"
+
+
+def _root_with_installed_helper(tmp_path: Path) -> Path:
+    root = tmp_path / "MonClub Access"
+    (root / "current").mkdir(parents=True)
+    (root / "current" / "half.dll").write_text("half", encoding="ascii")
+    (root / "previous").mkdir()
+    shutil.copy(WHOAMI, root / "previous" / "FakeApp.exe")
+    (root / "previous" / "version.json").write_text('{"version":"1.5.0"}', encoding="ascii")
+    (root / "state").mkdir()
+    (root / "watchdog").mkdir()
+    shutil.copy(HELPER, root / "watchdog" / "update_helper.ps1")
+    return root
+
+
+@pytest.mark.skipif(not WINDOWS or not WHOAMI.exists(), reason="needs Windows PowerShell")
+def test_install_wrapper_restores_through_the_installed_update_helper(tmp_path):
+    """L4 review H1: with {app}/watchdog/update_helper.ps1 present (every v2 install), the wrapper's
+    journal restore IS the helper's `recover` -- the one implementation of design 8.0."""
+    root = _root_with_installed_helper(tmp_path)
+    fake_setup = root / "monclub_access_1.5.1.cmd"
+    fake_setup.write_text(
+        '@echo {"phase":"copying","from":"1.5.0","to":"1.5.1","at":"2026-01-01T00:00:00Z"}> "%~dp0state\\install_journal.json"\r\n'
+        '@exit /b 5\r\n',
+        encoding="ascii",
+    )
+    script = uw.build_install_script(
+        setup_image_re=NO_SETUP, app_pid=_dead_pid(), installer=fake_setup, install_root=root, exe_name="FakeApp.exe",
+        from_version="1.5.0", to_version="1.5.1",
+        setup_log=root / "logs" / "s.log", wrapper_log=root / "logs" / "w.log",
+    )
+    _run(script, root / "state")
+    assert sorted(p.name for p in (root / "current").iterdir()) == ["FakeApp.exe", "version.json"]
+    assert not (root / "state" / "install_journal.json").exists()
+    result = json.loads((root / "state" / "last_update.json").read_text(encoding="utf-8-sig"))
+    assert (result["result"], result["from"], result["to"], result["reason"]) == ("ROLLED_BACK", "1.5.1", "1.5.0", "interrupted")
+    wlog = (root / "logs" / "w.log").read_text(encoding="utf-8", errors="replace")
+    assert "update_helper recover exit 20" in wlog and "journal after Setup: restored" in wlog and "relaunched" in wlog
+    assert "claimed stale journal" in (root / "logs" / "update-recover.log").read_text(encoding="utf-8", errors="replace")
+
+
+@pytest.mark.skipif(not WINDOWS or not WHOAMI.exists(), reason="needs Windows PowerShell")
+def test_install_wrapper_stands_down_on_a_live_restore_claim_and_starts_nothing(tmp_path):
+    """L4 review H1(a): another restorer holds a live claim (a PowerShell that started before it) --
+    e.g. Setup exited 7 with ABORTED restore_in_progress. The wrapper must neither restore nor start
+    the app from the half-copied current/."""
+    root = _root_with_installed_helper(tmp_path)
+    restorer = subprocess.Popen([uw.powershell_exe(), "-NoProfile", "-Command", "Start-Sleep -Seconds 120"])
+    try:
+        time.sleep(1.5)
+        claim = root / "state" / f"install_journal.restoring-{restorer.pid}.json"
+        claim.write_text('{"phase":"copying","from":"1.5.0","to":"1.5.1","at":"2026-01-01T00:00:00Z"}', encoding="ascii")
+        fake_setup = root / "monclub_access_1.5.1.cmd"
+        fake_setup.write_text("@exit /b 7\r\n", encoding="ascii")
+        script = uw.build_install_script(
+            setup_image_re=NO_SETUP, app_pid=_dead_pid(), installer=fake_setup, install_root=root, exe_name="FakeApp.exe",
+            from_version="1.5.0", to_version="1.5.1",
+            setup_log=root / "logs" / "s.log", wrapper_log=root / "logs" / "w.log",
+        )
+        _run(script, root / "state")
+        wlog = (root / "logs" / "w.log").read_text(encoding="utf-8", errors="replace")
+        assert "update_helper recover exit 22" in wlog and "another restorer starts the app" in wlog
+        assert "relaunched" not in wlog
+        assert claim.exists() and (root / "current" / "half.dll").exists()
+    finally:
+        restorer.kill()
+

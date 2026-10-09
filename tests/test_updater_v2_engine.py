@@ -646,3 +646,15 @@ def test_the_wrapper_is_built_with_this_components_setup_pattern_only(env):
     mgr.launch_install()
     script = env.launched[-1]["script"]
     assert "^monclub_access_[0-9]" in script and "(access|tv)" not in script
+
+def test_an_aborted_setup_failed_is_a_strike_not_a_ban(env):
+    """L4 review M4: Setup writes ABORTED setup_failed / restore_failed when it ended BEFORE changing
+    anything -- the new version never ran, so one such result must not ban it (design 7 bans only a
+    version that crashed or failed after the copy)."""
+    mgr = env.make()
+    d = {}
+    mgr._record_failure(d, "1.5.1", "setup_failed", "ABORTED")
+    assert not d["versions"]["1.5.1"].get("banned") and d["versions"]["1.5.1"]["strikes"] == 1
+    mgr._record_failure(d, "1.5.2", "setup_failed", "ROLLED_BACK")
+    assert d["versions"]["1.5.2"]["banned"] is True
+
