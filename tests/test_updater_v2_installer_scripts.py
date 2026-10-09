@@ -390,3 +390,22 @@ def test_invoke_native_probe_keeps_the_exit_code_and_does_not_throw_under_stop()
     r = _sp.run([ps, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60)
     assert "rc=3" in r.stdout, r.stdout + r.stderr
 
+
+def test_build_release_try_run_really_reads_the_commit_and_the_dirty_state(tmp_path):
+    """L4's real build_release run wrote buildCommit "" and git.dirty null: Try-Run's parameter was named
+    $Args (PowerShell's automatic variable -> a bare "git"), and Get-Content -Raw of the EMPTY stderr file
+    gave $null -> .Trim() threw. So provenance and the dirty-tree gate never worked, and a release could
+    never pass publish_github_release.ps1 (it needs a 40-hex buildCommit). This runs the real function."""
+    import subprocess as _sp
+
+    text = (REPO / "build_release.ps1").read_text(encoding="utf-8")
+    fn = text[text.index("function Try-Run"):]
+    fn = fn[: fn.index("\n}") + 2]
+    script = tmp_path / "t.ps1"
+    script.write_text(fn + '\n$r = Try-Run "git" @("rev-parse","HEAD")\n"ok=" + $r.ok + " out=" + $r.out\n', encoding="utf-8")
+    ps = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    r = _sp.run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)], capture_output=True,
+                text=True, timeout=60, cwd=str(REPO))
+    head = _sp.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=str(REPO)).stdout.strip()
+    assert f"ok=True out={head}" in r.stdout, r.stdout + r.stderr
+

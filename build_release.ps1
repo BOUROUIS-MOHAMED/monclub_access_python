@@ -78,14 +78,19 @@ function Get-Sha256($Path) {
   return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
 }
 
-function Try-Run($Cmd, $Args) {
+# NOT "$Args": that is PowerShell's automatic variable, so the parameter arrived empty, every git probe
+# ran a bare "git" (exit 1), and provenance (buildCommit) and the dirty-tree gate were silently OFF on
+# every build until L4's real run (2026-10-09).
+function Try-Run($Cmd, $CmdArgs) {
   try {
-    $p = Start-Process -FilePath $Cmd -ArgumentList $Args -NoNewWindow -PassThru -Wait `
+    $p = Start-Process -FilePath $Cmd -ArgumentList $CmdArgs -NoNewWindow -PassThru -Wait `
       -RedirectStandardOutput "$env:TEMP\mc_out.txt" -RedirectStandardError "$env:TEMP\mc_err.txt"
     $out = ""
     $err = ""
-    if (Test-Path "$env:TEMP\mc_out.txt") { $out = Get-Content "$env:TEMP\mc_out.txt" -Raw }
-    if (Test-Path "$env:TEMP\mc_err.txt") { $err = Get-Content "$env:TEMP\mc_err.txt" -Raw }
+    # Get-Content -Raw gives NOTHING for an empty file (a quiet stderr: every successful git call), and
+    # $null.Trim() threw, so every probe read as failed. Keep "" then.
+    if (Test-Path "$env:TEMP\mc_out.txt") { $o = Get-Content "$env:TEMP\mc_out.txt" -Raw; if ($null -ne $o) { $out = $o } }
+    if (Test-Path "$env:TEMP\mc_err.txt") { $e = Get-Content "$env:TEMP\mc_err.txt" -Raw; if ($null -ne $e) { $err = $e } }
     return @{ ok = ($p.ExitCode -eq 0); code = $p.ExitCode; out = $out.Trim(); err = $err.Trim() }
   } catch {
     return @{ ok = $false; code = -1; out = ""; err = "$($_.Exception.Message)" }
