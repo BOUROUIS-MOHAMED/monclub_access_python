@@ -163,3 +163,12 @@ def test_status_payload_carries_the_v2_fields_and_no_updater_exe():
     assert data["autoInstallBlocked"] is True and data["autoInstallBlockedReason"] == "crash"
     assert data["lastResult"] == {"result": "ROLLED_BACK", "reason": "crash"}
     assert "updaterInstalled" not in data and "updaterExecutable" not in data
+
+
+# ------------------------------------------------------------------ UI (D33)
+
+@pytest.mark.parametrize("page", ["tauri-ui/src/pages/UpdatePage.tsx", "tauri-ui/src/tv/pages/TvUpdatePage.tsx"])
+def test_release_notes_are_never_injected_as_raw_html(page):
+    text = Path(page).read_text(encoding="utf-8")
+    assert "dangerouslySetInnerHTML" not in text
+    assert "<ReleaseNotes" in text and "<UpdateNotices" in text
