@@ -58,6 +58,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The one-shot credentials re-send at startup — what it drops, its marker table, its place and catch in `init_db` (`db.py::_force_one_credentials_resend`, `::_run_one_shot_credentials_resend`, `local_one_shot_steps`; `tools/bench_credential_resend.py`) | §3.1b "The upgrade window" |
 | What happens when an `init_db` step fails — the five schema migrations and the inline `device_write_hold.pin_scheme` `ALTER` that stop startup, the steps that log and go on, a `try` or an `import logging` added inside `init_db` (`db.py::init_db`, `::_relax_firmware_profiles_not_null`, `::_rebuild_sync_users_without_legacy_fingerprint`, `::_ensure_main_account_id_column`, `::_ensure_pin_scheme_column`, `sync_device_store.py::ensure_ultra_merge_device_columns`, `::_run_one_shot_credentials_resend`) | §3.2d "A failing migration stops startup", §3.1b "The upgrade window" |
 | Anything in `app/core/v2/` (the server clock, the v2 client, the notice socket, leases, commands, ownership backup, problem reports, loss re-add), `access/v2_routes.py`, or a lease-gate call site (`ultra_engine.py::_v2_writes_blocked` and the `_lease_gate` calls, `device_sync.py`, `realtime_agent.py`, `device_attendance.py`, `ultra_worker_pool.py::devices_to_drive`, `access/local_api_routes.py::LEASE_GATED_HANDLERS` / `SCANNER_GATED_HANDLERS`) | §3.9 |
+| The software updater client — check / verify / download / install / start-up gate / journal restore / loop guard / telemetry / update pages (`shared/update_runtime.py`, `shared/release_manifest.py`, `shared/ed25519.py`, `shared/release_keys.py`, `shared/update_versions.py`, `shared/update_files.py`, `shared/update_wrapper.py`, `shared/update_startup.py`, `access/update_runtime.py`, the update handlers in `local_access_api_v2.py`, `UpdatePage.tsx` / `TvUpdatePage.tsx`); the installer half — the safe swap, journal, health wait, same-version / zkemkeeper rules, uninstall data (`installer/MonClubAccess.iss`, `installer/MonClubTV.iss`, `installer/update_safety.iss`, `installer/update_helper.ps1`), the watchdog's journal rule (`packaging/watchdog/monclub_access_watchdog.ps1`), the build / sign / publish gates (`build_release.ps1`, `tools/release_sign.py`, `publish_github_release.ps1`) | §11 Software updates |
 | What `push_safety.check_bulk_removal` defers (`add_only`, `handover_release`) or lets through (a Confirm-removal approval) | §3.2g, §3.9 |
 | The removal log (`db.py::_log_v2_removal` in `clear_device_revocation_state` / `delete_device_sync_state`) | §3.4a, §3.9 |
 | The Erase-content wizard or the write hold (`app/core/erase_wizard.py` — incl. `::refill_roster`, `::held_waiting_count`, `EraseWizard._refill_check`, and since lane 1c `::_sync_staleness` / `::_sync_max_age_sec` with `app.py`'s `_last_sync_ok_mono` stamp, `::terminal_people` / `::not_refilled` / `::_bind_not_refilled` / `KEEP_MARK`, `::_refill_recheck`, `::_prune_now` / `::_folder_times`, `::_no_answer`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s codes —, `app/core/device_hold.py` — incl. `load(release_unstarted=)` and the `erase-prep`/`erase` phases —, `db.py::set_device_write_hold` / `::clear_device_write_hold` / `::list_device_write_holds`, `::begin_device_erase`, `::release_unstarted_erase_holds`, `::undo_device_erase_record` / `::device_list_is_authoritative` (lane 1f), `erase_wizard.py::check_erase_switch` / `monclub_api.py::get_erase_wizard_switch` (the gym's server switch), `erase_wizard.py::prune_erase_backups` (30-day retention), `::retire_device_records`, `::invalidate_device_records`, `device_sync.py::_filter_users_for_device(quiet=)`, `PullSDKDevice.ERASABLE_TABLES`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s offline answer, the hold in `ultra_engine.py::_v2_writes_blocked`, the worker's `_connected_addr` (`::_connect` / `::_disconnect`), `device_sync.py`'s three hold checks, `v2/handlers.py::device_reconcile`, `app.py`'s start-up `device_hold.load()` and `_sync_tick`'s `device_hold.ensure_loaded()`, `ownership.py::OwnershipSync._worker_idle`, the `erase` routes and handlers, `local_access_api_v2.py::_refuse_held_or_frozen`, `PullSDKDevice.count_table_strict` / `::read_table_strict` / `::erase_table`, `ZKStandaloneDevice.read_device_status` / `::read_user_templates` and the listing's `privilege`, `tauri-ui/src/components/EraseWizardDialog.tsx`) | §3.2h, pullsdk_guide §5, zkemkeeper_guide §4 |
@@ -2527,15 +2528,17 @@ drop stays for folders an earlier build wrote. Residual `[CODE]`: a power cut be
 command keeps a backup for good for a run that erased nobody -- no device command runs between the two. `[TEST:
 test_erase_wizard_lane1e.py::TestTheKeepMarkComesAfterTheEraseRecord]`
 
-**An uninstall deletes the hold and the backups** (lane 1b, review C2, verified): `installer/MonClubAccess.iss`
-`[UninstallDelete]` removes `{commonappdata}\MonClub Access` (and the LocalAppData / AppData copies), which is the data
+**An uninstall deletes the hold and the backups** (lane 1b, review C2, verified; narrowed by updater v2 D26, §11.10):
+an Access uninstall removes Access's folders of the data root (all of it when TV is not installed, else `data\`,
+`access\`, `backups\`, `versions\` only), which is the data
 root (`app/core/utils.py::_candidate_data_roots`: `%ProgramData%\MonClub Access`, else `%LOCALAPPDATA%\MonClub
 Access`) holding `access.db` — the `device_write_hold` row — and `access\erase_backups\`. An Access installed after an
 uninstall has no hold: its first pass refills the turnstile under whatever scheme the server then sends, and the only
 backup of the erased content is gone. **Never uninstall Access while a turnstile is held**: press Refill first (or
 finish the switch). Runbook A7 already says "never uninstall first" for another reason. `[CODE]`
 An installer run OVER the install is another matter (the master review of lane 1c, F5; runbook part F): it replaces only
-the program folder (`PrepareToInstall` → `DeleteTreeIfExists({app}\current)`) and keeps the data root `[CODE]` -- the
+the program folder (since updater v2: `PrepareToInstall` backs `current\` up into `previous\` and empties it, never a
+delete of the tree, §11.8) and keeps the data root `[CODE]` -- the
 SAME version then honours the hold (the repair of the autostart checklist §6, never tried on a gym PC `[UNVERIFIED]`); an
 OLDER version has no hold code and refills the turnstile at its first pass (every tag up to 1.4.33 with membership pins),
 so never over a held turnstile's data root. The runbook's rollback rows that go back to an older version move the whole
@@ -5088,8 +5091,9 @@ scenario (a store another system fills), not as a re-diagnosis of that incident.
   PyInstaller build ran and the frozen app started (DLLs resolved, local API up) on the dev PC.
   `[TEST — 2026-09-29, dev PC; no gym hardware attached]`
 - **Windows 10 or newer is required**: Python 3.14 supports Windows 10+ only (3.13 was the last
-  for 8.1). Both Inno installers carry `MinVersion=10.0`. `[CODE: installer/*.iss]` Updates apply by
-  zip (`MonClubAccessUpdater`), which the installer check does not cover; the owner confirmed on
+  for 8.1). Both Inno installers carry `MinVersion=10.0`. `[CODE: installer/*.iss]` Since updater v2
+  every update is the full Inno installer run silently (§11; the zip / `MonClubAccessUpdater` path
+  is deleted), so `MinVersion` now covers updates too `[CODE]`; the owner confirmed on
   2026-09-29 that every client PC runs Windows 10+. The heartbeat's Windows version (Access PCs
   page) is reported only by builds from 1.4.35 on, the same build that needs Windows 10, so it
   cannot survey the fleet beforehand: a PC that never shows 1.4.35 after the update window is the
@@ -5588,3 +5592,341 @@ python tools/list_telemetry_events.py
 call with more than about three fields is wrapped onto the next line, and because
 `zkfinger.py` emits through the `_enroll_tel(...)` helper that stamps `enroll_id`.
 A single-line grep finds 63 of the 134 names. `[CODE]`
+
+---
+
+## 11. Software updates (updater v2)
+
+Design and defect IDs: `D:\Monclub\docs\access-updater-v2\design.md` (sections 5, 7, 8);
+lane reports and the E2E evidence: `docs/access-updater-v2/progress.md`, `.../e2e/`.
+§11.1-11.7 are the **client** (lane L3), §11.8-11.11 the **installer, watchdog and build**
+(lane L2), reconciled by L4 on 2026-10-09. One engine serves both targets:
+`shared/update_runtime.py::ComponentUpdateManager`, wrapped by `access/update_runtime.py`
+(target `access`) and `tv/update_runtime.py` (target `tv`). `[CODE]`
+
+**There is no ZIP / C# updater path any more.** The client only ever runs a signed Inno
+installer through the wrapper below; `updater_exe_name`, `_launch_installer_exe` and the
+`--zip` spawn are gone (D2). `[CODE; TEST: test_silent_update.py::test_the_zip_and_csharp_updater_path_is_gone]`
+
+### 11.1 Files under the install root `{app}` (the parent of `current\`)
+
+| File | Written by | Read by |
+|---|---|---|
+| `state\install_journal.json` `{phase,from,to,at,setupPid}` | Setup | app start-up, wrapper, watchdog |
+| `state\last_update.json` `{result,from,to,reason,log,at}` | Setup, the wrapper (`ABORTED setup_exit_<n>`), the restore helper (`ROLLED_BACK interrupted`) | the app; renamed to `last_update.consumed.json` once reported |
+| `state\boot_ok.json` `{version,pid,at}` | the app, once its local API listens | Setup (health wait) |
+| `state\update_state.json` | the app only | the app only: pending update, install attempt, per-version strikes/bans, telemetry outbox, TV install id |
+| `logs\update-<ver>-<utc>.log`, `logs\update-wrapper.log`, `logs\update-restore.log`, `logs\update-startup.log` | Setup `/LOG`, wrapper, restore helper, start-up journal check | people |
+| `downloads\<target>\<channel>\<version>\<installerName>` | the app | the app |
+
+`[CODE: shared/update_files.py::UpdatePaths]`
+
+### 11.2 Check, verify, download
+
+- Check at start-up and every `update_check_interval_sec` (3 h); a failed check retries after
+  60 s / 5 min / 15 min. The request adds `capabilities=signed-v1`. HTTP 404 is "no release"
+  (`app/api/monclub_api.py::get_latest_software_release` answers `{"shouldUpdate": false,
+  "noRelease": true}`), **not** a failed check (D16). `[CODE; TEST: test_updater_v2_engine.py::test_404_is_no_update_and_not_a_failed_check, test_update_check_interval.py]`
+- An offer is accepted only through `shared/release_manifest.py::verify_offer`: the
+  `signedManifest` string must verify (pure-Python Ed25519, `shared/ed25519.py`, RFC 8032
+  vectors in `tests/test_updater_v2_ed25519.py`) with a key from
+  `shared/release_keys.py::trusted_keys()`, then — parsed only after verification — name
+  this target / platform / channel and the offered version, with an `installerName` of
+  the form `monclub_<target>_<version...>.exe` (the name the Setup-running check knows,
+  always a plain file name inside `downloads\`). A normal manifest needs a
+  version above the installed one; a rollback manifest (`allowDowngrade=true`) only applies
+  when `rollbackFrom` equals the installed version exactly (D8). Versions:
+  `shared/update_versions.py`, SemVer precedence with pre-releases (D29, D38), shared table
+  `tests/fixtures/semver_precedence.json`. `[CODE; TEST: test_updater_v2_manifest.py, test_updater_v2_versions.py]`
+- **Today's backend sends no signed fields**: every offer is refused as `UNSIGNED`, shown on
+  the Update page and reported once per version as `VERIFY_FAILED`; nothing is downloaded and
+  nothing crashes. `[TEST: test_updater_v2_engine.py::test_todays_unsigned_backend_is_refused_reported_once_and_never_downloaded]`
+- **`PROD_KEYS` is empty until the owner runs `tools/release_sign.py keygen`** (design 5.1);
+  until then a frozen build refuses every release. `TEST_KEYS` (`test-l2-2026-10`, seed in
+  `tests/fixtures/release_signing/`) are trusted only from source; a frozen E2E build trusts
+  the test key only because `build_release.ps1 -E2ETestKeys` writes it into the staged
+  `PROD_KEYS` line (kept on one line for that regex) and marks the build non-publishable. `[CODE]`
+- Download goes to `<installerName>.part`, is bounded by and compared with the signed size and
+  SHA-256, then renamed. A cached file is reused only when its SHA-256 matches (D11, D12);
+  a mismatch is `VERIFY_FAILED`, a transport error `DOWNLOAD_FAILED`. Cancel stops a running
+  download (D37). Only the pending version's folder is kept; older ones and the pre-v2
+  `downloads\<platform>\<channel>\*.exe` are deleted (D35). `[TEST: test_updater_v2_engine.py]`
+- A 404, a `shouldUpdate=false` answer or a different offer **discards** the pending
+  download — this is how Pause / Withdraw reach a PC. `[TEST: ::test_pause_or_withdraw_discards_the_pending_download, ::test_an_older_eligible_release_answer_also_discards_the_pending]`
+
+### 11.3 Install — the wrapper (D1, D24, D36)
+
+`ComponentUpdateManager.launch_install` re-verifies the manifest and the file's SHA-256,
+records `attempt {version, from, at, mode}` in `update_state.json`, then starts a hidden
+`powershell.exe` (full `System32` path, `-NoProfile -ExecutionPolicy Bypass`, cwd
+`{app}\state`) and checks it is still alive after 0.5 s. Only then does the caller quit;
+any failure raises `InstallRefused` and the app keeps running — the "Restart to update"
+handler answers 500 with the reason (`local_access_api_v2.py::_handle_component_update_install`). `[CODE; TEST: test_updater_v2_app_wiring.py::test_install_answers_an_error_and_never_quits_when_the_wrapper_fails]`
+
+The wrapper (`shared/update_wrapper.py::build_install_script`): wait up to 90 s for the app
+pid, then stop that pid only (Setup's `taskkill /T` on a live app would kill the wrapper's whole
+tree, Setup's own `.tmp` included, before any journal exists) → `Start-Process <setup> -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+/LOG="{app}\logs\update-<ver>-<utc>.log"' -WorkingDirectory {app}\state -PassThru` and
+`WaitForExit(30 min)` on the Setup stub (not `-Wait`, which would also wait for the app
+Setup starts; a Setup still running after 30 min is stopped, with every Setup-pattern
+process) → on a non-zero exit with no fresh `last_update.json`, write `ABORTED
+setup_exit_<code>` (a result the relaunched app already consumed, `last_update.consumed.json`
+newer than the start, counts as written) → run the journal restore: the INSTALLED
+`{app}\watchdog\update_helper.ps1 -Action recover` (the same code Setup and the watchdog run: live-claim
+stand-down, stop the app + UI running from `current\`, robocopy `/MIR` `previous` → `current`); exit 22
+(a live claim / a running Setup) = back off and re-check every 30 s for up to 15 min (the other restorer
+usually finishes and starts the app; if it dies without doing so the next check takes over — TV has no
+watchdog), then start nothing; the inline PowerShell copy is only a fallback for a root without the helper
+→ if no
+`<exe>` runs from `{app}\current`, start `{app}\current\<exe>` with that working directory. `[TEST: test_updater_v2_files_and_wrapper.py::test_install_wrapper_runs_for_real_writes_aborted_and_relaunches_the_old_app, ::test_install_wrapper_restores_a_journal_setup_left_behind_before_relaunching — real PowerShell, stand-in Setup]`
+`[TEST: ::test_install_wrapper_restores_through_the_installed_update_helper,
+::test_install_wrapper_stands_down_on_a_live_restore_claim_and_starts_nothing — real PowerShell + the real helper]`
+The hidden PowerShell survives the app's exit when the app was started by the watchdog's scheduled task
+`[FIELD: dev PC, L4 E2E 2026-10-09, docs/access-updater-v2/e2e/L4/02-a-startup-auto-install-1.5.0-to-1.5.1 —
+the watchdog-started 1.5.0 launched the wrapper and quit; the wrapper ran Setup to INSTALLED]`.
+
+### 11.4 Start-up order (O1, D25)
+
+1. `access/main.py` / `tv/main.py`, right after the single-instance guard and before
+   anything else loads: `shared/update_startup.py::check_install_journal` (standard library
+   only). A stale journal (no Setup image `monclub_(access|tv)_<ver>.(exe|tmp)` running, and
+   `setupPid` set, or `at` > 10 min old, or before the last boot) with phase `copying` /
+   `verifying` / `restoring` → start the restore helper and exit; `backing_up` → delete it,
+   `current` is intact. The helper claims the journal (rename to
+   `install_journal.restoring-<pid>.json`; a failed rename = another restorer owns it, back
+   off), copies `previous\*` back, writes `ROLLED_BACK interrupted`, restarts the app. A
+   claim whose `<pid>` runs `powershell.exe` / `pwsh.exe`, whose process started no later
+   than the claim's LastWriteTime + 5 s, and that was made since the last Windows boot means
+   a restore is in progress: the app exits without starting from `current` (the restorer
+   restarts it). Any other claim (pid gone, pid reused by another program or by a PowerShell
+   started after the claim, claim older than the boot) is renamed back to the journal. The
+   start-time rule is what holds under Fast Startup (§11.5: a shutdown does not move the
+   boot time, so a claim left by a restorer killed at shutdown passes the boot rule and the
+   watchdog's PowerShell may reuse its pid); an unreadable start time skips the rule. Python
+   (`update_files.py::live_restore_claims`, `::process_creation_epoch` = OpenProcess +
+   GetProcessTimes) and the helper (`update_helper.ps1::Test-ClaimLive`) apply the same rule.
+   `[TEST: test_updater_v2_files_and_wrapper.py::test_a_claim_is_dead_when_its_pid_is_a_powershell_that_started_after_the_claim; test_updater_v2_install_helper.py::test_a_claim_*]` A rename keeps the
+   journal's old LastWriteTime, so every restorer sets the claim's LastWriteTimeUtc to now
+   right after claiming it; the helpers write every timestamp with the invariant culture
+   (under ar-SA, PowerShell's `ToString(fmt)` writes a Hijri year).
+   `[TEST: test_updater_v2_files_and_wrapper.py::test_a_claim_gets_a_fresh_timestamp_right_after_the_rename, ::test_timestamps_stay_gregorian_utc_under_an_arabic_culture]` The journal itself is
+   stale when no Setup image runs AND (`at` older than 10 min, or before the last boot, or
+   no live process — any image name — has its `setupPid`). Only in a frozen build running from `{app}\current`. Each component looks only
+   for ITS OWN Setup (`monclub_access_...` / `monclub_tv_...`), so an Access restore never
+   waits for or stops a TV Setup; the pattern allows `_` after the version (L2's
+   `..._TESTFAIL_<x>` builds). `[TEST: test_updater_v2_files_and_wrapper.py::test_a_claim_is_live_only_for_a_powershell_pid_claimed_since_the_last_boot, ::test_each_component_waits_only_for_its_own_setup, ::test_a_live_setup_pid_with_any_image_name_protects_a_fresh_journal]` `[TEST: test_updater_v2_startup_journal.py, test_updater_v2_files_and_wrapper.py::test_restore_helper_runs_for_real_and_puts_previous_back]`
+2. `MainApp.__init__` (Access), right after `_init_scheduler()` and before any engine is
+   built, the date flip, the hold load or the first `_sync_tick`; `TvApp.__init__` before the
+   shell is scheduled: `startup_gate` consumes `last_update.json`, then — frozen builds run
+   from `{app}\current` only —
+   installs a verified, downloaded, not-banned pending update after a 5 s server re-check
+   (still offered → install; paused / withdrawn / replaced → discard; no answer → install,
+   it was signed and offered). It raises `UpdateInstallStarted`, which `run_access_app` /
+   `run_tv_app` turn into a clean return. **No pending update = no network call.** The gate
+   logs its duration. `[TEST: test_updater_v2_app_wiring.py::test_a_startup_install_happens_before_any_engine_or_door_work, test_updater_v2_engine.py::test_startup_*]`
+3. Once the local API listens (or is disabled by config), on the main loop:
+   `on_local_api_ready` writes `boot_ok.json` (once per process), then re-reads
+   `last_update.json` every 30 s for 10 min (Setup writes `INSTALLED` only after our
+   `boot_ok`), cleans `downloads\` and flushes telemetry. A local API that fails to start
+   writes no `boot_ok`, so Setup rolls that version back. `[CODE]`
+
+### 11.5 24 h fallback and the loop guard
+
+- Always-on PCs: every 5 min, if the pending update was first verified ≥ 24 h ago and the
+  newest `access_history.created_at` is ≥ 15 min old, the same re-check + install runs, then
+  the app quits. An unknown idle time never counts as idle. TV has no doors: 24 h alone
+  (**default awaiting the owner**). DEVICE-mode rows are recorded at the attendance pull, so
+  for them "15 min" is measured from the pull. `[CODE: access/update_runtime.py::seconds_since_last_door_event; TEST: ::test_fallback_waits_24h_and_15_minutes_without_a_door_event]`
+- Loop guard (`update_state.json` `versions`): a `ROLLED_BACK` with reason `crash` or `setup_failed`
+  bans the version from **automatic** install at once (an `ABORTED` with those reasons never ran the
+  new version: a strike, `::test_an_aborted_setup_failed_is_a_strike_not_a_ban`); any other failure
+  (`health_timeout`, `backup_failed`, `interrupted`, `restore_failed` — a restore can fail on a version
+  that never ran —, `setup_exit_<n>`, an attempt that left
+  no result at all) is a strike, two strikes ban. A struck version is retried
+  automatically only after the next Windows boot (or 24 h later on a PC never switched
+  off) — not when Setup relaunches the old version seconds after the failure. "Boot" is
+  `GetTickCount64`. **A shutdown with Windows Fast Startup (on by default) does NOT reset it**:
+  on the dev PC (`HiberbootEnabled=1`) the System log shows Fast Startup power-ons
+  (Kernel-Boot 27, boot type `0x1`) on 2026-10-04 09:13 and 10-07 07:40 with no Kernel-General
+  12 "OS started" event, while the full boots (`0x0`) each have one; `now - GetTickCount64`
+  equals `LastBootUpTime` (2026-10-08 10:14 UTC, the last `0x0` boot) to the second, so a Fast
+  Startup power-on keeps the previous full boot's time. `[FIELD: dev PC event log, read
+  2026-10-09 by L4]` Consequence: on a gym PC that is shut down every night (Fast Startup on) a
+  struck version is retried through the 24 h path only — later, never sooner; a restart (not a
+  shutdown) or a PC with Fast Startup off retries at the next start. Journal staleness does
+  not depend on the boot rule alone (10 min / dead `setupPid` also make it stale), and claim
+  liveness uses the restorer's start time (§11.4).
+  `same_version` is no strike. "Restart to update" still works on a banned version; the
+  page warns.
+- **Direction of `last_update.json`** (L2's `UpdWriteLastUpdate`, the restore helper, the
+  wrapper): `ROLLED_BACK` from = the version that failed, to = the one restored;
+  `INSTALLED` / `ABORTED` from = before, to = tried. The engine strikes the TRIED version
+  (`_result_versions`); telemetry and the Update page always show before → tried.
+  `[TEST: ::test_regression_l2_rolled_back_json_bans_the_failed_version_not_the_running_one]` `[TEST: ::test_a_crash_bans_the_version_from_auto_install_but_not_from_the_button, ::test_a_health_timeout_gets_exactly_one_automatic_retry, ::test_an_install_that_left_no_result_counts_as_one_strike]`
+
+### 11.6 Telemetry (D19)
+
+Every result is queued in `update_state.json` `outbox` (max 50) and POSTed to
+`/api/v1/manager/access/softwareUpdateEvent` (beside `getLatestAccessSoftwareRelease`)
+with the gym token: `{eventId, target, pcKey, pcName, fromVersion, toVersion, result,
+detail, occurredAt}`, result one of `PENDING` (install started) / `INSTALLED` /
+`ROLLED_BACK` / `ABORTED` / `VERIFY_FAILED` / `DOWNLOAD_FAILED`. `eventId` is a UUID5 of
+the event's source (the result file content, the attempt), so a resend dedupes. `pcKey` =
+Access `pcUuid` (`access/pc_identity.py`), else `install-<id>`; TV `tv-<id>`, the id kept in
+`update_state.json`. Network errors / 5xx / 408 / 429 and the token answers 401 / 403 / 428 keep
+the event (an expired gym token must not lose the INSTALLED report); any other 4xx drops it (a backend
+without the endpoint answers 404). The server answers 200 `ignored` (not stored, owner decision O6) for a
+version that is no release of its target or an Access `pcKey` that is not one of the gym's PCs, so an
+unregistered PC (`install-<id>`) never shows on the dashboard. Setup's `ABORTED same_version` (nothing was changed) is shown on the Update page but not
+reported (it made the dashboard count a healthy PC as failed, L4 E2E (g)); `::test_same_version_abort_is_not_reported_as_a_failed_update`. `[TEST: ::test_an_expired_or_refused_token_keeps_the_event_for_the_next_flush]` `[TEST: test_updater_v2_engine.py::test_events_*, ::test_server_errors_keep_the_event_and_an_old_backend_404_drops_it]`
+
+### 11.7 Update pages
+
+`tauri-ui/src/pages/UpdatePage.tsx` and `src/tv/pages/TvUpdatePage.tsx` render release
+notes through `src/lib/releaseNotes.ts` (allowlist p/br/ul/ol/li/strong/b/em/i/h1-h4/code,
+no attributes, links as text, script/style/iframe dropped) — never `dangerouslySetInnerHTML`
+(D33) — and show the last result, a refused offer, the loop-guard warning and an install
+error (`src/components/update/UpdateNotices.tsx`). `[TEST: tauri-ui src/lib/releaseNotes.test.ts; tests/test_updater_v2_app_wiring.py::test_release_notes_are_never_injected_as_raw_html]`
+
+### 11.8 The installer — safe swap, health wait, results (D21-D24)
+
+Updates are the full Inno installer (`installer/MonClubAccess.iss`, `installer/MonClubTV.iss`,
+shared Pascal `installer/update_safety.iss`, file work in `installer/update_helper.ps1`,
+extracted to `{tmp}` and also installed into `{app}\watchdog`). `[CODE]`
+
+- **`{app}` layout:** `current\` (the running version; `[Files]` still target it, which keeps
+  Inno's uninstall log valid), `previous\` (the version before the last update — a manual
+  rollback is copying it back), `state\` (§11.1), `logs\`, `downloads\`, `watchdog\` (Access: watchdog
+  scripts + `update_helper.ps1`; TV: `update_helper.ps1` only — the client's wrapper runs it). `[CODE]`
+- **`PrepareToInstall`:** FIRST `update_helper -Action other-setup`: another process with this product's
+  Setup image name that is not our own Setup (`.exe` stub / `.tmp` ancestors) = a second installer run
+  (staff starting it by hand during the morning auto-install) → this Setup ends at once with exit 7 and
+  changes nothing (no sentinel, no `last_update.json`, nothing stopped), so it can never kill the app the
+  first Setup is health-checking or clear its sentinel `[CODE; TEST: test_updater_v2_install_helper.py::test_other_setup_reports_another_installer_of_the_product_and_recover_ignores_it,
+  test_updater_v2_installer_scripts.py::test_a_second_installer_run_stops_before_the_sentinel_and_the_process_kill]` → pause sentinel → stop the app → `update_helper -Action recover
+  -InSetup` (a journal or claim found now was left by a dead Setup or restorer: it is restored
+  first, whatever its age, so re-running an installer repairs a half-written PC) → backup:
+  journal `backing_up` → robocopy `/MIR` `current` → `previous` → verify (exe + `version.json`
+  + same file count and bytes) → journal `copying` → empty `current` **files only** (up to
+  15 s of retries per locked item). `current` is never deleted as a tree and never renamed
+  (a live process's working directory cannot be renamed; the 1.4.35 client starts Setup with
+  its cwd inside `current`). Any backup failure puts `current` back, writes `ABORTED
+  backup_failed`, starts the old app and makes Setup exit with code 7. `[CODE; TEST:
+  test_updater_v2_install_helper.py::test_backup_*, ::test_restore_*;
+  test_updater_v2_installer_scripts.py::test_current_is_never_deleted_wholesale,
+  ::test_the_helper_never_renames_current; E2E L2 01/F01, 06]`
+- **Copy order:** the new watchdog + helper are copied into `{app}\watchdog` before `current`
+  is emptied; `version.json` and then the exe are the last two payload files. `[CODE; TEST:
+  ::test_version_json_and_then_the_exe_are_the_last_payload_files; E2E L2 F01 setup log]`
+- **Health wait (silent installs):** `ssPostInstall` deletes `boot_ok.json`, starts the new exe
+  with working directory `{app}\current` (as gyms do) and waits up to **300 s** for
+  `boot_ok.json` carrying the new version → `INSTALLED`. The process gone → `ROLLED_BACK
+  crash`; timeout → kill it, `ROLLED_BACK health_timeout`. Rollback = restore `previous` →
+  `current`, uninstall entry put back to the old version, old app started. A failure after
+  the backup that Pascal sees in `DeinitializeSetup` → restore, `ROLLED_BACK setup_failed`.
+  `[Run]` starts the app only for interactive installs (`Check: not WizardSilent`). `[CODE;
+  TEST: test_updater_v2_install_helper.py::test_launch_wait_tells_healthy_crash_and_timeout_apart;
+  E2E L2 03-08]`
+- **Every Setup end after the app was stopped writes `last_update.json` FIRST, then starts an
+  app** (old or healthy new). A failed restore is retried once; if it still fails the journal
+  is KEPT (the watchdog's journal-first rule recovers the tree) and the app is still started;
+  only `restore_in_progress` (another restorer holds a live claim) skips the start. `[CODE;
+  TEST: ::test_a_failed_restore_is_retried_once_keeps_the_journal_and_still_relaunches]`
+- **Same version (D22):** silently, no message box — `ABORTED same_version`, the installed
+  app started, exit code 1. It counts as same version only when `current\` has the exe AND
+  `version.json` and there is no journal or claim; an incomplete `current\` with no journal is
+  installed over without a backup (`INSTALLED repair`). Every `MsgBox` is guarded by
+  `WizardSilent()`. `[CODE; TEST: ::test_every_message_box_is_guarded_by_a_silent_check,
+  ::test_same_version_*; E2E L2 02, F02, F05]`
+- **zkemkeeper (D23):** a silent install or uninstall never elevates (`runas`). **The app has
+  no zkemkeeper self-heal** (no `regsvr32` / registration call in `app/`, `shared/`, `tv/`). A
+  registered PC loses nothing: the registration points at `{app}\current\sdk\zkemkeeper.dll`
+  (or another product's DLL) and the update refills that path. A PC where it was never
+  registered stays unregistered after a silent update (as before): one interactive install or
+  the logged `regsvr32` line as admin. `[CODE; TEST: ::test_zkemkeeper_registration_never_elevates_in_silent_mode,
+  ::test_no_regsvr32_self_heal_exists_in_the_app; E2E L2 09]` The unregistered silent branch was
+  never executed `[UNVERIFIED]`.
+- **Result reasons** Setup writes: `backup_failed`, `setup_failed`, `crash`, `health_timeout`,
+  `same_version`, `restore_failed`, `restore_in_progress`; `INSTALLED` carries `""` (update),
+  `fresh_install`, `repair` or `interactive`. The client tolerates unknown ones. `[CODE]`
+- **Exit codes seen:** 0 installed — or rolled back after the copy (read `last_update.json`,
+  it is the truth); 1 same version; 7 `PrepareToInstall` refused (backup failed / restore in
+  progress). `[E2E L2]`
+- **Setup's own log:** the `/LOG` path when given (the v2 wrapper always gives
+  `{app}\logs\update-<ver>-<utc>.log`), else `%TEMP%\Setup Log <date> #<n>.txt`;
+  `last_update.json.log` names it and every helper line is copied into it. `[CODE]`
+- **The 1.4.35 → 1.5.0 bootstrap hop** (old client, no wrapper, Setup started from inside
+  `current\`) works with this installer. `[E2E L2 01/F01]` Residual: a Setup that aborts before
+  any Pascal runs (corrupt download, Windows < 10) on that hop leaves the PC without Access
+  until the watchdog (if ticked) or a person starts it — only the v2 client's wrapper covers
+  that, from the second hop on.
+- **Failure injection (tests only):** `ISCC /DUPDATER_TEST_FAIL=after_copy|health|crash`
+  (any other value: compile error) builds `<base>_<ver>_TESTFAIL_<mode>.exe`;
+  `build_release.ps1` refuses it without `-E2ETestKeys`. `[CODE; TEST: ::test_test_fail_define_is_test_only_everywhere]`
+
+### 11.9 The watchdog's journal rule
+
+`packaging/watchdog/monclub_access_watchdog.ps1` runs `{app}\watchdog\update_helper.ps1 -Action
+recover` **first** on every tick — before its "is it running" check (a half-written windowed exe
+can sit alive on PyInstaller's error box) and before the sentinel and exe-missing guards — and
+logs to `{app}\logs\update-recover.log`. The helper path is resolved in the body: under Windows
+PowerShell 5.1 `$PSScriptRoot` is empty inside a `param()` default (every tick died that way in
+L2's first E2E). The watchdog is not rolled back with the app (it works with any version).
+`[CODE; TEST: test_updater_v2_watchdog_journal.py; E2E L2 10/F10 — a power cut during the health
+wait, one tick of the installed watchdog → ROLLED_BACK interrupted]` The watchdog task is still
+unticked by default on existing installs (D39, owner product choice). It is a scheduled task
+(`register_watchdog.ps1`: at logon + every few minutes, `ExecutionTimeLimit` 5 min,
+`MultipleInstances IgnoreNew`) `[CODE]`. It starts the app only after two misses at least 90 s apart and
+refuses after 5 restarts in 60 min (its crash-loop guard): after a real reboot on the dev PC Access was running
+about 2.5 min after Windows started `[FIELD: L4 E2E 2026-10-09]` — a morning start-up install begins only then.
+**After a power cut during the file copy only the watchdog (or re-running the installer, whose `recover -InSetup`
+repairs) brings Access back:** the exe and `version.json` are copied last, so until they are there the Start-menu
+shortcut has nothing to start and the app's own start-up journal check cannot run `[FIELD: L4 E2E (k) —
+the watchdog restored previous 88 s after the cut]`. The app's own start-at-logon is the HKCU `Run` value
+`MonClubAccess` written by `app/ui/app.py` when `start_on_system_startup` is set `[CODE]`.
+
+### 11.10 Uninstall and data (D26)
+
+The data root (`%ProgramData%\MonClub Access`, else `%LOCALAPPDATA%\MonClub Access`,
+`app/core/utils.py`) is shared. Access owns `data\` (legacy `app.db`; TV only reads it,
+`tv/auth_bridge.py`), `access\`, `backups\`, `versions\`; TV owns `tv\` (`tv/storage.py`,
+`app/core/tv_local_cache.py`); both use `shared\`. An Access uninstall removes the whole root
+only when TV is not installed (TV's uninstall key), else only its four folders. A TV uninstall
+removes `tv\`, and `shared\` + empty folders + the empty root only when Access is not installed.
+Data is never touched by an update. `UninstallLogMode=overwrite`: Inno appends uninstall logs
+across updates, so 1.4.x's `{commonappdata}\MonClub Access` delete kept replaying (it wiped TV's
+data in L2's E2E 21); after one v2 update it is gone. `[CODE; TEST:
+test_updater_v2_installer_scripts.py::test_access_uninstall_keeps_tv_data_while_tv_is_installed,
+::test_tv_uninstall_deletes_only_its_own_data_folder,
+::test_the_uninstall_log_is_overwritten_so_old_data_deletes_do_not_replay; E2E L2 20-23, F09]`
+Residuals: a PC uninstalled while still on 1.4.x runs the old log (deletes all data); TV
+detection reads the uninstalling user's HKCU only; an Access installed in the legacy root
+`{localappdata}\MonClub Access` shares that folder with the fallback data root. `[CODE]`
+`[UninstallDelete]` also removes `previous`, `current.failed`, `state`, `downloads` under `{app}`.
+
+### 11.11 Build, sign, publish (D3, D20, D30, D31)
+
+- `build_release.ps1` runs its gates **before** the Tauri build and PyInstaller: dirty tree,
+  SQL arity, trusted keys (`release_sign.py check-trust`: refuses an empty `PROD_KEYS` or a
+  `test-` key), signing key present, then `pytest tests/ -q --ignore=tests/_pydeps` (any
+  non-zero exit refuses). `-SkipTests` is explicit, recorded as `testsSkipped`, never
+  publishable. Then it builds, stages, compiles the installer, runs the optional `-SignTool`
+  (Authenticode hook, O2) and only then computes the SHA-256, signs the manifest and writes
+  `release-<target>-<version>.json` (design 5.3, plus `githubRepo`, `githubTag`,
+  `buildCommit`, `testsSkipped`, `publishable`, `signedWith`). `[CODE; TEST:
+  test_updater_v2_installer_scripts.py::test_build_release_gates_run_before_the_tauri_build_and_pyinstaller]`
+- `-E2ETestKeys` rewrites the one-line `PROD_KEYS` of `shared/release_keys.py` to the test key
+  for the PyInstaller run only (restored in `finally`) and signs with the test key; `-TestFail`
+  is accepted only with it; neither is ever publishable. `[CODE]`
+- `tools/release_sign.py` (Ed25519 from `shared/ed25519.py`, the only implementation):
+  `sign` (canonical ASCII manifest, non-ASCII refused, self-verify), `--rollback-from` for a
+  rollback manifest, `keygen` (owner only; never prints the private key, never overwrites;
+  `%USERPROFILE%\.monclub\release-signing\<keyId>.key`), `check-trust`, `check-key`,
+  `verify`. `[TEST: test_updater_v2_release_sign.py]`
+- `publish_github_release.ps1`: `gh release create <tag> <installer> <release file> --target
+  <full built SHA>`; refuses a release file that does not verify against the prod keys, is not
+  publishable, does not match the installer bytes / URL, an existing tag, or a commit on no
+  remote branch. `[CODE; TEST: ::test_publish_tags_the_built_commit_and_uploads_the_release_file]`
+  Only `-DryRun` was ever executed (it refused a test-key file before any `gh` call).
+- The C# zip updater (`updater/`, `installer/updater/*.exe`, `build_updater.ps1`) is deleted
+  (D2, D27, D28). `[TEST: ::test_the_zip_updater_is_gone]`

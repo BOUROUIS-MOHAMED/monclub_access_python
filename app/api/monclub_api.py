@@ -700,8 +700,11 @@ class MonClubApi:
         release_id: Optional[str] = None,
         current_version: Optional[str] = None,
         target: Optional[str] = None,
+        capabilities: Optional[str] = None,
         timeout: int = 20,
     ) -> Dict[str, Any]:
+        """The server's update offer. HTTP 404 = no eligible release: answered as
+        ``{"shouldUpdate": False, "noRelease": True}``, not raised (updater v2, D16)."""
         url = (self.endpoints.latest_release_url or "").strip()
         if not url:
             raise MonClubApiError("Latest release URL is empty (check Configuration).")
@@ -717,6 +720,8 @@ class MonClubApi:
             params["currentVersion"] = current_version
         if target:
             params["target"] = target
+        if capabilities:
+            params["capabilities"] = capabilities
 
         headers = {
             "Authorization": f"Bearer {token}",
@@ -728,6 +733,9 @@ class MonClubApi:
             r = self._session.get(url, params=params, headers=headers, timeout=timeout)
         except Exception as e:
             raise MonClubApiError(f"getLatestSoftwareRelease request failed: {e}") from e
+
+        if r.status_code == 404:
+            return {"shouldUpdate": False, "noRelease": True}
 
         if r.status_code < 200 or r.status_code >= 300:
             txt = (r.text or "").strip()
@@ -743,6 +751,29 @@ class MonClubApi:
             raise MonClubApiError("getLatestSoftwareRelease JSON is not an object/dict.")
 
         return data
+
+    def post_software_update_event(self, *, token: str, event: Dict[str, Any], timeout: int = 10) -> int:
+        """POST one updater telemetry event (design 6.4); returns the HTTP status.
+
+        The URL sits beside getLatestAccessSoftwareRelease
+        (``/api/v1/manager/access/softwareUpdateEvent``). Raises MonClubApiError only when
+        no answer came back."""
+        from urllib.parse import urljoin
+
+        base = (self.endpoints.latest_release_url or "").strip()
+        if not base:
+            raise MonClubApiError("Latest release URL is empty (check Configuration).")
+        url = urljoin(base, "softwareUpdateEvent")
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        try:
+            r = self._session.post(url, json=event, headers=headers, timeout=timeout)
+        except Exception as e:
+            raise MonClubApiError(f"softwareUpdateEvent request failed: {e}") from e
+        return int(r.status_code)
 
     def get_latest_access_software_release(
         self,

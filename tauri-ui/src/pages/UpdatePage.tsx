@@ -28,6 +28,8 @@ import {
   Shield,
   Loader2,
 } from "lucide-react";
+import ReleaseNotes from "@/components/update/ReleaseNotes";
+import UpdateNotices from "@/components/update/UpdateNotices";
 
 function formatBytes(bytes: number | null | undefined): string {
   if (!bytes) return "—";
@@ -81,6 +83,7 @@ export default function UpdatePage() {
   const [downloading, setDownloading] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [installError, setInstallError] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchStatus = useCallback(async () => {
@@ -126,10 +129,15 @@ export default function UpdatePage() {
 
   const handleInstall = async () => {
     setInstalling(true);
+    setInstallError(null);
     try {
+      // Answers OK only once the installer really started; the app then restarts.
       await installAccessUpdate();
-    } catch {
+    } catch (e) {
+      // The app keeps running: show why (updater v2, D1).
+      setInstallError(e instanceof Error && e.message ? e.message : "unknown error");
       setInstalling(false);
+      await fetchStatus();
     }
   };
 
@@ -173,6 +181,8 @@ export default function UpdatePage() {
           </Button>
         </div>
 
+        <UpdateNotices status={status} installError={installError} />
+
         {/* Current Version Card */}
         <div className="rounded-xl border border-border bg-card p-4 space-y-3">
           <div className="flex items-center gap-2">
@@ -204,7 +214,9 @@ export default function UpdatePage() {
                 <div className="space-y-1.5">
                   <div className="flex items-center gap-2">
                     <Zap className="h-4 w-4 text-primary" />
-                    <span className="text-[13px] font-semibold text-foreground">Update available</span>
+                    <span className="text-[13px] font-semibold text-foreground">
+                      {status.rollback ? "Return to a previous version" : "Update available"}
+                    </span>
                   </div>
                   {status.latestVersion && (
                     <VersionBadge version={status.latestVersion} codename={status.latestCodename} variant="latest" />
@@ -236,9 +248,9 @@ export default function UpdatePage() {
                       <Info className="h-3.5 w-3.5 text-muted-foreground" />
                       <span className="text-[12px] font-medium text-muted-foreground uppercase tracking-wider">Release notes</span>
                     </div>
-                    <div
+                    <ReleaseNotes
                       className="prose prose-sm dark:prose-invert max-w-none text-[13px] leading-relaxed [&_h1]:text-base [&_h2]:text-[13px] [&_h3]:text-[13px] [&_ul]:pl-4 [&_li]:my-0.5 [&_p]:my-1"
-                      dangerouslySetInnerHTML={{ __html: status.releaseNotes }}
+                      html={status.releaseNotes}
                     />
                   </div>
                 </>

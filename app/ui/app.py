@@ -92,6 +92,7 @@ from access.runtime import (
     UpdateStatus,
     schedule_access_shell_startup,
 )
+from shared.update_runtime import UpdateInstallStarted
 from app.core.ultra_engine import UltraEngine
 from app.core import access_mode_refresh as _access_mode_refresh
 from app.core import desk_alerts as _desk_alerts
@@ -610,6 +611,13 @@ class MainApp:
         self._stop_event = threading.Event()
         self._init_scheduler()
 
+        # Updater v2 (owner decision O1): a verified pending update is installed HERE, before
+        # any device, ULTRA or sync work is created or scheduled (design section 7). The
+        # installer's last result is read first (loop guard). No pending update = no
+        # network call, so a normal start is not slowed down.
+        if self._run_update_startup_gate():
+            raise UpdateInstallStarted()
+
         self._sync_after_id: int | None = None
         self._local_api: Optional[LocalAccessApiServerV2] = None
 
@@ -854,6 +862,23 @@ class MainApp:
         self._wake_scheduler()
 
     # ======================= Update Manager =======================
+    def _run_update_startup_gate(self) -> bool:
+        """True = the update wrapper is running and this process must exit now."""
+        try:
+            auth = load_auth_token()
+            tok = str(getattr(auth, "token", None) or "").strip() if auth else ""
+            if not self._update_manager.startup_gate(token=tok):
+                return False
+            self.logger.info(
+                "App shutting down for a start-up update. pid=%s version=%s",
+                os.getpid(),
+                getattr(self, "_boot_version", "unknown"),
+            )
+            return True
+        except Exception:
+            self.logger.exception("[Access Update] start-up update gate failed; starting normally")
+            return False
+
     def _ensure_update_manager_started(self, *, check_now: bool) -> None:
         try:
             auth = load_auth_token()
@@ -1591,6 +1616,8 @@ class MainApp:
         host, port, enabled = self._effective_local_api_bind()
         if not enabled:
             self.logger.info("Local API disabled (cfg or backend settings).")
+            # No API to wait for: the main loop running is the health signal.
+            self.after(0, self._update_manager.on_local_api_ready)
             return
 
         if self._local_api:
@@ -1604,6 +1631,10 @@ class MainApp:
             self.logger.info(f"Local API started on {host}:{port}")
         except Exception as e:
             self.logger.exception("Failed to start Local API: %s", e)
+            return
+        # Health marker for Setup (updater v2): the API listens and, since this runs as a
+        # scheduled callback, the main loop runs. Devices / network are not waited for.
+        self.after(0, self._update_manager.on_local_api_ready)
 
     def stop_local_api_server(self):
         if self._local_api:

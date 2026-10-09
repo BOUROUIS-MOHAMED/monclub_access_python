@@ -42,6 +42,20 @@ def main() -> None:
         print("MonClub Access is already running — exiting this instance.", file=sys.stderr)
         raise SystemExit(0)
 
+    # Updater v2: Setup killed mid-copy (power cut) leaves install_journal.json. Restore
+    # previous\ before anything loads from a half-copied current\ (design 8.0); the helper
+    # restarts the app once this process has exited.
+    try:
+        from shared.update_startup import check_install_journal
+
+        if check_install_journal(exe_name="MonClubAccess.exe"):
+            guard.release()
+            raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"Install journal check failed: {exc}", file=sys.stderr)
+
     # Only the instance that holds the guard: a second start must not wipe the running
     # instance's crash evidence. Moves faulthandler from stderr to its own file.
     from app.core import crash_capture

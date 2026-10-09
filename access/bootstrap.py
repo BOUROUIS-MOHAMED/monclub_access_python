@@ -38,7 +38,12 @@ def create_access_app():
 
 
 def run_access_app() -> None:
-    app = create_access_app()
+    from shared.update_runtime import UpdateInstallStarted
+
+    try:
+        app = create_access_app()
+    except UpdateInstallStarted:
+        return  # the update wrapper waits for this process to exit (updater v2)
     try:
         app.mainloop()
     except KeyboardInterrupt:

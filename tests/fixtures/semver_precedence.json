@@ -1,0 +1,23 @@
+{
+  "comment": "Updater v2 shared version table (design section 5.2). Python: tests/test_updater_v2_versions.py. Java must use the same rows. Each pair is strictly ascending: a < b.",
+  "ascending": [
+    ["1.0.0-alpha", "1.0.0-alpha.1"],
+    ["1.0.0-alpha.1", "1.0.0-alpha.beta"],
+    ["1.0.0-alpha.beta", "1.0.0-beta"],
+    ["1.0.0-beta", "1.0.0-beta.2"],
+    ["1.0.0-beta.2", "1.0.0-beta.11"],
+    ["1.0.0-beta.11", "1.0.0-rc.1"],
+    ["1.0.0-rc.1", "1.0.0"],
+    ["1.4.35", "1.5.0-beta.1"],
+    ["1.5.0-beta.1", "1.5.0"],
+    ["1.5.0", "1.5.1"],
+    ["1.5.9", "1.5.10"],
+    ["1.9.0", "1.10.0"],
+    ["1.99.99", "2.0.0"]
+  ],
+  "equal": [
+    ["1.5.0", "1.5.0"],
+    ["1.5.0-beta.1", "1.5.0-beta.1"]
+  ],
+  "invalid": ["", "1", "1.5", "1.5.0.1", "v1.5.0", "1.5.x", "1.5.0-", "1.5.0-beta..1", "1.5.0+build.1", " 1.5.0", "1.5.0 ", "-1.5.0", "1.5.-1", "1.5.0-bet@", "1.5.0-01", "1.5.0-beta.01"]
+}

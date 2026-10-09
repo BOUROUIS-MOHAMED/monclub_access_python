@@ -76,6 +76,8 @@ if (-not (Test-Path $tauriDir)) {
 Write-Host "Synchronizing Tauri version metadata..." -ForegroundColor Yellow
 Sync-TauriShellVersionFiles -TargetComponent $Component
 
+# (.NET hashing, not Get-FileHash: a Windows PowerShell 5.1 started from a PowerShell 7 window -- as
+# build_release.ps1 starts this script -- cannot load Get-FileHash; it stopped L4's final build.)
 # The TV build swaps the TV icons over the Access ones and restores them afterwards. A
 # snapshot taken mid-build once committed the swapped files, and every Access build then
 # showed the TV logo. Refuse to build Access with TV icons in place.
@@ -84,7 +86,8 @@ if ($Component -eq "access") {
     $tvPath = Join-Path $iconsDir $entry.Key
     $accessPath = Join-Path $iconsDir $entry.Value
     if ((Test-Path $tvPath) -and (Test-Path $accessPath) -and
-        ((Get-FileHash -LiteralPath $tvPath).Hash -eq (Get-FileHash -LiteralPath $accessPath).Hash)) {
+        ([Convert]::ToBase64String([System.Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($tvPath))) -eq
+         [Convert]::ToBase64String([System.Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($accessPath))))) {
       throw "Access icon $($entry.Value) is identical to the TV icon $($entry.Key). Restore the Access icon first."
     }
   }

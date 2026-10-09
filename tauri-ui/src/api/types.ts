@@ -106,12 +106,17 @@ export interface UpdatesBlock {
   componentDisplayName?: string | null;
   artifactName?: string | null;
   mainExecutable?: string | null;
-  updaterExecutable?: string | null;
-  updaterInstalled?: boolean;
   installRoot?: string | null;
   updateEnabled?: boolean;
   channel?: string | null;
   platform?: string | null;
+  rollback?: boolean;
+  verifyError?: string | null;
+  autoInstallBlocked?: boolean;
+  autoInstallBlockedReason?: string | null;
+  pendingSince?: number | null;
+  installing?: boolean;
+  lastResult?: UpdateLastResult | null;
 }
 
 export interface StatusResponse extends ApiOk {
@@ -532,12 +537,19 @@ export interface UpdateStatusResponse {
   componentDisplayName?: string | null;
   artifactName?: string | null;
   mainExecutable?: string | null;
-  updaterExecutable?: string | null;
-  updaterInstalled?: boolean;
   installRoot?: string | null;
   updateEnabled?: boolean;
   channel?: string | null;
   platform?: string | null;
+
+  // Updater v2
+  rollback?: boolean;                  // the offer returns to an earlier version (withdrawn release)
+  verifyError?: string | null;         // the offer was refused: unsigned / forged / tampered
+  autoInstallBlocked?: boolean;        // loop guard: this version failed before
+  autoInstallBlockedReason?: string | null;
+  pendingSince?: number | null;        // epoch seconds the offer was first verified
+  installing?: boolean;
+  lastResult?: UpdateLastResult | null;
 
   // Legacy block (backward compat)
   latestRelease?: {
@@ -551,6 +563,16 @@ export interface UpdateStatusResponse {
     availableUntil?: string;
     minCompatibleVersion?: string;
   } | null;
+}
+
+// The installer's last result ({app}\state\last_update.json), as the PC read it.
+export interface UpdateLastResult {
+  result: "INSTALLED" | "ROLLED_BACK" | "ABORTED" | string;
+  from?: string | null;
+  to?: string | null;
+  reason?: string | null;
+  at?: string | null;
+  installedNow?: string | null;
 }
 
 export interface UpdateVersionInfoResponse {

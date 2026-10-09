@@ -6,6 +6,12 @@ param(
 
   [string]$IsccPath = "",
 
+  # Test-only failure injection (/DUPDATER_TEST_FAIL, installer/update_safety.iss). The
+  # installer is then named <base>_<version>_TESTFAIL_<mode>.exe; build_release.ps1 allows it
+  # only with -E2ETestKeys and such a release file is never publishable.
+  [ValidateSet("", "after_copy", "health", "crash")]
+  [string]$TestFail = "",
+
   [switch]$DryRun
 )
 
@@ -131,12 +137,19 @@ Write-Host "VersionJson: $($stageInfo.VersionPath)" -ForegroundColor Cyan
 Write-Host "ISS        : $installerScript" -ForegroundColor Cyan
 Write-Host "Output     : $installerPath" -ForegroundColor Cyan
 
-& "$iscc" `
-  "$installerScript" `
-  "/DAppVersion=$($stageInfo.Version)" `
-  "/DReleaseId=$($stageInfo.ReleaseId)" `
-  "/DStageDir=$StageDir" `
+$isccArgs = @(
+  "$installerScript",
+  "/DAppVersion=$($stageInfo.Version)",
+  "/DReleaseId=$($stageInfo.ReleaseId)",
+  "/DStageDir=$StageDir",
   "/DOutputBaseFilename=$outputBaseName"
+)
+if ($TestFail) {
+  Write-Host "TEST-ONLY installer: UPDATER_TEST_FAIL=$TestFail" -ForegroundColor Yellow
+  $isccArgs += "/DUPDATER_TEST_FAIL=$TestFail"
+  $installerPath = Join-Path $ROOT ("release\{0}_TESTFAIL_{1}.exe" -f $outputBaseName, $TestFail)
+}
+& "$iscc" @isccArgs
 
 if ($LASTEXITCODE -ne 0) {
   throw "ISCC compile failed with exit code $LASTEXITCODE"
