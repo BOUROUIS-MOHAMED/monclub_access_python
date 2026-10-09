@@ -36,6 +36,10 @@ CLAIM_GLOB = "install_journal.restoring-*.json"
 # Every restorer (the app's restore helper, the install wrapper, L2's watchdog / helper) is
 # PowerShell: a claim pid running anything else is a reused pid, not a restorer.
 _RESTORER_IMAGES = {"powershell.exe", "pwsh.exe"}
+# A restorer touches its claim right after renaming the journal, so it started BEFORE the
+# claim's mtime; a process that started later only reuses the pid (installer/update_helper.ps1
+# Test-ClaimLive uses the same 5 s slack).
+CLAIM_START_SLACK_SEC = 5.0
 
 
 def setup_image_re(target: Optional[str] = None) -> "re.Pattern[str]":
@@ -216,6 +220,36 @@ def setup_is_running(
     return bool(name) and rule.match(name) is not None
 
 
+def process_creation_epoch(pid: int) -> Optional[float]:
+    """Wall-clock creation time of a running process, or None when it cannot be read."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        try:
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if not kernel32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+                return None
+            created = (int(times[0].dwHighDateTime) << 32) | int(times[0].dwLowDateTime)
+            if created <= 0:
+                return None
+            return created / 10_000_000.0 - 11_644_473_600.0  # FILETIME (1601, 100 ns) -> epoch
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return None
+
+
 def last_boot_epoch() -> Optional[float]:
     """Wall-clock time of the last Windows boot, or None when unknown."""
     if os.name != "nt":
@@ -290,16 +324,27 @@ def live_restore_claims(
     processes: Optional[Dict[int, str]] = None,
     *,
     boot_epoch: Optional[float] = None,
+    creation_times: Optional[Dict[int, float]] = None,
 ) -> list[Path]:
     """Claimed journals (``install_journal.restoring-<pid>.json``) whose restorer still runs.
 
     While one exists, ``current`` is being rewritten: nothing may start from it. A claim is
-    live only when its pid runs PowerShell AND the claim was made since the last Windows boot
-    (a reboot kills every restorer, and pids are reused after it). Any other claim is a
-    restorer that died -- it is handed back as a journal (renamed back)."""
+    live only when its pid runs PowerShell, that process started no later than the claim
+    (+5 s) -- a restorer touches its claim after it starts, a later process only reuses the
+    pid -- AND the claim was made since the last Windows boot. The start-time rule is what
+    holds under Fast Startup, where a shutdown does not reset the boot time (L4 inbox 2); an
+    unreadable start time skips it, as installer/update_helper.ps1 Test-ClaimLive does. Any
+    other claim is a restorer that died -- it is handed back as a journal (renamed back).
+    ``creation_times``: pid -> epoch for an injected ``processes`` table (tests)."""
     live: list[Path] = []
     procs = running_process_names() if processes is None else processes
     boot = last_boot_epoch() if boot_epoch is None else boot_epoch
+    if creation_times is not None:
+        started_at: Callable[[int], Optional[float]] = creation_times.get
+    elif processes is None:
+        started_at = process_creation_epoch
+    else:  # an injected table without start times: the start-time rule cannot apply
+        started_at = lambda _pid: None  # noqa: E731
     for claim in sorted(paths.state_dir.glob(CLAIM_GLOB)) if paths.state_dir.is_dir() else []:
         m = re.match(r"^install_journal\.restoring-(\d+)\.json\Z", claim.name)
         pid = int(m.group(1)) if m else -1
@@ -315,10 +360,13 @@ def live_restore_claims(
                 continue
         elif (procs.get(pid) or "").lower() in _RESTORER_IMAGES:
             try:
-                since_boot = boot is None or claim.stat().st_mtime >= boot - 5
+                claimed_at = claim.stat().st_mtime
             except OSError:
-                since_boot = False
-            if since_boot:
+                claimed_at = None
+            started = started_at(pid)
+            restorer = started is None or (claimed_at is not None and started <= claimed_at + CLAIM_START_SLACK_SEC)
+            since_boot = claimed_at is not None and (boot is None or claimed_at >= boot - 5)
+            if restorer and since_boot:
                 live.append(claim)
                 continue
         try:

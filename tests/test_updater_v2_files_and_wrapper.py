@@ -131,6 +131,52 @@ def test_a_claim_is_live_only_for_a_powershell_pid_claimed_since_the_last_boot(t
     assert uf.live_restore_claims(paths, {111: "pwsh.exe"}, boot_epoch=now - 3600) == [claim]
 
 
+def test_a_claim_is_dead_when_its_pid_is_a_powershell_that_started_after_the_claim(tmp_path):
+    """L4 inbox 2: with Fast Startup a shutdown does not reset the boot time, so a claim left by
+    a restorer killed at shutdown passes the boot rule; a PowerShell that reuses its pid (the
+    watchdog) started AFTER the claim and must not stand every start-up down. Same 5 s slack
+    as installer/update_helper.ps1 Test-ClaimLive."""
+    paths = uf.UpdatePaths(tmp_path)
+    paths.state_dir.mkdir()
+    claim = paths.state_dir / "install_journal.restoring-111.json"
+    claim.write_text("{}", encoding="ascii")
+    now = time.time()
+    os.utime(claim, (now - 600, now - 600))
+    boot_long_ago = now - 7 * 86400  # Fast Startup: the "boot" is a week old
+    # pid 111 now belongs to a PowerShell started 9 min after the claim: a reused pid
+    assert uf.live_restore_claims(
+        paths, {111: "powershell.exe"}, boot_epoch=boot_long_ago, creation_times={111: now - 60}
+    ) == []
+    assert paths.journal.exists() and not claim.exists()  # handed back for a restore
+    os.replace(paths.journal, claim)
+    os.utime(claim, (now - 600, now - 600))
+    # the real restorer: started before it touched the claim
+    assert uf.live_restore_claims(
+        paths, {111: "powershell.exe"}, boot_epoch=boot_long_ago, creation_times={111: now - 610}
+    ) == [claim]
+    # inside the slack (clock granularity between the rename and the touch)
+    assert uf.live_restore_claims(
+        paths, {111: "pwsh.exe"}, boot_epoch=boot_long_ago, creation_times={111: now - 600 + 4}
+    ) == [claim]
+    # start time unreadable (access denied): the rule is skipped, as in the helper
+    assert uf.live_restore_claims(
+        paths, {111: "powershell.exe"}, boot_epoch=boot_long_ago, creation_times={}
+    ) == [claim]
+    # the boot rule still applies on top
+    assert uf.live_restore_claims(
+        paths, {111: "powershell.exe"}, boot_epoch=now - 60, creation_times={111: now - 610}
+    ) == []
+
+
+def test_process_creation_epoch_reads_this_process_start_time():
+    started = uf.process_creation_epoch(os.getpid())
+    if os.name != "nt":
+        assert started is None
+        return
+    assert started is not None and started <= time.time() + 1
+    assert uf.process_creation_epoch(0x7FFFFFFC) is None  # no such pid
+
+
 def test_each_component_waits_only_for_its_own_setup():
     """Advisor: an Access restore must not back off for (or stop) a TV Setup."""
     tv_setup = {9: "monclub_tv_1.5.1.tmp"}
