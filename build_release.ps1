@@ -68,8 +68,14 @@ function Invoke-NativeProbe([scriptblock] $Command) {
   try { & $Command 2>$null } finally { $ErrorActionPreference = $saved }
 }
 
+# Plain .NET, not Get-FileHash: Get-FileHash is a module function that Windows PowerShell 5.1 cannot load
+# when it inherits PowerShell 7's PSModulePath (a 5.1 process started from a pwsh 7 terminal) -- it
+# stopped L4's real -E2ETestKeys run right after the installer compiled.
 function Get-Sha256($Path) {
-  return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  $stream = [System.IO.File]::OpenRead((Resolve-Path -LiteralPath $Path).ProviderPath)
+  try { $bytes = $sha.ComputeHash($stream) } finally { $stream.Dispose(); $sha.Dispose() }
+  return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
 }
 
 function Try-Run($Cmd, $Args) {
