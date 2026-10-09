@@ -50,6 +50,9 @@ AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppPublisher}
 SetupIconFile={#SetupIcon}
+; Icon shown in Windows Settings > Apps. Without it Inno writes no DisplayIcon and
+; Windows shows a generic icon there.
+UninstallDisplayIcon={app}\current\{#MainExe}
 WizardImageFile={#WizardImage}
 WizardSmallImageFile={#WizardSmall}
 DefaultDirName={code:GetInstallRootDefault}

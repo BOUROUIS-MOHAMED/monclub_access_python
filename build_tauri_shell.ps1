@@ -67,6 +67,20 @@ if (-not (Test-Path $tauriDir)) {
 Write-Host "Synchronizing Tauri version metadata..." -ForegroundColor Yellow
 Sync-TauriShellVersionFiles -TargetComponent $Component
 
+# The TV build swaps the TV icons over the Access ones and restores them afterwards. A
+# snapshot taken mid-build once committed the swapped files, and every Access build then
+# showed the TV logo. Refuse to build Access with TV icons in place.
+if ($Component -eq "access") {
+  foreach ($entry in $tvIconMap.GetEnumerator()) {
+    $tvPath = Join-Path $iconsDir $entry.Key
+    $accessPath = Join-Path $iconsDir $entry.Value
+    if ((Test-Path $tvPath) -and (Test-Path $accessPath) -and
+        ((Get-FileHash -LiteralPath $tvPath).Hash -eq (Get-FileHash -LiteralPath $accessPath).Hash)) {
+      throw "Access icon $($entry.Value) is identical to the TV icon $($entry.Key). Restore the Access icon first."
+    }
+  }
+}
+
 Push-Location $tauriDir
 try {
   if ($Component -eq "tv") {
