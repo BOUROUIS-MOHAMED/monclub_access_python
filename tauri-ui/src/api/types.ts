@@ -75,6 +75,8 @@ export interface UltraBlock {
   running: boolean;
   /** Keyed by device id as a string. */
   devices: Record<string, UltraDeviceBlock>;
+  /** False on a READER PC (driver lease gives it no turnstile). Absent on older clients. */
+  drivesTurnstiles?: boolean;
 }
 
 export interface AgentBlock {
