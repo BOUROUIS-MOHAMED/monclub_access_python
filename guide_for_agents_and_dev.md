@@ -5681,8 +5681,9 @@ watchdog), then start nothing; the inline PowerShell copy is only a fallback for
 `<exe>` runs from `{app}\current`, start `{app}\current\<exe>` with that working directory. `[TEST: test_updater_v2_files_and_wrapper.py::test_install_wrapper_runs_for_real_writes_aborted_and_relaunches_the_old_app, ::test_install_wrapper_restores_a_journal_setup_left_behind_before_relaunching — real PowerShell, stand-in Setup]`
 `[TEST: ::test_install_wrapper_restores_through_the_installed_update_helper,
 ::test_install_wrapper_stands_down_on_a_live_restore_claim_and_starts_nothing — real PowerShell + the real helper]`
-`[UNVERIFIED]` that the hidden PowerShell survives the app's exit when the app was started
-by the watchdog's scheduled task (L4 E2E).
+The hidden PowerShell survives the app's exit when the app was started by the watchdog's scheduled task
+`[FIELD: dev PC, L4 E2E 2026-10-09, docs/access-updater-v2/e2e/L4/02-a-startup-auto-install-1.5.0-to-1.5.1 —
+the watchdog-started 1.5.0 launched the wrapper and quit; the wrapper ran Setup to INSTALLED]`.
 
 ### 11.4 Start-up order (O1, D25)
 
@@ -5875,7 +5876,13 @@ L2's first E2E). The watchdog is not rolled back with the app (it works with any
 wait, one tick of the installed watchdog → ROLLED_BACK interrupted]` The watchdog task is still
 unticked by default on existing installs (D39, owner product choice). It is a scheduled task
 (`register_watchdog.ps1`: at logon + every few minutes, `ExecutionTimeLimit` 5 min,
-`MultipleInstances IgnoreNew`) `[CODE]`; the app's own start-at-logon is the HKCU `Run` value
+`MultipleInstances IgnoreNew`) `[CODE]`. It starts the app only after two misses at least 90 s apart and
+refuses after 5 restarts in 60 min (its crash-loop guard): after a real reboot on the dev PC Access was running
+about 2.5 min after Windows started `[FIELD: L4 E2E 2026-10-09]` — a morning start-up install begins only then.
+**After a power cut during the file copy only the watchdog (or re-running the installer, whose `recover -InSetup`
+repairs) brings Access back:** the exe and `version.json` are copied last, so until they are there the Start-menu
+shortcut has nothing to start and the app's own start-up journal check cannot run `[FIELD: L4 E2E (k) —
+the watchdog restored previous 88 s after the cut]`. The app's own start-at-logon is the HKCU `Run` value
 `MonClubAccess` written by `app/ui/app.py` when `start_on_system_startup` is set `[CODE]`.
 
 ### 11.10 Uninstall and data (D26)
