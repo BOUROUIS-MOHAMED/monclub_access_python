@@ -66,9 +66,9 @@ def test_rfc8032_a_flipped_bit_anywhere_fails(seed_hex, public_hex, msg_hex, sig
 
 
 def test_the_shared_test_key_matches_its_seed_file_and_node():
-    seed_hex = TEST_SEED_FILE.read_text(encoding="ascii")
-    assert seed_hex == hashlib.sha256(b"monclub-updater-v2-test-key-2026-10").hexdigest() + "\n"
-    seed = bytes.fromhex(seed_hex.strip())
+    seed_hex = TEST_SEED_FILE.read_text(encoding="ascii").strip()  # git may check it out CRLF
+    assert seed_hex == hashlib.sha256(b"monclub-updater-v2-test-key-2026-10").hexdigest()
+    seed = bytes.fromhex(seed_hex)
     public = ed25519.public_key_from_seed(seed)
     assert public.hex() == TEST_KEYS["test-l2-2026-10"]
     # Node crypto, same seed, message b'{"a":1}'.
