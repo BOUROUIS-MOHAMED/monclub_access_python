@@ -21,6 +21,7 @@ import { usePageChrome } from "@/context/PageChromeContext";
 import { Button } from "@/components/ui/button";
 import ScanCardModal from "@/components/ScanCardModal";
 import { LiveDot } from "@/layouts/MainLayout";
+import { hasAgentDevices } from "@/lib/agentMode";
 import { cn } from "@/lib/utils";
 import type { DashboardFeedItem, DashboardOverview, DashboardToday } from "@/api/types";
 import {
@@ -209,6 +210,7 @@ export default function DashboardPage() {
   if (!status) return <p className="text-[13px] text-muted-foreground">Chargement…</p>;
 
   const agent = status.agent;
+  const showAgent = hasAgentDevices(status);
   const sync = status.sync;
   const mode = status.mode;
   const s = status.session;
@@ -239,7 +241,7 @@ export default function DashboardPage() {
   // observable faults are surfaced — /status carries no per-device reachability,
   // so "device offline" is deliberately not synthesised here.
   const alert =
-    !agent.running ? { icon: Square, text: "Agent temps réel arrêté", action: "Démarrer", run: () => post("/agent/start") }
+    showAgent && !agent.running ? { icon: Square, text: "Agent temps réel arrêté", action: "Démarrer", run: () => post("/agent/start") }
     : !readerConnected ? { icon: WifiOff, text: "Lecteur non connecté", action: "Recharger", run: () => window.location.reload() }
     : !sync.lastOk ? { icon: AlertTriangle, text: "Dernière synchronisation en échec", action: "Relancer", run: handleSync }
     : null;
@@ -462,13 +464,15 @@ export default function DashboardPage() {
           <Sep className="mb-3" />
 
           <div className="flex flex-col gap-2.5">
-            <div className="flex items-center gap-2.5">
-              <LiveDot className="h-2 w-2" tone={agent.running ? "ok" : "off"} />
-              <span className="flex-1 text-[12px] text-foreground">Agent</span>
-              <span className="font-mono text-[12px] text-muted-foreground">
-                {agent.eventQueueDepth} · {agent.avgDecisionMs.toFixed(1)} ms
-              </span>
-            </div>
+            {showAgent && (
+              <div className="flex items-center gap-2.5">
+                <LiveDot className="h-2 w-2" tone={agent.running ? "ok" : "off"} />
+                <span className="flex-1 text-[12px] text-foreground">Agent</span>
+                <span className="font-mono text-[12px] text-muted-foreground">
+                  {agent.eventQueueDepth} · {agent.avgDecisionMs.toFixed(1)} ms
+                </span>
+              </div>
+            )}
             <div className="flex items-center gap-2.5">
               <span className={cn("h-2 w-2 shrink-0 rounded-full", readerConnected ? "bg-emerald-500" : "bg-primary")} />
               <span className="flex-1 text-[12px] text-foreground">Lecteur</span>

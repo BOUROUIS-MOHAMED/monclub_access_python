@@ -23,6 +23,7 @@ import {
   DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog";
+import { hasAgentDevices } from "@/lib/agentMode";
 import { cn } from "@/lib/utils";
 import {
   AlertTriangle, LogOut, Router, Users, Database, RefreshCw, Clock,
@@ -300,15 +301,17 @@ export default function ProfilePage() {
               {status.updates?.currentVersion ?? "—"}
             </span>
           </div>
-          <div className="flex items-center justify-between gap-2.5">
-            <span className="text-[12px] text-muted-foreground">Agent temps réel</span>
-            <span className={cn(
-              "text-[12px] font-semibold",
-              status.agent?.running ? "text-emerald-700 dark:text-emerald-400" : "text-muted-foreground",
-            )}>
-              {status.agent?.running ? "actif" : "arrêté"}
-            </span>
-          </div>
+          {hasAgentDevices(status) && (
+            <div className="flex items-center justify-between gap-2.5">
+              <span className="text-[12px] text-muted-foreground">Agent temps réel</span>
+              <span className={cn(
+                "text-[12px] font-semibold",
+                status.agent?.running ? "text-emerald-700 dark:text-emerald-400" : "text-muted-foreground",
+              )}>
+                {status.agent?.running ? "actif" : "arrêté"}
+              </span>
+            </div>
+          )}
 
           <div className="mt-auto flex items-start gap-[9px] border-t border-border pt-3">
             <LifeBuoy className="mt-px h-4 w-4 shrink-0 text-muted-foreground" />

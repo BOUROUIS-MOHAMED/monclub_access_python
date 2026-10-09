@@ -5,6 +5,7 @@ import type { AgentDeviceSnap, DeviceDto, DoorPresetDto } from "@/api/types";
 import { useAgentStatus, useDevices } from "@/api/hooks";
 import StatusChip from "@/components/StatusChip2";
 import { useApp } from "@/context/AppContext";
+import { hasAgentDevices } from "@/lib/agentMode";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -364,9 +365,11 @@ export default function TrayPanelPage() {
                 <h1 className="mt-1 truncate text-lg font-semibold text-foreground">MonClub Access</h1>
                 <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                   <span className="truncate">{sessionEmail}</span>
-                  <Badge variant="outline" className={outlineBadgeClassName}>
-                    {status?.agent?.running ? "Agent on" : "Agent off"}
-                  </Badge>
+                  {hasAgentDevices(status) && (
+                    <Badge variant="outline" className={outlineBadgeClassName}>
+                      {status?.agent?.running ? "Agent on" : "Agent off"}
+                    </Badge>
+                  )}
                   <Badge variant="outline" className={outlineBadgeClassName}>
                     Last sync {formatClock(status?.sync?.lastSyncAt)}
                   </Badge>

@@ -35,6 +35,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { hasAgentDevices } from "@/lib/agentMode";
 import { cn } from "@/lib/utils";
 import {
   LayoutDashboard,
@@ -147,6 +148,9 @@ export default function MainLayout() {
     "Les dates d'accès n'avancent pas au-delà de la dernière date connue. " +
     "Vérifiez la date et l'heure de Windows.";
   const agentRunning = status?.agent?.running ?? false;
+  const navGroups = hasAgentDevices(status)
+    ? NAV_GROUPS
+    : NAV_GROUPS.map((g) => ({ ...g, items: g.items.filter((i) => i.to !== "/agent") }));
 
   // The design's account row shows a person's name and role. SessionBlock
   // carries neither — only `email` — so the address is the honest stand-in.
@@ -226,7 +230,7 @@ export default function MainLayout() {
         {/* Grouped nav */}
         <ScrollArea className="min-h-0 flex-1">
           <nav className={cn("flex flex-col gap-[18px] py-2", sidebarOpen ? "px-3" : "px-2")}>
-            {NAV_GROUPS.map((group) => (
+            {navGroups.map((group) => (
               <div key={group.label}>
                 {sidebarOpen ? (
                   <div className="px-2.5 pb-[9px] text-[8.5px] font-extrabold uppercase tracking-[0.2em] text-muted-foreground">

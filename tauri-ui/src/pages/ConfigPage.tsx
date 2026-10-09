@@ -175,6 +175,7 @@ function OverlayAnchorPicker({
 // Access v3 imports (Partie 2, screen 05)
 import { usePageChrome } from "@/context/PageChromeContext";
 import { ArrowRightLeft } from "lucide-react";
+import { hasAgentDevices } from "@/lib/agentMode";
 import { cn } from "@/lib/utils";
 
 export default function ConfigPage() {
@@ -1225,12 +1226,14 @@ export default function ConfigPage() {
             <span className="text-[12px] font-semibold text-foreground">{updates?.platform || "WINDOWS"}</span>
           </div>
           <div className="h-px bg-border" />
-          <div className="flex items-center justify-between gap-2.5">
-            <span className="text-[12px] text-muted-foreground">Agent temps réel</span>
-            <span className={cn("text-[12px] font-semibold", status?.agent?.running ? "text-emerald-700 dark:text-emerald-400" : "text-muted-foreground")}>
-              {status?.agent?.running ? "actif" : "arrêté"}
-            </span>
-          </div>
+          {hasAgentDevices(status) && (
+            <div className="flex items-center justify-between gap-2.5">
+              <span className="text-[12px] text-muted-foreground">Agent temps réel</span>
+              <span className={cn("text-[12px] font-semibold", status?.agent?.running ? "text-emerald-700 dark:text-emerald-400" : "text-muted-foreground")}>
+                {status?.agent?.running ? "actif" : "arrêté"}
+              </span>
+            </div>
+          )}
           <div className="flex items-center justify-between gap-2.5">
             <span className="text-[12px] text-muted-foreground">Lecteur PullSDK</span>
             <span className={cn("text-[12px] font-semibold", status?.pullsdk?.connected ? "text-emerald-700 dark:text-emerald-400" : "text-muted-foreground")}>
