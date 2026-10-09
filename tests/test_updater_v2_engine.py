@@ -598,6 +598,18 @@ def test_server_errors_keep_the_event_and_an_old_backend_404_drops_it(env):
     assert mgr.flush_outbox(token="tok") == 1 and _state(mgr)["outbox"] == []
 
 
+def test_an_expired_or_refused_token_keeps_the_event_for_the_next_flush(env):
+    """L4 review M1: 401 (expired token), 403 (subscription inactive), 428 (upgrade required) describe the
+    gym token, not the event -- the INSTALLED report must survive until a good token sends it."""
+    mgr = env.make()
+    mgr.emit_event("INSTALLED", to_version="1.5.1", flush=False)
+    for code in (401, 403, 428, 408, 429):
+        env.api.event_status = code
+        assert mgr.flush_outbox(token="tok") == 0 and len(_state(mgr)["outbox"]) == 1, code
+    env.api.event_status = 400
+    assert mgr.flush_outbox(token="tok") == 1 and _state(mgr)["outbox"] == []
+
+
 def test_the_same_installer_result_gives_the_same_event_id(env):
     mgr = env.make()
     a = mgr.emit_event("INSTALLED", to_version="1.5.1", id_seed="m1", flush=False)

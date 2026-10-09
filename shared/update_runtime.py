@@ -69,6 +69,9 @@ FALLBACK_TICK_MS = 5 * 60 * 1000
 RESULT_RESCAN_MS = 30 * 1000
 RESULT_RESCAN_WINDOW_SEC = 10 * 60
 OUTBOX_MAX = 50
+# HTTP answers that keep a telemetry event for the next flush (besides 5xx): timeouts, rate limits, and
+# the gym token's own state -- an expired token right after the update must not lose its INSTALLED report.
+_TELEMETRY_RETRY_CODES = (401, 403, 408, 428, 429)
 # Results after which a version is never auto-installed again (design 7 loop guard).
 # Anything else (health_timeout, interrupted, no result, Setup exit) gets one retry.
 _BAN_REASONS = {"crash", "after_copy_failed", "setup_failed", "copy_failed", "post_install_failed", "restore_failed"}
@@ -1429,8 +1432,10 @@ class ComponentUpdateManager:
             return None
 
     def flush_outbox(self, *, token: str) -> int:
-        """POST queued events; drop accepted (2xx) and refused (4xx but 408/429) ones.
-        Returns how many left the outbox. An old backend answers 404: dropped, never piles up."""
+        """POST queued events; drop accepted (2xx) and refused (4xx but 401/403/408/428/429) ones.
+        Returns how many left the outbox. An old backend answers 404: dropped, never piles up.
+        401/403/428 are the gym token's state (expired, subscription inactive, upgrade required),
+        not the event's: the event waits for a good token (L4 review M1); the outbox stays bounded."""
         if not token or not self._outbox_lock.acquire(blocking=False):
             return 0
         sent = 0
@@ -1445,7 +1450,7 @@ class ComponentUpdateManager:
                 except Exception as exc:
                     self._log("info", "telemetry not sent (will retry): %s", exc)
                     break
-                if 500 <= code or code in (408, 429):
+                if 500 <= code or code in _TELEMETRY_RETRY_CODES:
                     self._log("info", "telemetry HTTP %s (will retry)", code)
                     break
                 if not (200 <= code < 300):
