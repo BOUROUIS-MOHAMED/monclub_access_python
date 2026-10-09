@@ -800,6 +800,23 @@ def _build_status_payload(app: Any) -> Dict[str, Any]:
     return result
 
 
+def _pc_drives_ultra_turnstiles(mode: Any) -> bool:
+    """Whether this PC is meant to connect to at least one ULTRA turnstile.
+
+    False on a READER PC (driver lease assigns it none), where no ULTRA worker ever
+    runs: the UI must not report "Lecteur non connecté" there. Read from the
+    installed lease snapshot only, so no SQLite read on the status path.
+    """
+    from app.core.v2 import lease_gate
+    try:
+        snap = lease_gate.current()
+        if snap.mode != lease_gate.MODE_LEASED:
+            return int((mode or {}).get("ULTRA", 0) or 0) > 0
+        return bool(snap.release) or any(e.state == "DRIVE" for e in snap.drive.values())
+    except Exception:
+        return True
+
+
 def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
     from access.store import load_auth_token
     from app.core.db import load_sync_contract_meta, load_sync_device_mode_summary, peek_sync_cache, summarize_access_mode_counts
@@ -920,6 +937,8 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
             ultra = ultra_eng.get_status()
         except Exception:
             pass
+
+    ultra["drivesTurnstiles"] = _pc_drives_ultra_turnstiles(mode)
 
     updates = _build_update_status_payload(app)
     updates["progress"] = updates.get("progressPercent")

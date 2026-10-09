@@ -231,6 +231,8 @@ export default function DashboardPage() {
   const ultraDevices = Object.values(status.ultra?.devices ?? {});
   const ultraConnected = ultraDevices.filter((d) => d?.connected);
   const readerConnected = status.pullsdk.connected || ultraConnected.length > 0;
+  // A READER PC never connects to a turnstile, so "not connected" is its normal state.
+  const expectsReader = mode.DEVICE > 0 || mode.AGENT > 0 || (status.ultra?.drivesTurnstiles ?? true);
   const readerLabel =
     status.pullsdk.ip
     ?? (ultraConnected.length === 1 ? ultraConnected[0].device_name : null)
@@ -242,7 +244,7 @@ export default function DashboardPage() {
   // so "device offline" is deliberately not synthesised here.
   const alert =
     showAgent && !agent.running ? { icon: Square, text: "Agent temps réel arrêté", action: "Démarrer", run: () => post("/agent/start") }
-    : !readerConnected ? { icon: WifiOff, text: "Lecteur non connecté", action: "Recharger", run: () => window.location.reload() }
+    : expectsReader && !readerConnected ? { icon: WifiOff, text: "Lecteur non connecté", action: "Recharger", run: () => window.location.reload() }
     : !sync.lastOk ? { icon: AlertTriangle, text: "Dernière synchronisation en échec", action: "Relancer", run: handleSync }
     : null;
 
