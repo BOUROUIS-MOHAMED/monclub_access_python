@@ -93,10 +93,28 @@ def test_a_restore_in_progress_makes_the_app_exit_without_starting(tmp_path, mon
     """Review M1: a claimed journal whose restorer still runs = current is being rewritten."""
     import os as _os
 
+    from shared import update_files as uf
+
     root = _root(tmp_path, journal=False)
     (root / "state" / f"install_journal.restoring-{_os.getpid()}.json").write_text("{}", encoding="ascii")
+    monkeypatch.setattr(uf, "running_process_names", lambda: {_os.getpid(): "powershell.exe"})
     launched = []
     assert _check(root, launched) is True and launched == []
+
+
+def test_a_claim_whose_pid_was_reused_by_another_program_is_handed_back(tmp_path, monkeypatch):
+    """Advisor: after a power cut the claim pid may belong to an unrelated process."""
+    import os as _os
+
+    from shared import update_files as uf
+
+    root = _root(tmp_path, journal=False)
+    (root / "state" / f"install_journal.restoring-{_os.getpid()}.json").write_text(
+        json.dumps({"phase": "copying", "from": "1.5.0", "to": "1.5.1", "at": utc_now_iso(NOW - 3600)}), encoding="ascii")
+    monkeypatch.setattr(uf, "running_process_names", lambda: {_os.getpid(): "svchost.exe"})
+    launched = []
+    assert _check(root, launched) is True  # handed back as a journal -> stale -> restore helper
+    assert len(launched) == 1 and (root / "state" / "install_journal.json").exists()
 
 
 def test_a_source_run_never_restores(monkeypatch):

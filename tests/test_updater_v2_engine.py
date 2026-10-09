@@ -627,3 +627,10 @@ def test_a_frozen_exe_outside_current_never_auto_installs(env, monkeypatch, tmp_
     assert env.make(auto_install_allowed=None)._auto_install_allowed is False
     monkeypatch.setattr(ur, "runtime_base_dir", lambda: tmp_path / "MonClubAccess" / "current")
     assert env.make(auto_install_allowed=None)._auto_install_allowed is True
+
+
+def test_the_wrapper_is_built_with_this_components_setup_pattern_only(env):
+    mgr = _pending_ready(env)
+    mgr.launch_install()
+    script = env.launched[-1]["script"]
+    assert "^monclub_access_[0-9]" in script and "(access|tv)" not in script

@@ -5682,10 +5682,15 @@ by the watchdog's scheduled task (L4 E2E).
    `current` is intact. The helper claims the journal (rename to
    `install_journal.restoring-<pid>.json`; a failed rename = another restorer owns it, back
    off), copies `previous\*` back, writes `ROLLED_BACK interrupted`, restarts the app. A
-   claim whose `<pid>` still runs means a restore is in progress: the app exits without
-   starting from `current` (the restorer restarts it); a claim whose pid is gone is renamed
-   back to the journal. Only in a frozen build running from `{app}\current`. The Setup
-   pattern allows `_` after the version (L2's `..._TESTFAIL_<x>` builds). `[TEST: test_updater_v2_startup_journal.py, test_updater_v2_files_and_wrapper.py::test_restore_helper_runs_for_real_and_puts_previous_back]`
+   claim whose `<pid>` runs `powershell.exe` / `pwsh.exe` and that was made since the last
+   Windows boot means a restore is in progress: the app exits without starting from
+   `current` (the restorer restarts it). Any other claim (pid gone, pid reused by another
+   program, claim older than the boot) is renamed back to the journal. The journal itself is
+   stale when no Setup image runs AND (`at` older than 10 min, or before the last boot, or
+   no live process — any image name — has its `setupPid`). Only in a frozen build running from `{app}\current`. Each component looks only
+   for ITS OWN Setup (`monclub_access_...` / `monclub_tv_...`), so an Access restore never
+   waits for or stops a TV Setup; the pattern allows `_` after the version (L2's
+   `..._TESTFAIL_<x>` builds). `[TEST: test_updater_v2_files_and_wrapper.py::test_a_claim_is_live_only_for_a_powershell_pid_claimed_since_the_last_boot, ::test_each_component_waits_only_for_its_own_setup, ::test_a_live_setup_pid_with_any_image_name_protects_a_fresh_journal]` `[TEST: test_updater_v2_startup_journal.py, test_updater_v2_files_and_wrapper.py::test_restore_helper_runs_for_real_and_puts_previous_back]`
 2. `MainApp.__init__` (Access), right after `_init_scheduler()` and before any engine is
    built, the date flip, the hold load or the first `_sync_tick`; `TvApp.__init__` before the
    shell is scheduled: `startup_gate` consumes `last_update.json`, then — frozen builds run
@@ -5713,7 +5718,10 @@ by the watchdog's scheduled task (L4 E2E).
   (`health_timeout`, `backup_failed`, `interrupted`, `setup_exit_<n>`, an attempt that left
   no result at all) is a strike, two strikes ban. A struck version is retried
   automatically only after the next Windows boot (or 24 h later on a PC never switched
-  off) — not when Setup relaunches the old version seconds after the failure.
+  off) — not when Setup relaunches the old version seconds after the failure. "Boot" is
+  `GetTickCount64`: `[UNVERIFIED]` whether a nightly shutdown with Windows Fast Startup
+  (hibernated kernel, on by default) resets it; if it does not, gym PCs get the retry
+  through the 24 h path only — later, never sooner.
   `same_version` is no strike. "Restart to update" still works on a banned version; the
   page warns.
 - **Direction of `last_update.json`** (L2's `UpdWriteLastUpdate`, the restore helper, the

@@ -26,10 +26,12 @@ from shared.update_files import (
     live_restore_claims,
     previous_is_complete,
     read_json,
+    running_process_names,
     setup_is_running,
+    target_for_exe,
     utc_now_iso,
 )
-from shared.update_wrapper import HelperLaunchError, build_restore_script, launch_hidden_powershell
+from shared.update_wrapper import HelperLaunchError, build_restore_script, launch_hidden_powershell, setup_image_ps_re
 
 TEST_OVERRIDE_ENV = "MONCLUB_UPDATER_JOURNAL_ROOT"
 
@@ -43,6 +45,18 @@ def _install_root_for(exe_name: str) -> Optional[Path]:
     if exe.name.lower() != exe_name.lower() or exe.parent.name.lower() != "current":
         return None
     return exe.parent.parent
+
+
+def _pid_alive(pid: object) -> Optional[bool]:
+    """Whether any process has this pid (any image name); None when unknown."""
+    try:
+        wanted = int(str(pid).strip())
+    except (TypeError, ValueError):
+        return None
+    if wanted <= 0:
+        return None
+    procs = running_process_names()
+    return None if procs is None else wanted in procs
 
 
 def _note(paths: UpdatePaths, message: str) -> None:
@@ -59,7 +73,8 @@ def check_install_journal(
     exe_name: str,
     install_root: Optional[Path] = None,
     launcher: Callable[..., int] = launch_hidden_powershell,
-    setup_running: Callable[..., bool] = setup_is_running,
+    setup_running: Optional[Callable[..., bool]] = None,
+    pid_alive: Optional[Callable[[object], Optional[bool]]] = None,
     now: Optional[float] = None,
     boot_epoch: Optional[float] = None,
 ) -> bool:
@@ -68,6 +83,8 @@ def check_install_journal(
     if root is None:
         return False
     paths = UpdatePaths(Path(root))
+    target = target_for_exe(exe_name)
+    check_setup = setup_running or (lambda setup_pid=None: setup_is_running(setup_pid=setup_pid, target=target))
     live = live_restore_claims(paths)
     if live:
         # Another restorer (watchdog, wrapper, an earlier start) is rewriting current right
@@ -81,8 +98,9 @@ def check_install_journal(
         journal,
         now=time.time() if now is None else now,
         boot_epoch=last_boot_epoch() if boot_epoch is None else boot_epoch,
-        setup_running=setup_running(setup_pid=journal.get("setupPid")),
+        setup_running=check_setup(setup_pid=journal.get("setupPid")),
         previous_complete=previous_is_complete(paths, exe_name),
+        setup_pid_alive=(pid_alive or _pid_alive)(journal.get("setupPid")),
     )
     if decision == "wait":
         _note(paths, f"install journal present, Setup still working ({journal}); starting normally")
@@ -99,6 +117,7 @@ def check_install_journal(
         return False
     # restore: the helper claims the journal and re-checks the phase and previous\.
     script = build_restore_script(
+        setup_image_re=setup_image_ps_re(target),
         app_pid=os.getpid(),
         install_root=paths.install_root,
         exe_name=exe_name,

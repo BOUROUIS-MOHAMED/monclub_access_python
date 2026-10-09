@@ -33,6 +33,24 @@ JOURNAL_STALE_SEC = 10 * 60
 # (monclub_access_<ver>_TESTFAIL_<x>.exe), which must also count as a running Setup.
 SETUP_IMAGE_RE = re.compile(r"^monclub_(access|tv)_[0-9][0-9A-Za-z._\-]*\.(exe|tmp)\Z", re.IGNORECASE)
 CLAIM_GLOB = "install_journal.restoring-*.json"
+# Every restorer (the app's restore helper, the install wrapper, L2's watchdog / helper) is
+# PowerShell: a claim pid running anything else is a reused pid, not a restorer.
+_RESTORER_IMAGES = {"powershell.exe", "pwsh.exe"}
+
+
+def setup_image_re(target: Optional[str] = None) -> "re.Pattern[str]":
+    """The Setup image-name rule, for one product only when ``target`` is given.
+
+    A component checks only ITS OWN Setup: an Access restore must not wait for, or stop, a
+    TV Setup that runs in the same morning boot (different install roots)."""
+    if not target:
+        return SETUP_IMAGE_RE
+    return re.compile(rf"^monclub_{re.escape(target.lower())}_[0-9][0-9A-Za-z._\-]*\.(exe|tmp)\Z", re.IGNORECASE)
+
+
+def target_for_exe(exe_name: str) -> Optional[str]:
+    name = (exe_name or "").lower()
+    return {"monclubaccess.exe": "access", "monclubtv.exe": "tv"}.get(name)
 
 
 @dataclass(frozen=True)
@@ -179,20 +197,23 @@ def running_process_names() -> Optional[Dict[int, str]]:
         return None
 
 
-def setup_is_running(processes: Optional[Dict[int, str]] = None, *, setup_pid: Any = None) -> bool:
+def setup_is_running(
+    processes: Optional[Dict[int, str]] = None, *, setup_pid: Any = None, target: Optional[str] = None
+) -> bool:
     """True when a MonClub Setup process is running, or when the list cannot be read
     (unknown counts as running: never restore under a live Setup)."""
     procs = running_process_names() if processes is None else processes
     if procs is None:
         return True
-    if any(SETUP_IMAGE_RE.match(name or "") for name in procs.values()):
+    rule = setup_image_re(target)
+    if any(rule.match(name or "") for name in procs.values()):
         return True
     try:
         pid = int(setup_pid)
     except (TypeError, ValueError):
         return False
     name = procs.get(pid)
-    return bool(name) and SETUP_IMAGE_RE.match(name) is not None
+    return bool(name) and rule.match(name) is not None
 
 
 def last_boot_epoch() -> Optional[float]:
@@ -222,6 +243,7 @@ def journal_decision(
     boot_epoch: Optional[float],
     setup_running: bool,
     previous_complete: bool,
+    setup_pid_alive: Optional[bool] = None,
 ) -> str:
     """What the start-up check does with ``install_journal.json``.
 
@@ -229,8 +251,10 @@ def journal_decision(
     ``"delete"`` stale and ``current\\`` is intact (or nothing to restore from);
     ``"restore"`` stale and ``previous\\`` must be copied back.
 
-    Stale = no Setup process is running and (``setupPid`` is set -- that Setup is gone --
-    or ``at`` is older than 10 min or earlier than the last Windows boot). Phases (L2, 2026-10-09): ``backing_up``
+    Stale (design 8.0, binding L2/L3 text) = no Setup image is running AND (``at`` unknown,
+    older than 10 min or earlier than the last Windows boot, OR no live process has the pid
+    ``setupPid`` -- any image name, so a killed Setup goes stale at once).
+    ``setup_pid_alive``: None = not known (only the time rules apply). Phases: ``backing_up``
     (current still intact) -> delete; ``copying`` / ``verifying`` / ``restoring`` ->
     restore; anything else -> restore only when previous\\ is complete.
     """
@@ -239,13 +263,12 @@ def journal_decision(
     if setup_running:
         return "wait"
     at = parse_utc_iso(journal.get("at"))
-    # setupPid present while no Setup runs: that Setup is gone (design 8.0 "stale").
-    setup_pid_gone = str(journal.get("setupPid") or "").strip() not in ("", "0")
+    has_setup_pid = str(journal.get("setupPid") or "").strip() not in ("", "0")
     stale = (
-        setup_pid_gone
-        or at is None
+        at is None
         or (now - at) >= JOURNAL_STALE_SEC
         or (boot_epoch is not None and at < boot_epoch)
+        or (has_setup_pid and setup_pid_alive is False)
     )
     if not stale:
         return "wait"
@@ -262,13 +285,21 @@ def consume_marker(data: Dict[str, Any]) -> str:
     return json.dumps(data, sort_keys=True, ensure_ascii=True)
 
 
-def live_restore_claims(paths: UpdatePaths, processes: Optional[Dict[int, str]] = None) -> list[Path]:
+def live_restore_claims(
+    paths: UpdatePaths,
+    processes: Optional[Dict[int, str]] = None,
+    *,
+    boot_epoch: Optional[float] = None,
+) -> list[Path]:
     """Claimed journals (``install_journal.restoring-<pid>.json``) whose restorer still runs.
 
-    While one exists, ``current`` is being rewritten: nothing may start from it. A claim whose
-    pid is gone is a restorer that died -- it is handed back as a journal (renamed back)."""
+    While one exists, ``current`` is being rewritten: nothing may start from it. A claim is
+    live only when its pid runs PowerShell AND the claim was made since the last Windows boot
+    (a reboot kills every restorer, and pids are reused after it). Any other claim is a
+    restorer that died -- it is handed back as a journal (renamed back)."""
     live: list[Path] = []
     procs = running_process_names() if processes is None else processes
+    boot = last_boot_epoch() if boot_epoch is None else boot_epoch
     for claim in sorted(paths.state_dir.glob(CLAIM_GLOB)) if paths.state_dir.is_dir() else []:
         m = re.match(r"^install_journal\.restoring-(\d+)\.json\Z", claim.name)
         pid = int(m.group(1)) if m else -1
@@ -282,9 +313,14 @@ def live_restore_claims(paths: UpdatePaths, processes: Optional[Dict[int, str]] 
             if fresh:
                 live.append(claim)
                 continue
-        elif pid in procs:
-            live.append(claim)
-            continue
+        elif (procs.get(pid) or "").lower() in _RESTORER_IMAGES:
+            try:
+                since_boot = boot is None or claim.stat().st_mtime >= boot - 5
+            except OSError:
+                since_boot = False
+            if since_boot:
+                live.append(claim)
+                continue
         try:
             if not paths.journal.exists():
                 os.replace(claim, paths.journal)
@@ -295,8 +331,9 @@ def live_restore_claims(paths: UpdatePaths, processes: Optional[Dict[int, str]] 
     return live
 
 
-def find_setup_names(names: Iterable[str]) -> list[str]:
-    return [n for n in names if SETUP_IMAGE_RE.match(n or "")]
+def find_setup_names(names: Iterable[str], target: Optional[str] = None) -> list[str]:
+    rule = setup_image_re(target)
+    return [n for n in names if rule.match(n or "")]
 
 
 __all__ = [
@@ -312,7 +349,9 @@ __all__ = [
     "previous_is_complete",
     "read_json",
     "running_process_names",
+    "setup_image_re",
     "setup_is_running",
+    "target_for_exe",
     "utc_now_iso",
     "write_boot_ok",
     "write_json_atomic",

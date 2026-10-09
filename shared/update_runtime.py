@@ -57,6 +57,7 @@ from shared.update_wrapper import (
     HelperLaunchError,
     build_install_script,
     launch_hidden_powershell,
+    setup_image_ps_re,
     setup_log_path,
 )
 
@@ -260,7 +261,7 @@ class ComponentUpdateManager:
         keys_provider: Callable[[], Mapping[str, str]] = trusted_keys,
         auto_install_allowed: Optional[bool] = None,
         launcher: Callable[..., int] = launch_hidden_powershell,
-        setup_running: Callable[[], bool] = setup_is_running,
+        setup_running: Optional[Callable[[], bool]] = None,
         clock: Callable[[], float] = time.time,
         boot_epoch: Callable[[], Optional[float]] = last_boot_epoch,
     ) -> None:
@@ -280,7 +281,8 @@ class ComponentUpdateManager:
             auto_install_allowed = is_frozen() and runtime_base_dir().name.lower() == "current"
         self._auto_install_allowed = bool(auto_install_allowed)
         self._launcher = launcher
-        self._setup_running = setup_running
+        # Only this component's own Setup counts (an Access install ignores a TV Setup).
+        self._setup_running = setup_running or (lambda: setup_is_running(target=component.component_id))
         self._clock = clock
         self._boot_epoch = boot_epoch
 
@@ -1194,6 +1196,7 @@ class ComponentUpdateManager:
             now = self._clock()
             setup_log = setup_log_path(self.install_root, verified.version, now=now)
             script = build_install_script(
+                setup_image_re=setup_image_ps_re(self.target),
                 app_pid=os.getpid(),
                 installer=installer,
                 install_root=self.install_root,

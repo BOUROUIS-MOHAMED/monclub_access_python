@@ -33,6 +33,14 @@ SETUP_WAIT_MS = 30 * 60 * 1000
 SETUP_IMAGE_PS_RE = r"^monclub_(access|tv)_[0-9][0-9A-Za-z._\-]*\.(exe|tmp)$"
 
 
+def setup_image_ps_re(target: Optional[str]) -> str:
+    """SETUP_IMAGE_PS_RE for one product (an Access wrapper never waits for / stops TV's Setup)."""
+    if not target:
+        return SETUP_IMAGE_PS_RE
+    safe = "".join(ch for ch in str(target).lower() if ch.isalnum())
+    return rf"^monclub_{safe}_[0-9][0-9A-Za-z._\-]*\.(exe|tmp)$"
+
+
 def _ps(value: object) -> str:
     """A PowerShell single-quoted literal."""
     return "'" + str(value).replace("'", "''") + "'"
@@ -299,5 +307,6 @@ __all__: Sequence[str] = [
     "launch_hidden_powershell",
     "powershell_command",
     "powershell_exe",
+    "setup_image_ps_re",
     "setup_log_path",
 ]

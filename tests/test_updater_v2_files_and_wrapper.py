@@ -54,7 +54,24 @@ def test_a_journal_older_than_ten_minutes_restores():
 
 def test_a_fresh_journal_whose_setup_pid_is_gone_restores_at_once():
     j = _j(age_sec=30, setup_pid=4242)
-    assert uf.journal_decision(j, now=NOW, boot_epoch=None, setup_running=False, previous_complete=True) == "restore"
+    assert uf.journal_decision(j, now=NOW, boot_epoch=None, setup_running=False, previous_complete=True,
+                               setup_pid_alive=False) == "restore"
+
+
+def test_a_live_setup_pid_with_any_image_name_protects_a_fresh_journal():
+    """L2: a technician's RENAMED installer (setup.exe) is not matched by the image rule;
+    its live pid still protects the journal (within the 10-min / same-boot window)."""
+    j = _j(age_sec=60, setup_pid=4242)
+    assert uf.journal_decision(j, now=NOW, boot_epoch=NOW - 7200, setup_running=False, previous_complete=True,
+                               setup_pid_alive=True) == "wait"
+    assert uf.journal_decision(j, now=NOW, boot_epoch=NOW - 7200, setup_running=False, previous_complete=True,
+                               setup_pid_alive=None) == "wait"
+
+
+def test_a_journal_from_before_the_last_boot_is_stale_even_if_its_pid_was_reused():
+    j = _j(age_sec=120, setup_pid=4242)
+    assert uf.journal_decision(j, now=NOW, boot_epoch=NOW - 60, setup_running=False, previous_complete=True,
+                               setup_pid_alive=True) == "restore"
 
 
 def test_a_journal_from_before_the_last_boot_restores_at_once():
@@ -93,6 +110,35 @@ def test_a_live_restore_claim_is_reported_and_a_dead_one_is_handed_back(tmp_path
     assert [p.name for p in uf.live_restore_claims(paths, {111: "powershell.exe"})] == ["install_journal.restoring-111.json"]
     assert uf.live_restore_claims(paths, {222: "powershell.exe"}) == []
     assert paths.journal.exists() and not (paths.state_dir / "install_journal.restoring-111.json").exists()
+
+
+def test_a_claim_is_live_only_for_a_powershell_pid_claimed_since_the_last_boot(tmp_path):
+    paths = uf.UpdatePaths(tmp_path)
+    paths.state_dir.mkdir()
+    claim = paths.state_dir / "install_journal.restoring-111.json"
+    claim.write_text("{}", encoding="ascii")
+    now = time.time()
+    # a reused pid: not PowerShell
+    assert uf.live_restore_claims(paths, {111: "svchost.exe"}, boot_epoch=now - 60) == []
+    assert paths.journal.exists()
+    os.replace(paths.journal, claim)
+    # PowerShell, but the claim predates the last boot: its restorer died in the reboot
+    os.utime(claim, (now - 7200, now - 7200))
+    assert uf.live_restore_claims(paths, {111: "powershell.exe"}, boot_epoch=now - 3600) == []
+    assert paths.journal.exists()
+    os.replace(paths.journal, claim)
+    os.utime(claim, (now, now))
+    assert uf.live_restore_claims(paths, {111: "pwsh.exe"}, boot_epoch=now - 3600) == [claim]
+
+
+def test_each_component_waits_only_for_its_own_setup():
+    """Advisor: an Access restore must not back off for (or stop) a TV Setup."""
+    tv_setup = {9: "monclub_tv_1.5.1.tmp"}
+    assert uf.setup_is_running(tv_setup, target="access") is False
+    assert uf.setup_is_running(tv_setup, target="tv") is True
+    assert uf.setup_is_running(tv_setup) is True
+    assert uw.setup_image_ps_re("access") == r"^monclub_access_[0-9][0-9A-Za-z._\-]*\.(exe|tmp)$"
+    assert uf.target_for_exe("MonClubTV.exe") == "tv" and uf.target_for_exe("MonClubAccess.exe") == "access"
 
 
 def test_an_unreadable_process_list_counts_as_setup_running(monkeypatch):
