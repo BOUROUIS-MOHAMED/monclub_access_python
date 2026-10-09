@@ -1,0 +1,111 @@
+"""Start-up journal check (design 7 "Journal check at start-up", 8.0).
+
+STANDARD LIBRARY ONLY: called from access/main.py and tv/main.py right after the
+single-instance guard, before the app (and its database migrations) load -- after a power
+cut ``current\\`` may be half-copied.
+
+A stale ``{app}\\state\\install_journal.json`` means Setup died mid-install. The app cannot
+overwrite its own locked files, so it starts the hidden restore helper
+(shared/update_wrapper.py) and exits; the helper waits for this process, puts
+``previous\\`` back, writes ``ROLLED_BACK`` reason ``interrupted`` and restarts the app,
+which then reports it.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Callable, Optional
+
+from shared.update_files import (
+    UpdatePaths,
+    journal_decision,
+    last_boot_epoch,
+    previous_is_complete,
+    read_json,
+    setup_is_running,
+    utc_now_iso,
+)
+from shared.update_wrapper import HelperLaunchError, build_restore_script, launch_hidden_powershell
+
+TEST_OVERRIDE_ENV = "MONCLUB_UPDATER_JOURNAL_ROOT"
+
+
+def _install_root_for(exe_name: str) -> Optional[Path]:
+    """``{app}`` when this process is the installed exe in ``{app}\\current``, else None."""
+    override = os.environ.get(TEST_OVERRIDE_ENV)
+    if override:
+        return Path(override)
+    if not getattr(sys, "frozen", False):
+        return None
+    exe = Path(sys.executable)
+    if exe.name.lower() != exe_name.lower() or exe.parent.name.lower() != "current":
+        return None
+    return exe.parent.parent
+
+
+def _note(paths: UpdatePaths, message: str) -> None:
+    try:
+        paths.logs_dir.mkdir(parents=True, exist_ok=True)
+        with (paths.logs_dir / "update-startup.log").open("a", encoding="utf-8") as f:
+            f.write(f"{utc_now_iso()} pid={os.getpid()} {message}\n")
+    except OSError:
+        pass
+
+
+def check_install_journal(
+    *,
+    exe_name: str,
+    install_root: Optional[Path] = None,
+    launcher: Callable[..., int] = launch_hidden_powershell,
+    setup_running: Callable[..., bool] = setup_is_running,
+    now: Optional[float] = None,
+    boot_epoch: Optional[float] = None,
+) -> bool:
+    """True = a restore helper is running and this process must exit now."""
+    root = install_root if install_root is not None else _install_root_for(exe_name)
+    if root is None:
+        return False
+    paths = UpdatePaths(Path(root))
+    if not paths.journal.exists():
+        return False
+    journal = read_json(paths.journal) or {}  # unreadable: phase unknown, "at" unknown = stale
+    decision = journal_decision(
+        journal,
+        now=time.time() if now is None else now,
+        boot_epoch=last_boot_epoch() if boot_epoch is None else boot_epoch,
+        setup_running=setup_running(setup_pid=journal.get("setupPid")),
+        previous_complete=previous_is_complete(paths, exe_name),
+    )
+    if decision == "wait":
+        _note(paths, f"install journal present, Setup still working ({journal}); starting normally")
+        return False
+    if decision == "delete":
+        # current is intact (backing_up) or there is nothing to restore from: claim + delete.
+        claim = paths.state_dir / f"install_journal.restoring-{os.getpid()}.json"
+        try:
+            os.replace(paths.journal, claim)
+            claim.unlink()
+            _note(paths, f"stale install journal deleted without restore ({journal})")
+        except OSError as exc:
+            _note(paths, f"stale journal not deleted ({exc}); another restorer owns it")
+        return False
+    # restore: the helper claims the journal and re-checks the phase and previous\.
+    script = build_restore_script(
+        app_pid=os.getpid(),
+        install_root=paths.install_root,
+        exe_name=exe_name,
+        restore_log=paths.logs_dir / "update-restore.log",
+    )
+    try:
+        pid = launcher(script, cwd=paths.state_dir)
+    except HelperLaunchError as exc:
+        _note(paths, f"RESTORE HELPER DID NOT START ({exc}); starting the app as it is")
+        return False
+    _note(paths, f"interrupted install ({journal}): restore helper pid={pid} started; exiting")
+    return True
+
+
+__all__ = ["TEST_OVERRIDE_ENV", "check_install_journal"]
