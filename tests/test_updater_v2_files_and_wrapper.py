@@ -29,8 +29,11 @@ WHOAMI = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "whoam
 NOW = 1_800_000_000.0
 
 
-def _j(phase="copying", age_sec=11 * 60):
-    return {"phase": phase, "from": "1.5.0", "to": "1.5.1", "at": uf.utc_now_iso(NOW - age_sec), "setupPid": 4242}
+def _j(phase="copying", age_sec=11 * 60, setup_pid=None):
+    j = {"phase": phase, "from": "1.5.0", "to": "1.5.1", "at": uf.utc_now_iso(NOW - age_sec)}
+    if setup_pid is not None:
+        j["setupPid"] = setup_pid
+    return j
 
 
 def test_no_journal_means_nothing_to_do():
@@ -47,6 +50,11 @@ def test_a_fresh_journal_waits_for_setup():
 
 def test_a_journal_older_than_ten_minutes_restores():
     assert uf.journal_decision(_j(), now=NOW, boot_epoch=None, setup_running=False, previous_complete=True) == "restore"
+
+
+def test_a_fresh_journal_whose_setup_pid_is_gone_restores_at_once():
+    j = _j(age_sec=30, setup_pid=4242)
+    assert uf.journal_decision(j, now=NOW, boot_epoch=None, setup_running=False, previous_complete=True) == "restore"
 
 
 def test_a_journal_from_before_the_last_boot_restores_at_once():
@@ -246,15 +254,60 @@ def test_restore_helper_runs_for_real_and_puts_previous_back(tmp_path):
     (root / "previous" / "version.json").write_text('{"version":"1.5.0"}', encoding="ascii")
     (root / "previous" / "sub" / "y.txt").write_text("old", encoding="ascii")
     (root / "state").mkdir()
-    (root / "state" / "install_journal.json").write_text('{"phase":"copying"}', encoding="ascii")
+    (root / "state" / "install_journal.json").write_text(
+        '{"phase":"copying","from":"1.5.0","to":"1.5.1","at":"2026-10-10T08:00:00Z","setupPid":1}', encoding="ascii")
     script = uw.build_restore_script(
-        app_pid=_dead_pid(), install_root=root, exe_name="FakeApp.exe",
-        journal_from="1.5.0", journal_to="1.5.1", restore_log=root / "logs" / "restore.log",
+        app_pid=_dead_pid(), install_root=root, exe_name="FakeApp.exe", restore_log=root / "logs" / "restore.log",
     )
     _run(script, root / "state")
     names = sorted(str(p.relative_to(root / "current")) for p in (root / "current").rglob("*"))
     assert names == ["FakeApp.exe", "sub", os.path.join("sub", "y.txt"), "version.json"]
-    assert not (root / "state" / "install_journal.json").exists()
-    result = json.loads((root / "state" / "last_update.json").read_text(encoding="ascii"))
+    assert sorted(p.name for p in (root / "state").iterdir()) == ["last_update.json"]  # claim deleted too
+    result = json.loads((root / "state" / "last_update.json").read_text(encoding="utf-8"))
     assert (result["result"], result["reason"], result["from"], result["to"]) == ("ROLLED_BACK", "interrupted", "1.5.1", "1.5.0")
     assert "relaunched" in (root / "logs" / "restore.log").read_text(encoding="utf-8", errors="replace")
+
+
+@pytest.mark.skipif(not WINDOWS or not WHOAMI.exists(), reason="needs Windows PowerShell")
+def test_restore_helper_only_deletes_a_backing_up_journal(tmp_path):
+    root = tmp_path / "root"
+    (root / "current").mkdir(parents=True)
+    (root / "current" / "intact.txt").write_text("current", encoding="ascii")
+    (root / "previous").mkdir()
+    (root / "state").mkdir()
+    (root / "state" / "install_journal.json").write_text('{"phase":"backing_up","from":"1.5.0","to":"1.5.1"}', encoding="ascii")
+    script = uw.build_restore_script(app_pid=_dead_pid(), install_root=root, exe_name="Missing.exe",
+                                     restore_log=root / "logs" / "r.log")
+    _run(script, root / "state")
+    assert (root / "current" / "intact.txt").read_text(encoding="ascii") == "current"
+    assert list((root / "state").iterdir()) == []
+    assert "backing_up" in (root / "logs" / "r.log").read_text(encoding="utf-8", errors="replace")
+
+
+@pytest.mark.skipif(not WINDOWS or not WHOAMI.exists(), reason="needs Windows PowerShell")
+def test_install_wrapper_restores_a_journal_setup_left_behind_before_relaunching(tmp_path):
+    root = tmp_path / "root"
+    (root / "current").mkdir(parents=True)
+    (root / "current" / "half.dll").write_text("half", encoding="ascii")
+    (root / "previous").mkdir()
+    shutil.copy(WHOAMI, root / "previous" / "FakeApp.exe")
+    (root / "previous" / "version.json").write_text('{"version":"1.5.0"}', encoding="ascii")
+    (root / "state").mkdir()
+    fake_setup = root / "monclub_access_1.5.1.cmd"
+    # A "Setup" killed mid-copy: journal left, no result, non-zero exit.
+    fake_setup.write_text(
+        '@echo {"phase":"copying","from":"1.5.0","to":"1.5.1","at":"2026-10-10T08:00:00Z"}> "%~dp0state\\install_journal.json"\r\n'
+        '@exit /b 5\r\n',
+        encoding="ascii",
+    )
+    script = uw.build_install_script(
+        app_pid=_dead_pid(), installer=fake_setup, install_root=root, exe_name="FakeApp.exe",
+        from_version="1.5.0", to_version="1.5.1",
+        setup_log=root / "logs" / "s.log", wrapper_log=root / "logs" / "w.log",
+    )
+    _run(script, root / "state")
+    assert sorted(p.name for p in (root / "current").iterdir()) == ["FakeApp.exe", "version.json"]
+    result = json.loads((root / "state" / "last_update.json").read_text(encoding="utf-8"))
+    assert (result["result"], result["reason"]) == ("ROLLED_BACK", "interrupted")
+    log = (root / "logs" / "w.log").read_text(encoding="utf-8", errors="replace")
+    assert "journal after Setup: restored" in log and "relaunched" in log

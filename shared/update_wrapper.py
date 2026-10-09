@@ -103,7 +103,7 @@ def build_install_script(
         '{"result":"ABORTED","from":' + _json_str(from_version) + ',"to":' + _json_str(to_version)
         + ',"log":' + _json_str(setup_log) + ',"reason":"setup_exit_'
     )
-    lines = _prelude(wrapper_log) + [
+    lines = _prelude(wrapper_log) + _restore_function(install_root, exe_name) + [
         f"W ('wrapper start: app pid {int(app_pid)}, installer ' + {_ps(installer)})",
     ] + _wait_for_pid(app_pid) + [
         "$started = (Get-Date).ToUniversalTime()",
@@ -126,50 +126,80 @@ def build_install_script(
         "    try { [IO.File]::WriteAllText($lu, $j); W 'wrote ABORTED result' } catch { W ('could not write result: ' + $_) }",
         "  }",
         "}",
+        # Setup killed or crashed mid-copy leaves its journal: never start a half-written
+        # current (design 8.0 claim rule).
+        "$outcome = Restore-Journal",
+        "if ($outcome -ne 'none') { W ('journal after Setup: ' + $outcome) }",
+        "if ($outcome -eq 'backoff') { W 'another restorer starts the app'; W 'wrapper end'; exit 0 }",
     ] + _relaunch_if_not_running(current_dir, exe_name) + ["W 'wrapper end'"]
     return "\n".join(lines)
 
 
-def build_restore_script(
-    *,
-    app_pid: int,
-    install_root: Path,
-    exe_name: str,
-    journal_from: str,
-    journal_to: str,
-    restore_log: Path,
-) -> str:
-    """Copy ``previous\\*`` back over ``current\\`` after an interrupted install (design 8.0)."""
-    state_dir = install_root / "state"
-    current_dir = install_root / "current"
-    previous_dir = install_root / "previous"
-    journal = state_dir / "install_journal.json"
-    last_update = state_dir / "last_update.json"
-    # The journal's "to" is the version that was being installed (now abandoned).
-    result_head = (
-        '{"result":"ROLLED_BACK","from":' + _json_str(journal_to) + ',"to":' + _json_str(journal_from)
-        + ',"reason":"interrupted","log":' + _json_str(restore_log) + ',"at":"'
-    )
-    lines = _prelude(restore_log) + [
-        f"W ('restore start: app pid {int(app_pid)}')",
-    ] + _wait_for_pid(app_pid) + [
-        f"$cur = {_ps(current_dir)}",
-        f"$prev = {_ps(previous_dir)}",
-        "$ok = $false",
-        "for ($i = 0; $i -lt 15 -and -not $ok; $i++) {",
-        "  try {",
-        "    if (-not (Test-Path -LiteralPath $cur)) { New-Item -ItemType Directory -Path $cur -Force | Out-Null }",
-        "    Get-ChildItem -LiteralPath $cur -Force | Remove-Item -Recurse -Force -ErrorAction Stop",
-        "    Get-ChildItem -LiteralPath $prev -Force | Copy-Item -Destination $cur -Recurse -Force -ErrorAction Stop",
-        "    $ok = $true",
-        "  } catch { W ('restore attempt ' + $i + ' failed: ' + $_); Start-Sleep -Seconds 1 }",
-        "}",
-        "if ($ok) {",
-        f"  try {{ [IO.File]::WriteAllText({_ps(last_update)}, ({_ps(result_head)} + (NowZ) + '\"}}')) }} catch {{ W ('could not write result: ' + $_) }}",
-        f"  Remove-Item -LiteralPath {_ps(journal)} -Force -ErrorAction SilentlyContinue",
+def _restore_function(install_root: Path, exe_name: str) -> List[str]:
+    """PowerShell ``Restore-Journal`` -- the journal contract of design 8.0 (L2/L3 2026-10-09).
+
+    Claim first: rename to ``install_journal.restoring-<pid>.json``; a failed rename means
+    another restorer (watchdog, Setup, the app) owns it -> back off. ``backing_up`` ->
+    current is intact, delete. Otherwise, with a complete previous, copy it back, write
+    ``ROLLED_BACK interrupted`` BEFORE anything starts the app, delete the claim. A failed
+    restore puts the journal back for the next restorer. Returns
+    ``restored`` / ``deleted`` / ``backoff`` / ``failed`` / ``none``."""
+    return [
+        "function Restore-Journal {",
+        f"  $state = {_ps(install_root / 'state')}",
+        f"  $cur = {_ps(install_root / 'current')}",
+        f"  $prev = {_ps(install_root / 'previous')}",
+        "  $journal = Join-Path $state 'install_journal.json'",
+        "  if (-not (Test-Path -LiteralPath $journal)) { return 'none' }",
+        "  $claimName = 'install_journal.restoring-' + $PID + '.json'",
+        "  $claim = Join-Path $state $claimName",
+        "  try { Rename-Item -LiteralPath $journal -NewName $claimName -ErrorAction Stop }",
+        "  catch { W 'journal claimed by another restorer; backing off'; return 'backoff' }",
+        "  $j = $null",
+        "  try { $j = Get-Content -LiteralPath $claim -Raw | ConvertFrom-Json } catch { W ('journal unreadable: ' + $_) }",
+        "  $phase = ''; $jfrom = ''; $jto = ''",
+        "  if ($j) { $phase = [string]$j.phase; $jfrom = [string]$j.from; $jto = [string]$j.to }",
+        "  if ($phase -eq 'backing_up') { Remove-Item -LiteralPath $claim -Force -ErrorAction SilentlyContinue; "
+        "W 'journal phase backing_up: current is intact, journal deleted'; return 'deleted' }",
+        f"  $complete = (Test-Path -LiteralPath (Join-Path $prev {_ps(exe_name)})) -and "
+        "(Test-Path -LiteralPath (Join-Path $prev 'version.json'))",
+        "  if (-not $complete) { Remove-Item -LiteralPath $claim -Force -ErrorAction SilentlyContinue; "
+        "W 'no complete previous; journal deleted without restore'; return 'deleted' }",
+        "  W ('restoring previous into current (phase ' + $phase + ', ' + $jfrom + ' -> ' + $jto + ')')",
+        "  $ok = $false",
+        "  for ($i = 0; $i -lt 15 -and -not $ok; $i++) {",
+        "    try {",
+        "      if (-not (Test-Path -LiteralPath $cur)) { New-Item -ItemType Directory -Path $cur -Force | Out-Null }",
+        "      Get-ChildItem -LiteralPath $cur -Force | Remove-Item -Recurse -Force -ErrorAction Stop",
+        "      Get-ChildItem -LiteralPath $prev -Force | Copy-Item -Destination $cur -Recurse -Force -ErrorAction Stop",
+        "      $ok = $true",
+        "    } catch { W ('restore attempt ' + $i + ' failed: ' + $_); Start-Sleep -Seconds 1 }",
+        "  }",
+        "  if (-not $ok) {",
+        "    try { Rename-Item -LiteralPath $claim -NewName 'install_journal.json' -ErrorAction Stop } catch {}",
+        "    W 'RESTORE FAILED: journal kept for the next restorer'; return 'failed'",
+        "  }",
+        # The journal's "to" is the version that was being installed (now abandoned).
+        "  $r = [ordered]@{ result = 'ROLLED_BACK'; from = $jto; to = $jfrom; reason = 'interrupted'; log = $log; at = (NowZ) }",
+        "  try { [IO.File]::WriteAllText((Join-Path $state 'last_update.json'), ($r | ConvertTo-Json -Compress)) } "
+        "catch { W ('could not write result: ' + $_) }",
+        "  Remove-Item -LiteralPath $claim -Force -ErrorAction SilentlyContinue",
         "  W 'restored previous into current'",
-        "} else { W 'RESTORE FAILED: journal kept for the watchdog / next start' }",
-    ] + _relaunch_if_not_running(current_dir, exe_name) + ["W 'restore end'"]
+        "  return 'restored'",
+        "}",
+    ]
+
+
+def build_restore_script(*, app_pid: int, install_root: Path, exe_name: str, restore_log: Path) -> str:
+    """The start-up journal check's external half: the running app cannot overwrite its
+    own locked files in current. Waits for the app to exit, restores, relaunches."""
+    lines = _prelude(restore_log) + _restore_function(install_root, exe_name) + [
+        f"W ('restore helper start: app pid {int(app_pid)}')",
+    ] + _wait_for_pid(app_pid) + [
+        "$outcome = Restore-Journal",
+        "W ('journal: ' + $outcome)",
+        "if ($outcome -eq 'backoff') { W 'another restorer starts the app'; W 'restore end'; exit 0 }",
+    ] + _relaunch_if_not_running(install_root / "current", exe_name) + ["W 'restore end'"]
     return "\n".join(lines)
 
 

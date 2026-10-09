@@ -226,8 +226,8 @@ def journal_decision(
     ``"delete"`` stale and ``current\\`` is intact (or nothing to restore from);
     ``"restore"`` stale and ``previous\\`` must be copied back.
 
-    Stale = ``at`` older than 10 min, or earlier than the last Windows boot (a reboot kills
-    Setup), and no Setup process is running. Phases (L2, 2026-10-09): ``backing_up``
+    Stale = no Setup process is running and (``setupPid`` is set -- that Setup is gone --
+    or ``at`` is older than 10 min or earlier than the last Windows boot). Phases (L2, 2026-10-09): ``backing_up``
     (current still intact) -> delete; ``copying`` / ``verifying`` / ``restoring`` ->
     restore; anything else -> restore only when previous\\ is complete.
     """
@@ -236,7 +236,14 @@ def journal_decision(
     if setup_running:
         return "wait"
     at = parse_utc_iso(journal.get("at"))
-    stale = at is None or (now - at) >= JOURNAL_STALE_SEC or (boot_epoch is not None and at < boot_epoch)
+    # setupPid present while no Setup runs: that Setup is gone (design 8.0 "stale").
+    setup_pid_gone = str(journal.get("setupPid") or "").strip() not in ("", "0")
+    stale = (
+        setup_pid_gone
+        or at is None
+        or (now - at) >= JOURNAL_STALE_SEC
+        or (boot_epoch is not None and at < boot_epoch)
+    )
     if not stale:
         return "wait"
     phase = str(journal.get("phase") or "").strip().lower()

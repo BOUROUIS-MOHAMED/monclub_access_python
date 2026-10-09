@@ -69,7 +69,7 @@ RESULT_RESCAN_WINDOW_SEC = 10 * 60
 OUTBOX_MAX = 50
 # Results after which a version is never auto-installed again (design 7 loop guard).
 # Anything else (health_timeout, interrupted, no result, Setup exit) gets one retry.
-_BAN_REASONS = {"crash", "after_copy_failed", "setup_failed", "copy_failed", "post_install_failed"}
+_BAN_REASONS = {"crash", "after_copy_failed", "setup_failed", "copy_failed", "post_install_failed", "restore_failed"}
 TELEMETRY_RESULTS = {"PENDING", "INSTALLED", "ROLLED_BACK", "ABORTED", "VERIFY_FAILED", "DOWNLOAD_FAILED"}
 # Delays before retrying a FAILED update check: 60 s, 5 min, then 15 min until one succeeds.
 _CHECK_RETRY_DELAYS_SEC = (60, 5 * 60, 15 * 60)
