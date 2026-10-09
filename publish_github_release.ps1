@@ -62,6 +62,9 @@ $commit = [string]$release.buildCommit
 if ($commit -notmatch '^[0-9a-f]{40}$') { throw "Release file has no full build commit: '$commit'." }
 git cat-file -e "$commit^{commit}" 2>$null
 if ($LASTEXITCODE -ne 0) { throw "Build commit $commit is not in this repository." }
+# gh ignores --target when the tag already exists, and GitHub can only tag a pushed commit.
+$remoteBranches = @(git branch -r --contains $commit 2>$null | Where-Object { $_.Trim() })
+if ($remoteBranches.Count -eq 0) { throw "Build commit $commit is not on any remote branch: push it first." }
 
 $tag = [string]$release.githubTag   # tools/release_sign.py release_tag(): the one tag format
 $expectedUrl = "https://github.com/$Repo/releases/download/$tag/$($manifest.installerName)"
@@ -81,6 +84,11 @@ if ($Channel -eq "beta") {
 } else {
   $extraFlags += "--latest"
 }
+
+gh release view $tag -R $Repo 2>$null | Out-Null
+if ($LASTEXITCODE -eq 0) { throw "Release $tag already exists: gh would ignore --target. Not publishing over it." }
+git ls-remote --exit-code --tags origin "refs/tags/$tag" 2>$null | Out-Null
+if ($LASTEXITCODE -eq 0) { throw "Tag $tag already exists on origin: it may point at another commit. Not publishing." }
 
 Write-Host "Creating release: $tag" -ForegroundColor Cyan
 Write-Host "Target commit : $commit" -ForegroundColor Cyan

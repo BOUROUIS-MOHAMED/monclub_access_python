@@ -186,7 +186,9 @@ def test_a_key_file_that_does_not_match_the_trusted_public_key_is_refused(instal
 def test_publishable_release_refuses_test_key_skipped_tests_missing_commit_and_http(installer, seed, tmp_path):
     prod_seed = bytes(range(32))
     prod = {"monclub-2026-10": rs.public_key_hex(prod_seed)}
-    common = dict(installer=installer, target="access", channel="stable", version="1.5.0")
+    good_payload = {"publishable": True, "e2eTestKeys": False}
+    common = dict(installer=installer, target="access", channel="stable", version="1.5.0",
+                  publishable=True, payload_version=good_payload)
     with pytest.raises(rs.ReleaseSignError, match="test key"):
         rs.make_release_file(**common, key_id=rs.TEST_KEY_ID, seed=seed,
                              trusted_keys={rs.TEST_KEY_ID: rs.public_key_hex(seed)},
@@ -203,6 +205,22 @@ def test_publishable_release_refuses_test_key_skipped_tests_missing_commit_and_h
     ok = rs.make_release_file(**common, key_id="monclub-2026-10", seed=prod_seed, trusted_keys=prod,
                               build_commit="a" * 40)
     assert ok["publishable"] is True and ok["buildCommit"] == "a" * 40
+
+
+def test_publishable_is_never_a_default_and_a_test_payload_cannot_be_signed_as_publishable(installer):
+    """Review #6: a hand-run `sign` with the prod key used to write "publishable": true for any
+    installer -- including one whose payload was built with -E2ETestKeys (trusts only the test
+    key: shipped, those PCs could never verify another release)."""
+    prod_seed = bytes(range(32))
+    prod = {"monclub-2026-10": rs.public_key_hex(prod_seed)}
+    common = dict(installer=installer, target="access", channel="stable", version="1.5.0",
+                  key_id="monclub-2026-10", seed=prod_seed, trusted_keys=prod, build_commit="a" * 40)
+    assert rs.make_release_file(**common)["publishable"] is False
+    with pytest.raises(rs.ReleaseSignError, match="version.json"):
+        rs.make_release_file(**common, publishable=True)
+    for payload in ({"publishable": True, "e2eTestKeys": True}, {"publishable": False}, {}):
+        with pytest.raises(rs.ReleaseSignError, match="test / non-publishable"):
+            rs.make_release_file(**common, publishable=True, payload_version=payload)
 
 
 def test_test_build_may_point_at_a_local_http_server_but_not_a_remote_one(installer, seed):

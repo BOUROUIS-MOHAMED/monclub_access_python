@@ -963,6 +963,9 @@ class TestInstallerWatchdogTask:
         stage = tmp_path / "stage" / "MonClubAccess"
         stage.mkdir(parents=True)
         (stage / "MonClubAccess.exe").write_text("stub")
+        (stage / "version.json").write_text('{"version": "0.0.0-test"}')  # build_installer.ps1 requires it
+        (stage / "_internal").mkdir()
+        (stage / "_internal" / "base_library.zip").write_text("stub")
         out = subprocess.run(
             [_iscc(), f"/O{tmp_path / 'out'}", "/DAppVersion=0.0.0-test",
              f"/DStageDir={stage}", "/DOutputBaseFilename=compile_test", str(INSTALLER)],

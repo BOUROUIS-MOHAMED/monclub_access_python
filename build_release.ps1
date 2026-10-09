@@ -497,7 +497,11 @@ $signArgs = @($releaseSign, "sign", "--installer", $installerPath, "--target", $
               "--github-repo", $GithubRepo, "--codename", [string]$buildVersion.Codename)
 if ($git.commit) { $signArgs += @("--build-commit", $git.commit) }
 if ($SkipTests) { $signArgs += "--tests-skipped" }
-if (-not $publishable) { $signArgs += "--not-publishable" }
+if ($publishable) {
+  $signArgs += @("--publishable", "--payload-version-json", (Join-Path $stagingApp "version.json"))
+} else {
+  $signArgs += "--not-publishable"
+}
 if ($E2ETestKeys) { $signArgs += "--allow-test-keys" }
 if (-not [string]::IsNullOrWhiteSpace($InstallerUrl)) { $signArgs += @("--installer-url", $InstallerUrl) }
 if (-not [string]::IsNullOrWhiteSpace($ReleaseNotesFile)) { $signArgs += @("--notes-file", $ReleaseNotesFile) }

@@ -58,7 +58,12 @@ param(
     [int] $StaleMinutes = 10,
 
     # Seconds of retries for a locked file while emptying current\ (antivirus, a lingering UI).
-    [int] $LockedRetrySec = 15
+    [int] $LockedRetrySec = 15,
+
+    # recover, called by Setup itself before its backup: a journal found then was left by a
+    # Setup that died (ours has not written one yet), so it is stale whatever its age, and
+    # our own running Setup must not count as "a Setup is running".
+    [switch] $InSetup
 )
 
 Set-StrictMode -Version Latest
@@ -87,7 +92,10 @@ function Write-HelperLog([string] $Message) {
     Write-Host $line
 }
 
-function Get-UtcStamp { [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'") }
+# InvariantCulture: under e.g. ar-SA the current culture writes a Hijri year (review #7).
+function Get-UtcStamp {
+    [DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)
+}
 
 function ConvertTo-AsciiJson($Object) {
     $json = $Object | ConvertTo-Json -Compress -Depth 4
@@ -345,7 +353,10 @@ try {
                         $boot = Get-Content -LiteralPath $BootOkPath -Raw | ConvertFrom-Json
                         $bv = ([string] $boot.version).Trim()
                         if ($bv -ieq $ToVersion.Trim()) {
-                            Write-HelperLog ("healthy: boot_ok.json version={0} pid={1} after {2:N0} s" -f $bv, $boot.pid, ((Get-Date) - $started).TotalSeconds)
+                            # Optional field: under StrictMode a missing property would throw and
+                            # turn a healthy update into a timeout (review #8).
+                            $bootPid = if ($boot.PSObject.Properties.Name -contains 'pid') { $boot.pid } else { '?' }
+                            Write-HelperLog ("healthy: boot_ok.json version={0} pid={1} after {2:N0} s" -f $bv, $bootPid, ((Get-Date) - $started).TotalSeconds)
                             exit 0
                         }
                         Write-HelperLog "boot_ok.json carries version '$bv', waiting for '$ToVersion'"
@@ -399,7 +410,7 @@ try {
                 Write-HelperLog "stale claim $($claim.Name) (restorer gone) -- journal handed back"
             }
             if (-not (Test-Path -LiteralPath $JournalPath)) { exit 0 }
-            if (Test-SetupRunning) {
+            if (-not $InSetup -and (Test-SetupRunning)) {
                 Write-HelperLog 'install journal present but a Setup is running -- standing down'
                 exit 22
             }
@@ -430,7 +441,7 @@ try {
             # The Setup that wrote it is gone (killed / crashed): no need to wait the 10 minutes.
             # Liveness by PID, not by name, so a renamed installer still counts as running.
             $setupGone = $jSetupPid -gt 0 -and -not (Get-Process -Id $jSetupPid -ErrorAction SilentlyContinue)
-            $stale = (($nowUtc - $at).TotalMinutes -gt $StaleMinutes) -or ($null -ne $boot -and $at -lt $boot) -or $setupGone
+            $stale = $InSetup -or (($nowUtc - $at).TotalMinutes -gt $StaleMinutes) -or ($null -ne $boot -and $at -lt $boot) -or $setupGone
             if (-not $stale) {
                 Write-HelperLog ("install journal phase={0} is only {1:N0} s old and no reboot since -- not stale yet" -f $phase, ($nowUtc - $at).TotalSeconds)
                 exit 22
@@ -441,6 +452,9 @@ try {
                 Write-HelperLog 'install journal claimed by someone else -- backing off'
                 exit 22
             }
+            # A rename keeps the journal's LastWriteTime -- before the last boot after a power
+            # cut -- and Test-ClaimLive would then call this live claim dead (review #4).
+            try { [System.IO.File]::SetLastWriteTimeUtc($claimed, [DateTime]::UtcNow) } catch { }
             Write-HelperLog ("claimed stale journal phase={0} from={1} to={2} at={3:o}" -f $phase, $jFrom, $jTo, $at)
             Remove-Item -LiteralPath $SentinelPath -Force -ErrorAction SilentlyContinue
             $doRestore = $phase -in @('copying', 'verifying', 'restoring')

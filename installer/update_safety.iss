@@ -42,6 +42,7 @@ var
   UpdBackupDone: Boolean;     // previous\ holds the old version, current\ was emptied
   UpdFinalized: Boolean;      // a terminal result was handled; DeinitializeSetup does nothing
   UpdRolledBackTo: string;    // set after a post-install rollback (uninstall key fix-up)
+  UpdRepair: Boolean;         // current\ was incomplete: installed over it without a backup
 
 function UpdPad(Value, Width: Integer): string;
 begin
@@ -250,6 +251,30 @@ begin
 #endif
 end;
 
+// A journal or a restore claim (install_journal*.json) left in state\: an earlier Setup or
+// restorer did not finish.
+function UpdLeftoverPresent(const Root: string): Boolean;
+var
+  FindRec: TFindRec;
+begin
+  Result := False;
+  if (Root <> '') and FindFirst(AddBackslash(Root) + 'state\install_journal*.json', FindRec) then
+  begin
+    Result := True;
+    FindClose(FindRec);
+  end;
+end;
+
+// current\ holds a whole installed version: the exe AND version.json, and nothing says a swap
+// was interrupted. A version.json alone (power cut in the copy) is NOT an installed version.
+function UpdCurrentComplete(const Root: string): Boolean;
+begin
+  Result := (Root <> '') and
+            FileExists(AddBackslash(Root) + 'current\{#MainExe}') and
+            FileExists(AddBackslash(Root) + 'current\version.json') and
+            not UpdLeftoverPresent(Root);
+end;
+
 // SAME VERSION (D22). Called from InitializeSetup, where {app} is not yet known: works on
 // ExistingInstallRoot. Silent: no box, record ABORTED, make sure the app runs again.
 procedure UpdHandleSameVersion();
@@ -276,9 +301,34 @@ begin
   Result := '';
   UpdInstallRoot := RemoveBackslashUnlessRoot(ExpandConstant('{app}'));
   UpdFromVersion := '';
+
+  // A Setup or restorer that died left its journal / claim: put previous\ back FIRST, so this
+  // run backs up a real version (and a re-run installer repairs such a PC; review #5).
+  if UpdLeftoverPresent(UpdInstallRoot) then
+  begin
+    RC := UpdRunHelper('recover', UpdInstallRoot, ' -InSetup');
+    if RC = 22 then
+    begin
+      // Another restorer holds a live claim: it restores and starts the app. Stay out.
+      UpdFinalized := True;
+      UpdWriteLastUpdate(UpdInstallRoot, 'ABORTED', '', '{#AppVersion}', 'restore_in_progress');
+      UpdClearPauseSentinel(UpdInstallRoot);
+      Result := '{#AppName}: a restore of the previous version is in progress; try again later.';
+      exit;
+    end;
+  end;
+
   if not PathHasInstalledPayload(UpdInstallRoot) then
   begin
     Log('No installed payload in ' + UpdInstallRoot + '\current -- fresh install, no backup.');
+    exit;
+  end;
+  if not UpdCurrentComplete(UpdInstallRoot) then
+  begin
+    // Half a version (no exe, or no version.json) and nothing to restore it from: backing it
+    // up would fail every time and leave the PC without Access. Install over it instead.
+    Log('current\ is incomplete and no journal can restore it -- repair install, no backup.');
+    UpdRepair := True;
     exit;
   end;
   TryReadInstalledVersion(UpdInstallRoot, UpdFromVersion);
@@ -293,10 +343,17 @@ begin
   // journal (if any) makes the next start-up / watchdog restore it.
   UpdFinalized := True;
   if RC = 3 then
-    UpdWriteLastUpdate(UpdInstallRoot, 'ABORTED', UpdFromVersion, '{#AppVersion}', 'restore_failed')
+  begin
+    // current\ is half-restored: starting it would hang on an error box. The kept journal
+    // makes the watchdog / the wrapper / the next start restore it (review #12).
+    UpdWriteLastUpdate(UpdInstallRoot, 'ABORTED', UpdFromVersion, '{#AppVersion}', 'restore_failed');
+    Log('NOT relaunching: current\ could not be put back; the install journal is kept for recovery.');
+  end
   else
+  begin
     UpdWriteLastUpdate(UpdInstallRoot, 'ABORTED', UpdFromVersion, '{#AppVersion}', 'backup_failed');
-  UpdRelaunch(UpdInstallRoot);
+    UpdRelaunch(UpdInstallRoot);
+  end;
   UpdClearPauseSentinel(UpdInstallRoot);
   Result := '{#AppName} could not back up the installed version, so nothing was changed. ' +
             'See the setup log: ' + UpdSetupLogPath();
@@ -309,16 +366,27 @@ var
 begin
   Log('Rolling back to ' + UpdFromVersion + ' (' + Reason + ')');
   RC := UpdRunHelper('restore', UpdInstallRoot, '');
+  if RC <> 0 then
+  begin
+    Log('Restore failed (exit ' + IntToStr(RC) + ') -- one more try in 5 s');
+    Sleep(5000);
+    RC := UpdRunHelper('restore', UpdInstallRoot, '');
+  end;
   if RC = 0 then
   begin
     UpdWriteLastUpdate(UpdInstallRoot, 'ROLLED_BACK', '{#AppVersion}', UpdFromVersion, Reason);
     UpdDeleteJournal(UpdInstallRoot);
     UpdRolledBackTo := UpdFromVersion;
+    UpdRelaunch(UpdInstallRoot);
   end
   else
-    // The journal stays (phase restoring): the next start-up / watchdog retries the restore.
+  begin
+    // The journal stays (phase restoring) and current\ is half-restored: do NOT start it
+    // (review #12). The watchdog, the v2 wrapper (after Setup exits) or the next start-up
+    // restores from the journal and starts the app.
     UpdWriteLastUpdate(UpdInstallRoot, 'ROLLED_BACK', '{#AppVersion}', UpdFromVersion, 'restore_failed');
-  UpdRelaunch(UpdInstallRoot);
+    Log('NOT relaunching: current\ could not be restored; the install journal is kept for recovery.');
+  end;
   UpdClearPauseSentinel(UpdInstallRoot);
   UpdFinalized := True;
 end;
@@ -352,8 +420,11 @@ begin
 
   if not UpdBackupDone then
   begin
-    // Silent fresh install: nothing to go back to; just start it.
-    UpdWriteLastUpdate(UpdInstallRoot, 'INSTALLED', '', '{#AppVersion}', 'fresh_install');
+    // Silent fresh (or repair) install: nothing to go back to; just start it.
+    if UpdRepair then
+      UpdWriteLastUpdate(UpdInstallRoot, 'INSTALLED', '', '{#AppVersion}', 'repair')
+    else
+      UpdWriteLastUpdate(UpdInstallRoot, 'INSTALLED', '', '{#AppVersion}', 'fresh_install');
     UpdRelaunch(UpdInstallRoot);
     UpdClearPauseSentinel(UpdInstallRoot);
     UpdFinalized := True;

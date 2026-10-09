@@ -117,7 +117,10 @@ Name: "{app}\state"
 [Files]
 ; Safe-swap helper (updater v2): extracted to {tmp} for Setup's own use (dontcopy) ...
 Source: "update_helper.ps1"; Flags: dontcopy
-Source: "{#StageDir}\*"; DestDir: "{app}\current"; Flags: ignoreversion recursesubdirs createallsubdirs
+; The new watchdog is also extracted (dontcopy) and put in place by PrepareToInstall BEFORE
+; current\ is emptied: on the 1.4.35 -> 1.5.0 hop, a power cut in the copy would otherwise leave
+; the OLD watchdog -- no journal rule -- standing down for ever on "exe missing" (review #3).
+Source: "..\packaging\watchdog\monclub_access_watchdog.ps1"; Flags: dontcopy
 ; Watchdog scripts live OUTSIDE current\ on purpose: an update empties and refills
 ; current\ (and a rollback refills it again), and the scheduled task's action path must
 ; stay valid across both.
@@ -127,6 +130,12 @@ Source: "..\packaging\watchdog\monclub_access_watchdog_hidden.vbs"; DestDir: "{a
 ; ... and installed beside the watchdog, which applies the install-journal rule with it
 ; (design section 8 step 12).
 Source: "update_helper.ps1"; DestDir: "{app}\watchdog"; Flags: ignoreversion
+; version.json and then the exe are copied LAST (Inno installs [Files] in script order): if
+; power is cut during the copy, a present exe means the whole payload is there, and a
+; version.json without the exe is never taken for an installed version (review #3 / #5).
+Source: "{#StageDir}\*"; Excludes: "\{#MainExe},\version.json"; DestDir: "{app}\current"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#StageDir}\version.json"; DestDir: "{app}\current"; Flags: ignoreversion
+Source: "{#StageDir}\{#MainExe}"; DestDir: "{app}\current"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\MonClubAccess"; Filename: "{app}\current\{#MainExe}"; Tasks: startmenuicon
@@ -710,7 +719,9 @@ begin
   if ExistingInstallDetected then
     TryReadInstalledVersion(ExistingInstallRoot, ExistingInstallVersion);
 
-  if SameVersionInstalled() then
+  // Same version only when current\ really holds it (exe + version.json, no leftover journal):
+  // a re-run installer must be able to repair a half-written current\ (review #5).
+  if SameVersionInstalled() and UpdCurrentComplete(ExistingInstallRoot) then
   begin
     // D22: silent -> no box, ABORTED same_version, app relaunched (update_safety.iss).
     UpdHandleSameVersion();
@@ -777,6 +788,22 @@ begin
   end;
 end;
 
+// Review #3: the journal-aware watchdog and its helper must be in {app}\watchdog before
+// current\ is touched (on an update from 1.4.x the old watchdog has no journal rule).
+procedure InstallWatchdogEarly(const Root: string);
+var
+  Dir: string;
+begin
+  Dir := AddBackslash(Root) + 'watchdog';
+  if not DirExists(Dir) then exit;   // fresh install: [Files] puts them there
+  ExtractTemporaryFile('monclub_access_watchdog.ps1');
+  if FileCopy(UpdHelperPath(), Dir + '\update_helper.ps1', False) and
+     FileCopy(ExpandConstant('{tmp}\monclub_access_watchdog.ps1'), Dir + '\monclub_access_watchdog.ps1', False) then
+    Log('Watchdog + update_helper updated in ' + Dir + ' before the swap')
+  else
+    Log('WARNING: could not update ' + Dir + ' before the swap');
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Root: string;
@@ -790,6 +817,8 @@ begin
 
   KillRunningMonClubProcesses();
   Sleep(900);
+
+  InstallWatchdogEarly(Root);
 
   // Back up current\ -> previous\ and empty current\ (never DelTree it, D21). On failure the
   // old app is restarted, ABORTED is recorded and Setup stops here.

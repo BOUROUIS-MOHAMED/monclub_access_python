@@ -367,3 +367,87 @@ def test_recover_takes_back_the_journal_of_a_restorer_that_died(root: Path):
 def test_recover_without_journal_does_nothing(root: Path):
     assert run_helper("recover", root).returncode == 0
     assert not (root / "state" / "last_update.json").exists()
+
+
+# ---------------------------------------------------------------- review fixes
+
+
+def _helper_cmd(action: str, root: Path, *extra: str) -> list[str]:
+    return [str(POWERSHELL), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(HELPER),
+            "-Action", action, "-InstallRoot", str(root), "-AppExe", EXE, "-UiExe", "monclub-access-ui.exe",
+            "-FromVersion", "1.0.0", "-ToVersion", "2.0.0", "-LogPath", str(root / f"helper-{action}.log"), *extra]
+
+
+def test_a_live_restorers_claim_of_a_pre_boot_journal_is_seen_as_live(root: Path):
+    """Review #4: a rename keeps the journal's LastWriteTime (before the boot after a power
+    cut), so a second restorer judged the first one's claim dead and restored concurrently."""
+    write_payload(root / "previous", "1.0.0")
+    write_payload(root / "current", "2.0.0")
+    locked = root / "current" / "_internal" / "nested" / "payload.txt"
+    journal_path = root / "state" / "install_journal.json"
+    write_journal(root, "copying", utc(-60 * 24 * 3))
+    old = time.time() - 3 * 24 * 3600
+    os.utime(journal_path, (old, old))
+    # Hold a file that differs from previous\ with NO sharing for 8 s (robocopy retries 15 x 1 s).
+    holder = subprocess.Popen([str(POWERSHELL), "-NoProfile", "-Command",
+                               f"$f=[IO.File]::Open('{locked}','Open','Read','None'); Start-Sleep -Seconds 8; $f.Close()"])
+    time.sleep(2)
+    first = subprocess.Popen(_helper_cmd("recover", root), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.time() + 20
+        claims = []
+        while time.time() < deadline and not claims:
+            claims = list((root / "state").glob("install_journal.restoring-*.json"))
+            time.sleep(0.3)
+        assert claims, "the first restorer never claimed the journal"
+        assert claims[0].stat().st_mtime > time.time() - 60, "claim kept the journal's old time"
+        second = run_helper("recover", root)
+        assert second.returncode == 22, second.stdout
+        assert "restore is in progress" in second.stdout
+    finally:
+        holder.wait(timeout=60)
+        first.communicate(timeout=240)
+    assert first.returncode == 20  # the lock went away inside robocopy's retries
+    assert tree(root / "current") == tree(root / "previous")
+
+
+def test_journal_times_are_gregorian_utc_whatever_the_pc_culture(root: Path):
+    """Review #7: under ar-SA the current culture writes a Hijri year."""
+    write_payload(root / "current", "1.0.0")
+    ps = (f"[Threading.Thread]::CurrentThread.CurrentCulture = 'ar-SA'; "
+          f"& '{HELPER}' -Action backup -InstallRoot '{root}' -AppExe {EXE} -FromVersion 1.0.0 -ToVersion 2.0.0 "
+          f"-LogPath '{root / 'h.log'}'; exit $LASTEXITCODE")
+    r = subprocess.run([str(POWERSHELL), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    at = read_json(root / "state" / "install_journal.json")["at"]
+    assert at.startswith(str(dt.datetime.now(dt.timezone.utc).year)), at
+
+
+def test_a_boot_ok_without_pid_still_counts_as_healthy(root: Path, stub_exe: bytes):
+    """Review #8: StrictMode threw on the missing property and turned success into a timeout."""
+    write_payload(root / "current", "2.0.0", mode="noboot", exe_bytes=stub_exe)
+    try:
+        p = subprocess.Popen(_helper_cmd("launch-wait", root, "-TimeoutSec", "40"),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(6)
+        (root / "state" / "boot_ok.json").write_text('{"version":"2.0.0"}', encoding="ascii")
+        out, _err = p.communicate(timeout=60)
+        assert p.returncode == 0, out
+    finally:
+        kill_stubs(root)
+
+
+def test_recover_in_setup_treats_any_journal_as_left_by_a_dead_setup(root: Path):
+    write_payload(root / "previous", "1.0.0")
+    (root / "current").mkdir()
+    alive = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        write_journal(root, "copying", utc(-1), setup_pid=alive.pid)  # fresh, "live" setupPid
+        assert run_helper("recover", root).returncode == 22
+        r = run_helper("recover", root, "-InSetup")
+        assert r.returncode == 20, r.stdout + r.stderr
+        assert tree(root / "current") == tree(root / "previous")
+    finally:
+        alive.kill()
+        alive.wait()

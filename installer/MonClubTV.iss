@@ -94,7 +94,12 @@ Name: "{app}\state"
 [Files]
 ; Safe-swap helper (updater v2), extracted to {tmp} for Setup's own use.
 Source: "update_helper.ps1"; Flags: dontcopy
-Source: "{#StageDir}\*"; DestDir: "{app}\current"; Flags: ignoreversion recursesubdirs createallsubdirs
+; version.json and then the exe are copied LAST (Inno installs [Files] in script order): if
+; power is cut during the copy, a present exe means the whole payload is there, and a
+; version.json without the exe is never taken for an installed version (review #3 / #5).
+Source: "{#StageDir}\*"; Excludes: "\{#MainExe},\version.json"; DestDir: "{app}\current"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#StageDir}\version.json"; DestDir: "{app}\current"; Flags: ignoreversion
+Source: "{#StageDir}\{#MainExe}"; DestDir: "{app}\current"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\MonClubTV"; Filename: "{app}\current\{#MainExe}"; Tasks: startmenuicon
@@ -366,7 +371,9 @@ begin
   if ExistingInstallDetected then
     TryReadInstalledVersion(ExistingInstallRoot, ExistingInstallVersion);
 
-  if SameVersionInstalled() then
+  // Same version only when current\ really holds it (exe + version.json, no leftover journal):
+  // a re-run installer must be able to repair a half-written current\ (review #5).
+  if SameVersionInstalled() and UpdCurrentComplete(ExistingInstallRoot) then
   begin
     // D22: silent -> no box, ABORTED same_version, app relaunched (update_safety.iss).
     UpdHandleSameVersion();

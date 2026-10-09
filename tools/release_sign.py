@@ -252,7 +252,8 @@ def make_release_file(
     rollback_from: str | None = None,
     build_commit: str = "",
     tests_skipped: bool = False,
-    publishable: bool = True,
+    publishable: bool = False,
+    payload_version: Mapping[str, Any] | None = None,
     issued_at: str | None = None,
 ) -> dict[str, Any]:
     installer = Path(installer)
@@ -270,6 +271,13 @@ def make_release_file(
         raise ReleaseSignError(f"the private key file for {key_id!r} does not match the trusted public key "
                                f"(file -> {derived[:16]}..., trusted -> {str(trusted)[:16]}...)")
     if publishable:
+        # The payload's own version.json (written by build_release.ps1) must agree: a payload
+        # built with -E2ETestKeys trusts only the test key -- shipped, those PCs could never
+        # verify another release (review #6). "Publishable" is never a default.
+        if payload_version is None:
+            raise ReleaseSignError("a publishable release needs the payload's version.json (--payload-version-json)")
+        if payload_version.get("publishable") is not True or payload_version.get("e2eTestKeys"):
+            raise ReleaseSignError("the payload was built as a test / non-publishable build (its version.json says so)")
         if key_id.startswith(TEST_KEY_PREFIX):
             raise ReleaseSignError("a publishable release cannot be signed with a test key")
         if tests_skipped:
@@ -386,7 +394,10 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--rollback-from", default=None)
     s.add_argument("--build-commit", default="")
     s.add_argument("--tests-skipped", action="store_true")
-    s.add_argument("--not-publishable", action="store_true")
+    s.add_argument("--publishable", action="store_true",
+                   help="only build_release.ps1 passes it; needs --payload-version-json")
+    s.add_argument("--not-publishable", action="store_true", help="the default; kept for clarity")
+    s.add_argument("--payload-version-json", type=Path, default=None)
     s.add_argument("--allow-test-keys", action="store_true")
     s.add_argument("--out", type=Path, default=None)
 
@@ -439,7 +450,10 @@ def main(argv: list[str] | None = None) -> int:
                 key_id=args.key_id, seed=read_seed(key_file), trusted_keys=_trusted_for(args),
                 installer_url=args.installer_url, github_repo=args.github_repo, release_notes=notes,
                 codename=args.codename, rollback_from=args.rollback_from, build_commit=args.build_commit,
-                tests_skipped=args.tests_skipped, publishable=not args.not_publishable,
+                tests_skipped=args.tests_skipped,
+                publishable=bool(args.publishable) and not args.not_publishable,
+                payload_version=(json.loads(args.payload_version_json.read_text(encoding="utf-8-sig"))
+                                 if args.payload_version_json else None),
             )
             out = args.out or args.installer.parent / release_file_name(
                 args.target, args.version, rollback_from=args.rollback_from)

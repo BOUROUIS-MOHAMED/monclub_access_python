@@ -206,6 +206,9 @@ def test_installers_compile_and_refuse_an_unknown_test_fail_mode(tmp_path, iss, 
     stage = tmp_path / "stage"
     stage.mkdir()
     (stage / exe).write_text("stub")
+    (stage / "version.json").write_text('{"version": "0.0.0-test"}')  # every real payload has one
+    (stage / "_internal").mkdir()
+    (stage / "_internal" / "base_library.zip").write_text("stub")  # ... and an _internal\ tree
     args = [_iscc(), "/Q", f"/O{tmp_path / 'out'}", "/DAppVersion=0.0.0-test", f"/DStageDir={stage}",
             "/DOutputBaseFilename=compile_test"]
     if define:
@@ -315,3 +318,39 @@ def test_the_parse_check_itself_catches_a_broken_script(tmp_path):
     # Exactly the broken generate_installer.ps1 comment: the "\r" of "release\release" became a CR.
     bad.write_bytes(b"# the signed release file (release" + bytes([13]) + b"elease-<component>.json)\r\n$x = 1\r\n")
     assert len(parse_errors([bad])) == 1
+
+
+# ------------------------------------------------------------------ review fixes (#3 #5 #12)
+
+
+@pytest.mark.parametrize("iss, exe", [(ACCESS_ISS, "{#MainExe}"), (TV_ISS, "{#MainExe}")])
+def test_version_json_and_then_the_exe_are_the_last_payload_files(iss, exe):
+    files = [ln for ln in section(text(iss), "Files").splitlines() if ln.startswith("Source:")]
+    assert files[-2] == r'Source: "{#StageDir}\version.json"; DestDir: "{app}\current"; Flags: ignoreversion'
+    assert files[-1] == rf'Source: "{{#StageDir}}\{exe}"; DestDir: "{{app}}\current"; Flags: ignoreversion'
+    wildcard = [ln for ln in files if r'"{#StageDir}\*"' in ln]
+    assert len(wildcard) == 1 and r'Excludes: "\{#MainExe},\version.json"' in wildcard[0]
+
+
+def test_access_puts_the_journal_aware_watchdog_in_place_before_emptying_current():
+    src = text(ACCESS_ISS)
+    prep = src[src.index("function PrepareToInstall("):src.index("procedure CurStepChanged(")]
+    assert prep.index("InstallWatchdogEarly(Root);") < prep.index("UpdPrepareBackup()")
+    assert re.search(r'^Source: "\.\.\\packaging\\watchdog\\monclub_access_watchdog\.ps1"; Flags: dontcopy$', src, re.M)
+
+
+def test_setup_recovers_a_leftover_journal_and_repairs_an_incomplete_current():
+    src = text(SAFETY)
+    prep = src[src.index("function UpdPrepareBackup(): string;"):src.index("procedure UpdRollback(")]
+    assert prep.index("UpdRunHelper('recover', UpdInstallRoot, ' -InSetup')") < prep.index("UpdRunHelper('backup'")
+    assert prep.index("UpdRepair := True;") < prep.index("UpdRunHelper('backup'")
+    for iss in (ACCESS_ISS, TV_ISS):
+        assert "if SameVersionInstalled() and UpdCurrentComplete(ExistingInstallRoot) then" in text(iss)
+
+
+def test_a_failed_restore_is_retried_once_and_never_relaunches_a_half_restored_tree():
+    src = text(SAFETY)
+    rb = src[src.index("procedure UpdRollback("):src.index("procedure UpdPostInstall();")]
+    assert rb.count("UpdRunHelper('restore'") == 2
+    failed = rb[rb.index("'restore_failed'"):]
+    assert "UpdRelaunch" not in failed
