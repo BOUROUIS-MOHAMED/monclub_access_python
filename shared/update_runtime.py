@@ -161,6 +161,11 @@ class InstallRefused(RuntimeError):
     """The install was not started; the app keeps running."""
 
 
+class UpdateInstallStarted(Exception):
+    """Raised from the app constructor when the start-up gate started the update wrapper:
+    the entry point returns normally (a clean exit, not a crash) so the wrapper can run."""
+
+
 @dataclass
 class UpdateStatus:
     current_version: str = "0.0.0"
@@ -1033,7 +1038,10 @@ class ComponentUpdateManager:
 
     def on_local_api_ready(self) -> None:
         """Called on the main loop once the local API listens: write the health marker
-        Setup waits for, then look for the installer's result for 10 minutes."""
+        Setup waits for, then look for the installer's result for 10 minutes. Once per
+        process (a local API restart calls it again)."""
+        if self._boot_ok_written:
+            return
         try:
             payload = write_boot_ok(self.paths, version=self.get_current_version())
             self._boot_ok_written = True
@@ -1286,12 +1294,13 @@ class ComponentUpdateManager:
         if not first_seen or self._clock() - first_seen < FALLBACK_PENDING_SEC:
             return False
         if self._door_idle_sec_provider is None:
-            return True
+            return True  # TV: no doors
         try:
             idle = self._door_idle_sec_provider()
         except Exception:
             return False
-        return idle is None or idle >= FALLBACK_DOOR_IDLE_SEC
+        # Unknown idle time is not idle: never install over a possible passage.
+        return idle is not None and idle >= FALLBACK_DOOR_IDLE_SEC
 
     # ------------------------------------------------------------------ telemetry
 
@@ -1402,6 +1411,7 @@ __all__ = [
     "DownloadCancelled",
     "DownloadRefused",
     "InstallRefused",
+    "UpdateInstallStarted",
     "UpdateStateStore",
     "UpdateStatus",
     "file_sha256",
