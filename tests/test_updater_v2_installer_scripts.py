@@ -423,3 +423,13 @@ def test_a_second_installer_run_stops_before_the_sentinel_and_the_process_kill()
     fn = fn[: fn.index("\nend;")]
     assert "'other-setup'" in fn and "UpdFinalized := True" in fn and "UpdWriteLastUpdate" not in fn
 
+
+def test_build_scripts_do_not_use_get_filehash():
+    """Get-FileHash is a module function that Windows PowerShell 5.1 cannot load when started from a PowerShell 7
+    window (PSModulePath): it stopped two of L4's real builds (build_release.ps1, then build_tauri_shell.ps1)."""
+    import re as _re
+
+    for name in ("build_release.ps1", "build_tauri_shell.ps1", "build_installer.ps1", "publish_github_release.ps1",
+                 "generate_installer.ps1"):
+        code = "\n".join(l.split("#", 1)[0] for l in (REPO / name).read_text(encoding="utf-8").splitlines())
+        assert not _re.search(r"\bGet-FileHash\b", code), name
