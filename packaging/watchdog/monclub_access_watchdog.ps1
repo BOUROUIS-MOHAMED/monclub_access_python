@@ -21,8 +21,9 @@
     Racing it can lock files inside current\ mid-swap and break the update. These
     guards prevent that:
 
+      2. An install journal is left behind        -> recover it FIRST, even before
+                                                     the "is it running" check (below).
       1. An installer/setup process is running    -> stand down.
-      2. An install journal is left behind        -> recover it first (below).
       3. The pause sentinel file exists and is    -> stand down.
          fresh (the installer writes it before
          killing and removes it at its result)
@@ -36,7 +37,9 @@
     Guard 2 is the install-journal rule (design.md section 8.0 / 8 step 12): a Setup
     killed mid-swap (power cut) leaves {app}\state\install_journal.json and possibly a
     half-filled current\ -- with the exe missing (guard 4) and a fresh sentinel
-    (guard 3), so it MUST run before those two or the app would never come back.
+    (guard 3), so it MUST run before those two or the app would never come back --
+    and before the "is it running" check too: a half-written windowed exe started by
+    the Run key sits alive on PyInstaller's error box and looks running.
     update_helper.ps1 -Action recover restores previous\ when the journal is stale
     (no Setup running and older than 10 min or written before the last boot),
     records ROLLED_BACK "interrupted" in state\last_update.json and clears the
@@ -256,22 +259,16 @@ function Test-PauseSentinel {
 try {
     $state = Read-State
 
-    if (Test-ProcessRunning -Names @($AppProcessName)) {
-        if ($state.misses -ne 0 -or $state.missAt -ne 0) { Write-State -Misses 0 -Restarts $state.restarts }
-        exit 0                      # healthy: the overwhelmingly common path, logged silently
-    }
-
-    # --- stand-down guards, most specific first ---
-    if (Test-InstallerRunning) {
-        Write-Log 'INFO' 'app is down but an installer appears to be running -- standing down'
-        Write-State -Misses 0 -Restarts $state.restarts
-        exit 0
-    }
+    # --- guard 2 FIRST: the install journal (see .DESCRIPTION) ---
+    # Before even the "is it running" check: after a power cut mid-copy the exe may already be
+    # the new one while _internal\ is incomplete; started by the Run key or by staff, that
+    # windowed PyInstaller exe sits alive on its error box, and a name-only "running" check
+    # would call it healthy for ever (review finding #2). update_helper stands down by itself
+    # while a Setup of this product runs (exit 22) and stops anything running from current\
+    # before it restores.
     $claims = @(Get-ChildItem -LiteralPath (Split-Path -Parent $JournalPath) -Filter 'install_journal.restoring-*.json' -ErrorAction SilentlyContinue)
+    $journalStandDown = $false
     if ((Test-Path -LiteralPath $JournalPath) -or $claims.Count -gt 0) {
-        # Guard 2 (see .DESCRIPTION): BEFORE the sentinel and exe-missing guards. A live
-        # claim (install_journal.restoring-<pid>.json) means another restorer is at work:
-        # update_helper answers 22 and we stand down instead of starting it mid-restore.
         if (-not (Test-Path -LiteralPath $HelperPath)) {
             Write-Log 'ERROR' "install journal found but $HelperPath is missing -- cannot recover"
         } else {
@@ -288,18 +285,33 @@ try {
                 exit 0
             }
             if ($rc -eq 22) {
-                Write-Log 'INFO' 'app is down and an install journal is not stale yet, or a restore is in progress -- standing down'
-                Write-State -Misses 0 -Restarts $state.restarts
-                exit 0
-            }
-            if ($rc -eq 23) {
+                # A Setup of ours is at work, the journal is not stale yet, or another
+                # restorer holds a live claim: never start the app now.
+                $journalStandDown = $true
+            } elseif ($rc -eq 23) {
                 Write-Log 'ERROR' "an interrupted install could NOT be rolled back ($helperLog) -- needs a human"
-                Write-State -Misses 0 -Restarts $state.restarts
-                exit 0
+            } else {
+                # 21: dropped (current\ was never touched) -- carry on with the normal checks.
+                Write-Log 'INFO' "install journal handled by update_helper (exit $rc)"
             }
-            # 21: dropped (current\ was never touched) -- carry on with the normal checks.
-            Write-Log 'INFO' "install journal handled by update_helper (exit $rc)"
         }
+    }
+
+    if (Test-ProcessRunning -Names @($AppProcessName)) {
+        if ($state.misses -ne 0 -or $state.missAt -ne 0) { Write-State -Misses 0 -Restarts $state.restarts }
+        exit 0                      # healthy: the overwhelmingly common path, logged silently
+    }
+    if ($journalStandDown) {
+        Write-Log 'INFO' 'app is down and an install journal is not stale yet, or a restore is in progress -- standing down'
+        Write-State -Misses 0 -Restarts $state.restarts
+        exit 0
+    }
+
+    # --- stand-down guards, most specific first ---
+    if (Test-InstallerRunning) {
+        Write-Log 'INFO' 'app is down but an installer appears to be running -- standing down'
+        Write-State -Misses 0 -Restarts $state.restarts
+        exit 0
     }
     if (Test-PauseSentinel) {
         Write-Log 'INFO' 'app is down but the install pause sentinel is set -- standing down'

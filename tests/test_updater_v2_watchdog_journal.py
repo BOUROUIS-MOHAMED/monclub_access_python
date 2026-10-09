@@ -59,6 +59,28 @@ def test_power_cut_mid_copy_is_rolled_back_although_exe_is_missing_and_sentinel_
     assert (last["result"], last["reason"], last["to"]) == ("ROLLED_BACK", "interrupted", "1.4.35")
 
 
+def test_a_stale_journal_is_recovered_even_while_a_broken_exe_sits_running_in_current(tmp_path: Path):
+    r"""Review #2: after a power cut mid-copy the new exe may already be in current\ with
+    _internal\ incomplete; started by the Run key it hangs on PyInstaller's error box and
+    a name-only 'running' check called it healthy for ever. Stand-in: ping.exe renamed."""
+    import shutil
+    import subprocess as sp
+    payload(tmp_path / "previous", "1.4.35")
+    (tmp_path / "current").mkdir()
+    stuck = tmp_path / "current" / "MonClubAccess.exe"
+    shutil.copy(Path(os.environ["SystemRoot"]) / "System32" / "PING.EXE", stuck)
+    proc = sp.Popen([str(stuck), "-n", "120", "127.0.0.1"], stdout=sp.DEVNULL, cwd=str(tmp_path / "current"))
+    try:
+        journal(tmp_path, "copying", utc(-20))
+        out = tick(tmp_path)
+        assert "rolled back to previous" in out, out
+        assert proc.wait(timeout=30) is not None  # the stuck process was stopped by the restore
+        assert stuck.read_bytes() == b"exe 1.4.35"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
 def test_a_fresh_journal_makes_the_watchdog_stand_down(tmp_path: Path):
     payload(tmp_path / "previous", "1.4.35")
     payload(tmp_path / "current", "1.5.0")
