@@ -38,13 +38,9 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-try:  # lane L3 owns the one implementation (design 5.1)
-    from shared import ed25519 as _ed  # type: ignore[attr-defined]
-    ED25519_SOURCE = "shared.ed25519"
-except ImportError:  # until L3 lands -- see tools/_ed25519_fallback.py
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import _ed25519_fallback as _ed  # type: ignore[no-redef]
-    ED25519_SOURCE = "tools/_ed25519_fallback.py"
+from shared import ed25519 as _ed  # the one Ed25519 implementation (design 5.1)
+
+ED25519_SOURCE = "shared.ed25519"
 
 MANIFEST_SCHEMA = 1
 TARGETS = ("access", "tv")

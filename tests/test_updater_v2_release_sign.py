@@ -12,7 +12,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 
-import _ed25519_fallback as fallback  # noqa: E402
+from shared import ed25519 as shared_ed25519  # noqa: E402
 import release_sign as rs  # noqa: E402
 
 TEST_SEED_FILE = REPO / "tests" / "fixtures" / "release_signing" / "test-l2-2026-10.seed"
@@ -46,23 +46,25 @@ RFC8032_VECTORS = [
 
 
 @pytest.mark.parametrize("seed, pub, msg, sig", RFC8032_VECTORS)
-def test_fallback_ed25519_matches_rfc8032_vectors(seed, pub, msg, sig):
+def test_signing_ed25519_matches_rfc8032_vectors(seed, pub, msg, sig):
     s, m = bytes.fromhex(seed), bytes.fromhex(msg)
-    assert fallback.public_key_from_seed(s).hex() == pub
-    assert fallback.sign(s, m).hex() == sig
-    assert fallback.verify(bytes.fromhex(pub), m, bytes.fromhex(sig)) is True
-    assert fallback.verify(bytes.fromhex(pub), m + b"x", bytes.fromhex(sig)) is False
+    assert shared_ed25519.public_key_from_seed(s).hex() == pub
+    assert shared_ed25519.sign(s, m).hex() == sig
+    assert shared_ed25519.verify(bytes.fromhex(pub), m, bytes.fromhex(sig)) is True
+    assert shared_ed25519.verify(bytes.fromhex(pub), m + b"x", bytes.fromhex(sig)) is False
 
 
-def test_fallback_verify_never_raises_on_garbage():
-    assert fallback.verify(b"short", b"m", b"x" * 64) is False
-    assert fallback.verify(b"\xff" * 32, b"m", b"\xff" * 64) is False
-    assert fallback.verify(b"\x00" * 32, b"m", b"short") is False
+def test_signing_verify_never_raises_on_garbage():
+    assert shared_ed25519.verify(b"short", b"m", b"x" * 64) is False
+    assert shared_ed25519.verify(b"\xff" * 32, b"m", b"\xff" * 64) is False
+    assert shared_ed25519.verify(b"\x00" * 32, b"m", b"short") is False
 
 
-def test_signing_uses_shared_ed25519_when_lane_l3_has_landed_it():
-    # Documents the import rule: shared/ed25519.py wins; the fallback is temporary.
-    assert rs.ED25519_SOURCE in {"shared.ed25519", "tools/_ed25519_fallback.py"}
+def test_signing_uses_the_one_shared_ed25519_implementation():
+    # Design 5.1: one Ed25519 implementation (shared/ed25519.py); the L2 fallback is gone.
+    assert rs.ED25519_SOURCE == "shared.ed25519"
+    assert rs._ed is shared_ed25519
+    assert not (REPO / "tools" / "_ed25519_fallback.py").exists()
 
 
 def test_test_key_fixture_is_the_agreed_deterministic_seed():
