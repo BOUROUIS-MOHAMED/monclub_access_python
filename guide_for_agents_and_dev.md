@@ -58,6 +58,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The one-shot credentials re-send at startup — what it drops, its marker table, its place and catch in `init_db` (`db.py::_force_one_credentials_resend`, `::_run_one_shot_credentials_resend`, `local_one_shot_steps`; `tools/bench_credential_resend.py`) | §3.1b "The upgrade window" |
 | What happens when an `init_db` step fails — the five schema migrations and the inline `device_write_hold.pin_scheme` `ALTER` that stop startup, the steps that log and go on, a `try` or an `import logging` added inside `init_db` (`db.py::init_db`, `::_relax_firmware_profiles_not_null`, `::_rebuild_sync_users_without_legacy_fingerprint`, `::_ensure_main_account_id_column`, `::_ensure_pin_scheme_column`, `sync_device_store.py::ensure_ultra_merge_device_columns`, `::_run_one_shot_credentials_resend`) | §3.2d "A failing migration stops startup", §3.1b "The upgrade window" |
 | Anything in `app/core/v2/` (the server clock, the v2 client, the notice socket, leases, commands, ownership backup, problem reports, loss re-add), `access/v2_routes.py`, or a lease-gate call site (`ultra_engine.py::_v2_writes_blocked` and the `_lease_gate` calls, `device_sync.py`, `realtime_agent.py`, `device_attendance.py`, `ultra_worker_pool.py::devices_to_drive`, `access/local_api_routes.py::LEASE_GATED_HANDLERS` / `SCANNER_GATED_HANDLERS`) | §3.9 |
+| The software updater client — check / verify / download / install / start-up gate / journal restore / loop guard / telemetry / update pages (`shared/update_runtime.py`, `shared/release_manifest.py`, `shared/ed25519.py`, `shared/release_keys.py`, `shared/update_versions.py`, `shared/update_files.py`, `shared/update_wrapper.py`, `shared/update_startup.py`, `access/update_runtime.py`, the update handlers in `local_access_api_v2.py`, `UpdatePage.tsx` / `TvUpdatePage.tsx`) | §11 Software updates |
 | What `push_safety.check_bulk_removal` defers (`add_only`, `handover_release`) or lets through (a Confirm-removal approval) | §3.2g, §3.9 |
 | The removal log (`db.py::_log_v2_removal` in `clear_device_revocation_state` / `delete_device_sync_state`) | §3.4a, §3.9 |
 | The Erase-content wizard or the write hold (`app/core/erase_wizard.py` — incl. `::refill_roster`, `::held_waiting_count`, `EraseWizard._refill_check`, and since lane 1c `::_sync_staleness` / `::_sync_max_age_sec` with `app.py`'s `_last_sync_ok_mono` stamp, `::terminal_people` / `::not_refilled` / `::_bind_not_refilled` / `KEEP_MARK`, `::_refill_recheck`, `::_prune_now` / `::_folder_times`, `::_no_answer`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s codes —, `app/core/device_hold.py` — incl. `load(release_unstarted=)` and the `erase-prep`/`erase` phases —, `db.py::set_device_write_hold` / `::clear_device_write_hold` / `::list_device_write_holds`, `::begin_device_erase`, `::release_unstarted_erase_holds`, `::undo_device_erase_record` / `::device_list_is_authoritative` (lane 1f), `erase_wizard.py::check_erase_switch` / `monclub_api.py::get_erase_wizard_switch` (the gym's server switch), `erase_wizard.py::prune_erase_backups` (30-day retention), `::retire_device_records`, `::invalidate_device_records`, `device_sync.py::_filter_users_for_device(quiet=)`, `PullSDKDevice.ERASABLE_TABLES`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s offline answer, the hold in `ultra_engine.py::_v2_writes_blocked`, the worker's `_connected_addr` (`::_connect` / `::_disconnect`), `device_sync.py`'s three hold checks, `v2/handlers.py::device_reconcile`, `app.py`'s start-up `device_hold.load()` and `_sync_tick`'s `device_hold.ensure_loaded()`, `ownership.py::OwnershipSync._worker_idle`, the `erase` routes and handlers, `local_access_api_v2.py::_refuse_held_or_frozen`, `PullSDKDevice.count_table_strict` / `::read_table_strict` / `::erase_table`, `ZKStandaloneDevice.read_device_status` / `::read_user_templates` and the listing's `privilege`, `tauri-ui/src/components/EraseWizardDialog.tsx`) | §3.2h, pullsdk_guide §5, zkemkeeper_guide §4 |
@@ -5588,3 +5589,139 @@ python tools/list_telemetry_events.py
 call with more than about three fields is wrapped onto the next line, and because
 `zkfinger.py` emits through the `_enroll_tel(...)` helper that stamps `enroll_id`.
 A single-line grep finds 63 of the 134 names. `[CODE]`
+
+---
+
+## 11. Software updates — the client (updater v2)
+
+Design and defect IDs: `D:\Monclub\docs\access-updater-v2\design.md` (sections 5, 7, 8).
+This section is the **client** half (lane L3). The installer half (`installer/*.iss`, the
+watchdog, `build_release.ps1`) is reconciled into this section by L4 from L2's facts in
+`docs/access-updater-v2/progress.md`. One engine serves both targets:
+`shared/update_runtime.py::ComponentUpdateManager`, wrapped by `access/update_runtime.py`
+(target `access`) and `tv/update_runtime.py` (target `tv`). `[CODE]`
+
+**There is no ZIP / C# updater path any more.** The client only ever runs a signed Inno
+installer through the wrapper below; `updater_exe_name`, `_launch_installer_exe` and the
+`--zip` spawn are gone (D2). `[CODE; TEST: test_silent_update.py::test_the_zip_and_csharp_updater_path_is_gone]`
+
+### 11.1 Files under the install root `{app}` (the parent of `current\`)
+
+| File | Written by | Read by |
+|---|---|---|
+| `state\install_journal.json` `{phase,from,to,at,setupPid}` | Setup | app start-up, wrapper, watchdog |
+| `state\last_update.json` `{result,from,to,reason,log,at}` | Setup, the wrapper (`ABORTED setup_exit_<n>`), the restore helper (`ROLLED_BACK interrupted`) | the app; renamed to `last_update.consumed.json` once reported |
+| `state\boot_ok.json` `{version,pid,at}` | the app, once its local API listens | Setup (health wait) |
+| `state\update_state.json` | the app only | the app only: pending update, install attempt, per-version strikes/bans, telemetry outbox, TV install id |
+| `logs\update-<ver>-<utc>.log`, `logs\update-wrapper.log`, `logs\update-restore.log`, `logs\update-startup.log` | Setup `/LOG`, wrapper, restore helper, start-up journal check | people |
+| `downloads\<target>\<channel>\<version>\<installerName>` | the app | the app |
+
+`[CODE: shared/update_files.py::UpdatePaths]`
+
+### 11.2 Check, verify, download
+
+- Check at start-up and every `update_check_interval_sec` (3 h); a failed check retries after
+  60 s / 5 min / 15 min. The request adds `capabilities=signed-v1`. HTTP 404 is "no release"
+  (`app/api/monclub_api.py::get_latest_software_release` answers `{"shouldUpdate": false,
+  "noRelease": true}`), **not** a failed check (D16). `[CODE; TEST: test_updater_v2_engine.py::test_404_is_no_update_and_not_a_failed_check, test_update_check_interval.py]`
+- An offer is accepted only through `shared/release_manifest.py::verify_offer`: the
+  `signedManifest` string must verify (pure-Python Ed25519, `shared/ed25519.py`, RFC 8032
+  vectors in `tests/test_updater_v2_ed25519.py`) with a key from
+  `shared/release_keys.py::trusted_keys()`, then — parsed only after verification — name
+  this target / platform / channel and the offered version. A normal manifest needs a
+  version above the installed one; a rollback manifest (`allowDowngrade=true`) only applies
+  when `rollbackFrom` equals the installed version exactly (D8). Versions:
+  `shared/update_versions.py`, SemVer precedence with pre-releases (D29, D38), shared table
+  `tests/fixtures/semver_precedence.json`. `[CODE; TEST: test_updater_v2_manifest.py, test_updater_v2_versions.py]`
+- **Today's backend sends no signed fields**: every offer is refused as `UNSIGNED`, shown on
+  the Update page and reported once per version as `VERIFY_FAILED`; nothing is downloaded and
+  nothing crashes. `[TEST: test_updater_v2_engine.py::test_todays_unsigned_backend_is_refused_reported_once_and_never_downloaded]`
+- **`PROD_KEYS` is empty until the owner runs `tools/release_sign.py keygen`** (design 5.1);
+  until then a frozen build refuses every release. `TEST_KEYS` (`test-l2-2026-10`, seed in
+  `tests/fixtures/release_signing/`) are trusted only from source; a frozen E2E build trusts
+  the test key only because `build_release.ps1 -E2ETestKeys` writes it into the staged
+  `PROD_KEYS` line (kept on one line for that regex) and marks the build non-publishable. `[CODE]`
+- Download goes to `<installerName>.part`, is bounded by and compared with the signed size and
+  SHA-256, then renamed. A cached file is reused only when its SHA-256 matches (D11, D12);
+  a mismatch is `VERIFY_FAILED`, a transport error `DOWNLOAD_FAILED`. Cancel stops a running
+  download (D37). Only the pending version's folder is kept; older ones and the pre-v2
+  `downloads\<platform>\<channel>\*.exe` are deleted (D35). `[TEST: test_updater_v2_engine.py]`
+- A 404, a `shouldUpdate=false` answer or a different offer **discards** the pending
+  download — this is how Pause / Withdraw reach a PC. `[TEST: ::test_pause_or_withdraw_discards_the_pending_download, ::test_an_older_eligible_release_answer_also_discards_the_pending]`
+
+### 11.3 Install — the wrapper (D1, D24, D36)
+
+`ComponentUpdateManager.launch_install` re-verifies the manifest and the file's SHA-256,
+records `attempt {version, from, at, mode}` in `update_state.json`, then starts a hidden
+`powershell.exe` (full `System32` path, `-NoProfile -ExecutionPolicy Bypass`, cwd
+`{app}\state`) and checks it is still alive after 0.5 s. Only then does the caller quit;
+any failure raises `InstallRefused` and the app keeps running — the "Restart to update"
+handler answers 500 with the reason (`local_access_api_v2.py::_handle_component_update_install`). `[CODE; TEST: test_updater_v2_app_wiring.py::test_install_answers_an_error_and_never_quits_when_the_wrapper_fails]`
+
+The wrapper (`shared/update_wrapper.py::build_install_script`): wait up to 90 s for the app
+pid → `Start-Process <setup> -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+/LOG="{app}\logs\update-<ver>-<utc>.log"' -WorkingDirectory {app}\state -PassThru` and
+`WaitForExit()` on the Setup stub (not `-Wait`, which would also wait for the app Setup
+starts) → on a non-zero exit with no fresh `last_update.json`, write `ABORTED
+setup_exit_<code>` → if Setup left a journal, run the journal restore → if no
+`<exe>` runs from `{app}\current`, start `{app}\current\<exe>` with that working directory. `[TEST: test_updater_v2_files_and_wrapper.py::test_install_wrapper_runs_for_real_writes_aborted_and_relaunches_the_old_app, ::test_install_wrapper_restores_a_journal_setup_left_behind_before_relaunching — real PowerShell, stand-in Setup]`
+`[UNVERIFIED]` that the hidden PowerShell survives the app's exit when the app was started
+by the watchdog's scheduled task (L4 E2E).
+
+### 11.4 Start-up order (O1, D25)
+
+1. `access/main.py` / `tv/main.py`, right after the single-instance guard and before
+   anything else loads: `shared/update_startup.py::check_install_journal` (standard library
+   only). A stale journal (no Setup image `monclub_(access|tv)_<ver>.(exe|tmp)` running, and
+   `setupPid` set, or `at` > 10 min old, or before the last boot) with phase `copying` /
+   `verifying` / `restoring` → start the restore helper and exit; `backing_up` → delete it,
+   `current` is intact. The helper claims the journal (rename to
+   `install_journal.restoring-<pid>.json`; a failed rename = another restorer owns it, back
+   off), copies `previous\*` back, writes `ROLLED_BACK interrupted`, restarts the app. Only
+   in a frozen build running from `{app}\current`. `[TEST: test_updater_v2_startup_journal.py, test_updater_v2_files_and_wrapper.py::test_restore_helper_runs_for_real_and_puts_previous_back]`
+2. `MainApp.__init__` (Access), right after `_init_scheduler()` and before any engine is
+   built, the date flip, the hold load or the first `_sync_tick`; `TvApp.__init__` before the
+   shell is scheduled: `startup_gate` consumes `last_update.json`, then — frozen builds only —
+   installs a verified, downloaded, not-banned pending update after a 5 s server re-check
+   (still offered → install; paused / withdrawn / replaced → discard; no answer → install,
+   it was signed and offered). It raises `UpdateInstallStarted`, which `run_access_app` /
+   `run_tv_app` turn into a clean return. **No pending update = no network call.** The gate
+   logs its duration. `[TEST: test_updater_v2_app_wiring.py::test_a_startup_install_happens_before_any_engine_or_door_work, test_updater_v2_engine.py::test_startup_*]`
+3. Once the local API listens (or is disabled by config), on the main loop:
+   `on_local_api_ready` writes `boot_ok.json` (once per process), then re-reads
+   `last_update.json` every 30 s for 10 min (Setup writes `INSTALLED` only after our
+   `boot_ok`), cleans `downloads\` and flushes telemetry. A local API that fails to start
+   writes no `boot_ok`, so Setup rolls that version back. `[CODE]`
+
+### 11.5 24 h fallback and the loop guard
+
+- Always-on PCs: every 5 min, if the pending update was first verified ≥ 24 h ago and the
+  newest `access_history.created_at` is ≥ 15 min old, the same re-check + install runs, then
+  the app quits. An unknown idle time never counts as idle. TV has no doors: 24 h alone
+  (**default awaiting the owner**). DEVICE-mode rows are recorded at the attendance pull, so
+  for them "15 min" is measured from the pull. `[CODE: access/update_runtime.py::seconds_since_last_door_event; TEST: ::test_fallback_waits_24h_and_15_minutes_without_a_door_event]`
+- Loop guard (`update_state.json` `versions`): result reasons `crash`, `setup_failed`,
+  `restore_failed` ban the version from **automatic** install at once; any other failure
+  (`health_timeout`, `backup_failed`, `interrupted`, `setup_exit_<n>`, an attempt that left
+  no result at all) is a strike, two strikes ban. `same_version` is no strike. "Restart to
+  update" still works on a banned version; the page warns. `[TEST: ::test_a_crash_bans_the_version_from_auto_install_but_not_from_the_button, ::test_a_health_timeout_gets_exactly_one_automatic_retry, ::test_an_install_that_left_no_result_counts_as_one_strike]`
+
+### 11.6 Telemetry (D19)
+
+Every result is queued in `update_state.json` `outbox` (max 50) and POSTed to
+`/api/v1/manager/access/softwareUpdateEvent` (beside `getLatestAccessSoftwareRelease`)
+with the gym token: `{eventId, target, pcKey, pcName, fromVersion, toVersion, result,
+detail, occurredAt}`, result one of `PENDING` (install started) / `INSTALLED` /
+`ROLLED_BACK` / `ABORTED` / `VERIFY_FAILED` / `DOWNLOAD_FAILED`. `eventId` is a UUID5 of
+the event's source (the result file content, the attempt), so a resend dedupes. `pcKey` =
+Access `pcUuid` (`access/pc_identity.py`), else `install-<id>`; TV `tv-<id>`, the id kept in
+`update_state.json`. Network errors / 5xx / 408 / 429 keep the event; any other 4xx drops it
+(a backend without the endpoint answers 404). `[TEST: test_updater_v2_engine.py::test_events_*, ::test_server_errors_keep_the_event_and_an_old_backend_404_drops_it]`
+
+### 11.7 Update pages
+
+`tauri-ui/src/pages/UpdatePage.tsx` and `src/tv/pages/TvUpdatePage.tsx` render release
+notes through `src/lib/releaseNotes.ts` (allowlist p/br/ul/ol/li/strong/b/em/i/h1-h4/code,
+no attributes, links as text, script/style/iframe dropped) — never `dangerouslySetInnerHTML`
+(D33) — and show the last result, a refused offer, the loop-guard warning and an install
+error (`src/components/update/UpdateNotices.tsx`). `[TEST: tauri-ui src/lib/releaseNotes.test.ts; tests/test_updater_v2_app_wiring.py::test_release_notes_are_never_injected_as_raw_html]`
