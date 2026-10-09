@@ -64,8 +64,11 @@ def _prelude(log_path: Path) -> List[str]:
         f"$log = {_ps(log_path)}",
         "function W([string]$m) { try { $d = Split-Path -Parent $log; "
         "if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }; "
-        "Add-Content -LiteralPath $log -Value ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') + ' ' + $m) } catch {} }",
-        "function NowZ { (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }",
+        "Add-Content -LiteralPath $log -Value ((NowZ) + ' ' + $m) } catch {} }",
+        # Invariant culture: a PC set to ar-SA would otherwise write a Hijri year, and ':'
+        # is the culture's time separator in .NET custom formats (L2 found it, 2026-10-09).
+        "function NowZ { (Get-Date).ToUniversalTime().ToString(\"yyyy'-'MM'-'dd'T'HH':'mm':'ss'Z'\", "
+        "[Globalization.CultureInfo]::InvariantCulture) }",
     ]
 
 
@@ -184,6 +187,9 @@ def _restore_function(install_root: Path, exe_name: str) -> List[str]:
         "  $claim = Join-Path $state $claimName",
         "  try { Rename-Item -LiteralPath $journal -NewName $claimName -ErrorAction Stop }",
         "  catch { W 'journal claimed by another restorer; backing off'; return 'backoff' }",
+        # A rename keeps the journal's old LastWriteTime: after a power cut that is before the
+        # boot, and the claim would look dead to the next restorer (design 8.0 claim liveness).
+        "  try { [IO.File]::SetLastWriteTimeUtc($claim, [DateTime]::UtcNow) } catch { W ('claim not touched: ' + $_) }",
         "  $j = $null",
         "  try { $j = Get-Content -LiteralPath $claim -Raw | ConvertFrom-Json } catch { W ('journal unreadable: ' + $_) }",
         "  $phase = ''; $jfrom = ''; $jto = ''",

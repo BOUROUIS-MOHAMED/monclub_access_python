@@ -395,3 +395,34 @@ def test_restore_helper_backs_off_while_a_setup_runs(tmp_path):
     assert (root / "state" / "install_journal.json").exists()
     assert (root / "current" / "new.dll").exists()
     assert "a Setup is still running" in (root / "logs" / "r.log").read_text(encoding="utf-8", errors="replace")
+
+
+def test_a_claim_gets_a_fresh_timestamp_right_after_the_rename(tmp_path):
+    """L2 review: a rename keeps the journal's LastWriteTime (before the boot after a power
+    cut), so without the touch a live restorer's claim would look dead to the next one."""
+    script = uw.build_restore_script(app_pid=1, install_root=tmp_path, exe_name="FakeApp.exe",
+                                     restore_log=tmp_path / "r.log")
+    rename = script.index("Rename-Item -LiteralPath $journal -NewName $claimName")
+    touch = script.index("[IO.File]::SetLastWriteTimeUtc($claim, [DateTime]::UtcNow)")
+    assert rename < touch < script.index("Get-Content -LiteralPath $claim")
+
+
+@pytest.mark.skipif(not WINDOWS or not WHOAMI.exists(), reason="needs Windows PowerShell")
+def test_timestamps_stay_gregorian_utc_under_an_arabic_culture(tmp_path):
+    """L2 found PowerShell's ToString(fmt) writes a Hijri year under ar-SA (1448 in 2026)."""
+    root = tmp_path / "root"
+    (root / "current").mkdir(parents=True)
+    (root / "state").mkdir()
+    setup = root / "monclub_access_1.5.1.exe"
+    shutil.copy(WHOAMI, setup)  # exits 1: the wrapper writes ABORTED with "at"
+    script = uw.build_install_script(
+        setup_image_re=NO_SETUP, app_pid=_dead_pid(), installer=setup, install_root=root, exe_name="Missing.exe",
+        from_version="1.5.0", to_version="1.5.1", setup_log=root / "logs" / "s.log", wrapper_log=root / "logs" / "w.log",
+    )
+    script = "[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]'ar-SA'\n" + script
+    _run(script, root / "state")
+    result = json.loads((root / "state" / "last_update.json").read_text(encoding="ascii"))
+    year = time.gmtime().tm_year
+    assert abs(uf.parse_utc_iso(result["at"]) - time.time()) < 300, result["at"]
+    first_log_line = (root / "logs" / "w.log").read_text(encoding="utf-8", errors="replace").splitlines()[0]
+    assert first_log_line.startswith(f"{year}-"), first_log_line
