@@ -5773,7 +5773,8 @@ Access `pcUuid` (`access/pc_identity.py`), else `install-<id>`; TV `tv-<id>`, th
 the event (an expired gym token must not lose the INSTALLED report); any other 4xx drops it (a backend
 without the endpoint answers 404). The server answers 200 `ignored` (not stored, owner decision O6) for a
 version that is no release of its target or an Access `pcKey` that is not one of the gym's PCs, so an
-unregistered PC (`install-<id>`) never shows on the dashboard. `[TEST: ::test_an_expired_or_refused_token_keeps_the_event_for_the_next_flush]` `[TEST: test_updater_v2_engine.py::test_events_*, ::test_server_errors_keep_the_event_and_an_old_backend_404_drops_it]`
+unregistered PC (`install-<id>`) never shows on the dashboard. Setup's `ABORTED same_version` (nothing was changed) is shown on the Update page but not
+reported (it made the dashboard count a healthy PC as failed, L4 E2E (g)); `::test_same_version_abort_is_not_reported_as_a_failed_update`. `[TEST: ::test_an_expired_or_refused_token_keeps_the_event_for_the_next_flush]` `[TEST: test_updater_v2_engine.py::test_events_*, ::test_server_errors_keep_the_event_and_an_old_backend_404_drops_it]`
 
 ### 11.7 Update pages
 

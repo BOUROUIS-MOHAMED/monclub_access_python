@@ -1026,6 +1026,10 @@ class ComponentUpdateManager:
             return None
         before, tried = outcome["before"], outcome["tried"]
         self._log("info", "installer result: %s (tried %s, before %s) reason=%s; running %s", kind, tried, before, reason or "-", installed)
+        if kind == "ABORTED" and reason == "same_version":
+            # Setup found this very version installed and changed nothing: no update happened. Reported as
+            # ABORTED it made the dashboard count the PC as "failed" on the version it runs fine (L4 E2E (g)).
+            return result
         telemetry_kind = kind if kind in TELEMETRY_RESULTS else "ABORTED"
         # Telemetry always says fromVersion = before the install, toVersion = the version tried.
         self.emit_event(

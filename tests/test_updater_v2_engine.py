@@ -533,7 +533,7 @@ def test_installed_result_clears_pending_reports_and_measures_duration(env):
 
 def test_a_result_is_consumed_once(env):
     mgr = env.make()
-    _write_result(mgr, result="ABORTED", reason="same_version")
+    _write_result(mgr, result="ABORTED", reason="backup_failed")
     mgr.consume_results()
     raw = mgr.paths.last_update_consumed.read_text(encoding="utf-8")
     mgr.paths.last_update.write_text(raw, encoding="utf-8")
@@ -546,6 +546,16 @@ def test_same_version_abort_is_no_strike(env):
     _write_result(mgr, result="ABORTED", reason="same_version")
     mgr.consume_results()
     assert _state(mgr)["versions"] == {}
+
+
+def test_same_version_abort_is_not_reported_as_a_failed_update(env):
+    """L4 E2E (g): the dashboard counted a PC as "1 failed" on the version it ran fine, because Setup's
+    harmless same-version answer was reported as ABORTED. Nothing was attempted: nothing is reported."""
+    mgr = env.make()
+    _write_result(mgr, result="ABORTED", reason="same_version")
+    mgr.consume_results()
+    assert _state(mgr).get("outbox", []) == []
+    assert _state(mgr)["lastResult"]["reason"] == "same_version"  # still shown on the Update page
 
 
 # ------------------------------------------------------------------ boot_ok + 24 h fallback
