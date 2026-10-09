@@ -267,3 +267,14 @@ def test_the_zip_updater_is_gone():
     for p in (ACCESS_ISS, TV_ISS, REPO / "packaging" / "desktop_components.ps1", BUILD_RELEASE,
               REPO / "packaging" / "watchdog" / "monclub_access_watchdog.ps1", REPO / ".gitignore"):
         assert not re.search(r"MonClubDesktopUpdater|MonClub(Access|TV)Updater|build_updater", text(p)), p.name
+
+
+@pytest.mark.parametrize("iss", [ACCESS_ISS, TV_ISS])
+def test_the_uninstall_log_is_overwritten_so_old_data_deletes_do_not_replay(iss):
+    """D26, found by the E2E: Inno APPENDS uninstall logs across installs, so the 1.4.x entry
+    '[UninstallDelete] {commonappdata}\MonClub Access' kept wiping TV's data."""
+    src = text(iss)
+    assert re.search(r"^UninstallLogMode=overwrite$", section(src, "Setup"), re.M)
+    assert not re.search(r"^\[Registry\]", src, re.M)  # overwrite is only safe without them
+    ud = section(src, "UninstallDelete")
+    assert 'Type: filesandordirs; Name: "{app}"' in ud

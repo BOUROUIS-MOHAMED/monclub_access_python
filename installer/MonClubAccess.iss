@@ -60,6 +60,14 @@ CloseApplications=yes
 CloseApplicationsFilter={#MainExe},{#TauriExe}
 RestartApplications=no
 DisableProgramGroupPage=yes
+; D26: OVERWRITE the uninstall log instead of appending to it (Inno's default). Appending kept
+; every older version's entries -- 1.4.x recorded "[UninstallDelete] {commonappdata}\MonClub
+; Access" -- and an uninstall replays ALL of them, so the old whole-data-root delete still ran
+; even though this script no longer has it (E2E 2026-10-09, e2e\L2\21-*). Nothing is lost by
+; overwriting: [UninstallDelete] removes {app} entirely, neither installer ever had [Registry]
+; entries, and both shortcuts are listed in [UninstallDelete] in case an older install made
+; one whose task is unticked now.
+UninstallLogMode=overwrite
 OutputDir=..\release
 OutputBaseFilename={#OutputBaseFilename}
 Compression=lzma2
@@ -153,6 +161,8 @@ Filename: "powershell.exe"; \
   RunOnceId: "RemoveMonClubWatchdog"
 
 [UninstallDelete]
+Type: files; Name: "{userprograms}\MonClubAccess.lnk"
+Type: files; Name: "{userdesktop}\MonClubAccess.lnk"
 Type: filesandordirs; Name: "{app}\previous"
 Type: filesandordirs; Name: "{app}\current.failed"
 Type: filesandordirs; Name: "{app}\state"
