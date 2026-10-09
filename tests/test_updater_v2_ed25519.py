@@ -108,12 +108,26 @@ def test_sign_refuses_a_seed_that_is_not_32_bytes():
         ed25519.sign(b"\x00" * 31, b"")
 
 
-def test_production_key_list_ships_empty_until_the_owner_keygen():
-    assert PROD_KEYS == {}
+OWNER_KEY_ID = "monclub-2026-10"
+OWNER_PUBLIC_KEY = "38ae1e308bd5261f106634185775da989e1d8db025e2a6747db58142e9f469f6"
+
+
+def test_production_key_list_holds_exactly_the_owner_key_and_no_test_key():
+    # Owner keygen 2026-10-10. A change here means a key rotation: ship the new key in a
+    # release BEFORE signing with it (design 5.1).
+    assert PROD_KEYS == {OWNER_KEY_ID: OWNER_PUBLIC_KEY}
+    assert not any(key_id.startswith("test-") for key_id in PROD_KEYS)
     assert all(key_id.startswith("test-") for key_id in TEST_KEYS)
 
 
+def test_a_frozen_build_trusts_the_production_key_only(monkeypatch):
+    monkeypatch.setenv("MONCLUB_UPDATER_TEST_KEYS", "1")
+    assert trusted_keys(frozen=True) == {OWNER_KEY_ID: OWNER_PUBLIC_KEY}
+
+
 def test_test_keys_are_trusted_from_source_but_never_in_a_frozen_build(monkeypatch):
+    for key_id in list(PROD_KEYS):
+        monkeypatch.delitem(PROD_KEYS, key_id)
     monkeypatch.delenv("MONCLUB_UPDATER_TEST_KEYS", raising=False)
     assert "test-l2-2026-10" in trusted_keys(frozen=False)
     assert trusted_keys(frozen=True) == {}
@@ -124,5 +138,7 @@ def test_test_keys_are_trusted_from_source_but_never_in_a_frozen_build(monkeypat
 
 
 def test_a_test_key_injected_into_prod_keys_is_trusted_in_a_frozen_e2e_build(monkeypatch):
+    for key_id in list(PROD_KEYS):
+        monkeypatch.delitem(PROD_KEYS, key_id)
     monkeypatch.setitem(PROD_KEYS, "test-l2-2026-10", TEST_KEYS["test-l2-2026-10"])
     assert trusted_keys(frozen=True) == {"test-l2-2026-10": TEST_KEYS["test-l2-2026-10"]}

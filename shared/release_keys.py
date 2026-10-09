@@ -4,13 +4,11 @@
 the client installs a release only if its manifest verifies against one of these keys.
 Add a new key in one release BEFORE signing with it, so PCs already trust it (rotation).
 
-TODO(owner, before the 1.5.0 build): on the build PC run
-    python tools/release_sign.py keygen
-which keeps the private key in %USERPROFILE%\\.monclub\\release-signing\\<keyId>.key (never
-in a repo, never printed) and prints the PUBLIC key. Paste that keyId + public key here and
-into the backend prod config ``monclub.release-signing.public-keys``. Until then the list is
-empty, every release fails verification (VERIFY_FAILED) and build_release.ps1 refuses to
-produce a publishable build. A lane must never generate a production key.
+Production key ``monclub-2026-10`` was made by the owner on 2026-10-10 with
+    python tools/release_sign.py keygen --key-id monclub-2026-10
+(private key in %USERPROFILE%\\.monclub\\release-signing\\<keyId>.key, never in a repo, never printed).
+The same keyId + public key go into the backend prod config
+``MONCLUB_RELEASE_SIGNING_PUBLIC_KEYS``. A lane must never generate a production key.
 
 ``TEST_KEYS`` are trusted only when the app runs from source (never in a frozen build).
 A frozen end-to-end test build trusts the test key only because build_release.ps1's
@@ -25,7 +23,9 @@ from __future__ import annotations
 import os
 from typing import Dict
 
-PROD_KEYS: dict[str, str] = {}
+# Owner key made 2026-10-10 on the build PC; private key kept offline (USB backup).
+# Keep this assignment on ONE line: build_release.ps1 -E2ETestKeys rewrites it by regex.
+PROD_KEYS: dict[str, str] = {"monclub-2026-10": "38ae1e308bd5261f106634185775da989e1d8db025e2a6747db58142e9f469f6"}
 
 TEST_KEYS: dict[str, str] = {
     "test-l2-2026-10": "b7a32fb80368ee93dda0c920d0c577852159b16d2fc9a3d921a17fc2f28777b0",
