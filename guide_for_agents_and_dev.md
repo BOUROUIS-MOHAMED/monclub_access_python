@@ -5685,7 +5685,11 @@ by the watchdog's scheduled task (L4 E2E).
    claim whose `<pid>` runs `powershell.exe` / `pwsh.exe` and that was made since the last
    Windows boot means a restore is in progress: the app exits without starting from
    `current` (the restorer restarts it). Any other claim (pid gone, pid reused by another
-   program, claim older than the boot) is renamed back to the journal. The journal itself is
+   program, claim older than the boot) is renamed back to the journal. A rename keeps the
+   journal's old LastWriteTime, so every restorer sets the claim's LastWriteTimeUtc to now
+   right after claiming it; the helpers write every timestamp with the invariant culture
+   (under ar-SA, PowerShell's `ToString(fmt)` writes a Hijri year).
+   `[TEST: test_updater_v2_files_and_wrapper.py::test_a_claim_gets_a_fresh_timestamp_right_after_the_rename, ::test_timestamps_stay_gregorian_utc_under_an_arabic_culture]` The journal itself is
    stale when no Setup image runs AND (`at` older than 10 min, or before the last boot, or
    no live process — any image name — has its `setupPid`). Only in a frozen build running from `{app}\current`. Each component looks only
    for ITS OWN Setup (`monclub_access_...` / `monclub_tv_...`), so an Access restore never
