@@ -37,8 +37,8 @@
 #endif
 
 #define SetupIcon "assets\monclub_tv.ico"
-#define WizardImage "assets\wizard.bmp"
-#define WizardSmall "assets\wizard_small.bmp"
+#define WizardImage "assets\tv_wizard.bmp"
+#define WizardSmall "assets\tv_wizard_small.bmp"
 
 [Setup]
 ; Built with Python 3.14, which runs on Windows 10 and newer only.

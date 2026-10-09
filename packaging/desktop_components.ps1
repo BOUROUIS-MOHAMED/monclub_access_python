@@ -20,6 +20,7 @@ function Get-DesktopComponentMetadata {
         InstallerScript = ".\installer\MonClubAccess.iss"
         InstallerBaseName = "monclub_access"
         UiExeName = "monclub-access-ui.exe"
+        TauriIdentifier = "com.monclub.access"
         UiStagingDir = ".\tauri-ui\component-shells\MonClubAccess"
         DefaultInstallRootName = "MonClubAccess"
         RequiresSdkDlls = $true
@@ -37,6 +38,7 @@ function Get-DesktopComponentMetadata {
         InstallerScript = ".\installer\MonClubTV.iss"
         InstallerBaseName = "monclub_tv"
         UiExeName = "monclub-tv-ui.exe"
+        TauriIdentifier = "com.monclub.tv"
         UiStagingDir = ".\tauri-ui\component-shells\MonClubTV"
         DefaultInstallRootName = "MonClubTV"
         RequiresSdkDlls = $false
