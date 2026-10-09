@@ -109,19 +109,24 @@ powershell -ExecutionPolicy Bypass -File register_watchdog.ps1 -Remove
 ## What stops it firing at the wrong moment
 
 Restarting the app mid-update can lock files inside `current\` while it is being
-replaced and break the update. Both the Inno Setup installer
-(`KillRunningMonClubProcesses`) and `MonClubAccessUpdater.exe` legitimately stop
-the app for minutes at a time and relaunch it themselves. Five guards:
+replaced and break the update. The Inno Setup installer legitimately stops the app for
+minutes (back up `current\` to `previous\`, refill `current\`, start the new version and
+wait up to 300 s for it to prove healthy, or roll back) and relaunches it itself. Guards:
 
-1. An updater process is running.
-2. Our own installer (`monclub_access*`) is running.
+1. Our own installer (`monclub_access*`, the `.exe` or Inno's `.tmp`) is running.
+2. An install journal (`<InstallRoot>\state\install_journal.json`) is left behind: the
+   watchdog runs `update_helper.ps1 -Action recover` (installed beside it) BEFORE guards 3
+   and 4. A stale journal (no Setup running, and older than 10 min or written before the
+   last boot) is claimed, `previous\` is restored when the phase says `current\` was
+   touched, `state\last_update.json` gets `ROLLED_BACK` / `interrupted`, the sentinel is
+   cleared and the app is started at once. A fresh journal: stand down. Contract:
+   `docs/access-updater-v2/design.md` §8.0 (MonClub docs folder).
 3. `<InstallRoot>\.update-in-progress` exists and is fresh — the installer writes
-   it before killing anything and removes it at `ssPostInstall`. It ages out after
+   it before killing anything and removes it at its terminal result. It ages out after
    30 minutes so an aborted install cannot disable recovery permanently.
 4. `current\MonClubAccess.exe` is missing — the swap is in flight.
 5. The app has been absent for only ONE tick — a restart needs two consecutive
-   misses, which covers short legitimate gaps without the updater having to
-   cooperate (it is a compiled binary this change does not touch). A miss counts
+   misses, which covers short legitimate gaps. A miss counts
    only when it comes at least 90 s after the previous counted one
    (`-MinSecondsBetweenMisses`): two checks that land close together are one miss.
 
@@ -220,29 +225,20 @@ Get-Process MonClubAccess | Select PriorityClass                             # N
 
 ## Power lost during an update
 
-The installer deletes `<InstallRoot>\current\` before it copies the new files
-(`MonClubAccess.iss::PrepareToInstall` → `DeleteTreeIfExists`) `[CODE]`, and
-`MonClubAccessUpdater.exe` swaps the same folder (compiled; not read here). Power lost in
-that window can leave a PC that cannot start Access by itself, and nothing repairs it:
-- `current\MonClubAccess.exe` missing: the watchdog stands down at every check
-  (`watchdog.log`: `... is missing -- current\ may be mid-swap; standing down`) and the
-  "Ouvrir MonClub Access avec Windows" entry points at nothing `[CODE]`;
-- the exe there but other files missing: Access fails at start (`%TEMP%\MonClubAccess.log`);
-  the watchdog retries up to 5 times an hour, then logs `NOT restarting` `[CODE]`.
+Since updater v2 the installer never deletes `current\` up front: it copies `current\*` to
+`previous\`, writes `state\install_journal.json`, empties `current\` (files only) and copies
+the new files (`installer/update_safety.iss`, `installer/update_helper.ps1`) `[CODE]`. A
+power cut in that window leaves the journal; at the next start the watchdog (guard 2
+above) or Access's own start-up check restores `previous\` and starts Access `[CODE]`.
+Whoever renames the journal first does the restore; the other backs off.
 
-To recover, as the Windows user Access is installed for (never uninstall first: the
-uninstaller deletes `%ProgramData%\MonClub Access`, the gym's data):
-1. Run the installer of the version the PC was updating to (the release's download, or the
-   USB key) over the existing install.
-2. If it says "MonClub Access version X is already installed on this PC. Nothing will be
-   changed." -- `current\version.json` and the exe were already copied, so it believes the
-   version is there (`MonClubAccess.iss::SameVersionInstalled`) `[CODE]` -- rename
-   `%LOCALAPPDATA%\MonClubAccess\current` to `current_broken` and run it again.
-3. Start Access; check `App started` in the newest log under
-   `%ProgramData%\MonClub Access\data\logs\`, and the watchdog task's state.
+By hand, if neither runs (watchdog off and Access not starting): copy
+`%LOCALAPPDATA%\MonClubAccess\previous\*` over `current\`, delete
+`state\install_journal.json`, start `current\MonClubAccess.exe`. Never uninstall first: the
+uninstaller deletes `%ProgramData%\MonClub Access`, the gym's data.
 
 `<InstallRoot>\.update-in-progress` may be left behind; the watchdog ignores it after 30
-minutes. None of this has been tried on a PC `[UNVERIFIED]`.
+minutes (and the recovery deletes it).
 
 ## Logs
 

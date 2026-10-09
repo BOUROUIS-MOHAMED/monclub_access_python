@@ -14,25 +14,33 @@
     task, and no supervisor. This script plus register_watchdog.ps1 is that
     missing piece.
 
-    IT MUST NOT RESTART THE APP AT THE WRONG MOMENT. Both the Inno Setup
-    installer (KillRunningMonClubProcesses in PrepareToInstall) and the in-app
-    updater (MonClubAccessUpdater.exe -> KillRunningAppFromDir, swap current\,
-    StartExe) legitimately stop the app for a while and relaunch it themselves.
-    Racing either one can lock files inside current\ mid-swap and break the
-    update. Five independent guards prevent that:
+    IT MUST NOT RESTART THE APP AT THE WRONG MOMENT. The Inno Setup installer
+    (PrepareToInstall: stop the app, back up current\ to previous\, empty and refill
+    current\, then start the new version and wait for it to prove healthy -- or roll
+    back) legitimately keeps the app down for a while and relaunches it itself.
+    Racing it can lock files inside current\ mid-swap and break the update. These
+    guards prevent that:
 
-      1. An updater process is running            -> stand down.
-      2. An installer/setup process is running    -> stand down.
+      1. An installer/setup process is running    -> stand down.
+      2. An install journal is left behind        -> recover it first (below).
       3. The pause sentinel file exists and is    -> stand down.
          fresh (the installer writes it before
-         killing and removes it post-install)
+         killing and removes it at its result)
       4. The app exe is missing (current\ is      -> stand down.
          mid-swap)
       5. Only the FIRST miss is observed          -> wait, confirm next tick.
 
     Guard 5 means an ordinary restart has to be missing across two consecutive
-    ticks before we act, which covers short legitimate gaps without needing the
-    updater to cooperate (it is a compiled binary we do not modify here).
+    ticks before we act, which covers short legitimate gaps.
+
+    Guard 2 is the install-journal rule (design.md section 8.0 / 8 step 12): a Setup
+    killed mid-swap (power cut) leaves {app}\state\install_journal.json and possibly a
+    half-filled current\ -- with the exe missing (guard 4) and a fresh sentinel
+    (guard 3), so it MUST run before those two or the app would never come back.
+    update_helper.ps1 -Action recover restores previous\ when the journal is stale
+    (no Setup running and older than 10 min or written before the last boot),
+    records ROLLED_BACK "interrupted" in state\last_update.json and clears the
+    sentinel; the watchdog then starts the app at once.
 
     The misses must also be spread in TIME, not only counted: a miss counts only
     when it comes at least $MinSecondsBetweenMisses (90 s) after the previous
@@ -84,7 +92,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $AppExeName      = 'MonClubAccess.exe'
-$UpdaterNames    = @('MonClubAccessUpdater', 'MonClubDesktopUpdater')
+$UiExeName       = 'monclub-access-ui.exe'
 $AppProcessName  = 'MonClubAccess'
 
 $CurrentDir   = Join-Path $InstallRoot 'current'
@@ -93,6 +101,9 @@ $LogDir       = Join-Path $InstallRoot 'logs'
 $LogPath      = Join-Path $LogDir      'watchdog.log'
 $StatePath    = Join-Path $LogDir      'watchdog-state.json'
 $SentinelPath = Join-Path $InstallRoot '.update-in-progress'
+$JournalPath  = Join-Path $InstallRoot 'state\install_journal.json'
+# Installed beside this script by MonClubAccess.iss (the same file Setup uses).
+$HelperPath   = Join-Path $PSScriptRoot 'update_helper.ps1'
 
 function Write-Log {
     param([string] $Level, [string] $Message)
@@ -242,18 +253,44 @@ try {
     }
 
     # --- stand-down guards, most specific first ---
-    if (Test-ProcessRunning -Names $UpdaterNames) {
-        Write-Log 'INFO' 'app is down but the updater is running -- standing down'
+    if (Test-InstallerRunning) {
+        Write-Log 'INFO' 'app is down but an installer appears to be running -- standing down'
         Write-State -Misses 0 -Restarts $state.restarts
         exit 0
+    }
+    if (Test-Path -LiteralPath $JournalPath) {
+        # Guard 2 (see .DESCRIPTION): BEFORE the sentinel and exe-missing guards.
+        if (-not (Test-Path -LiteralPath $HelperPath)) {
+            Write-Log 'ERROR' "install journal found but $HelperPath is missing -- cannot recover"
+        } else {
+            $helperLog = Join-Path $LogDir 'update-recover.log'
+            & $HelperPath -Action recover -InstallRoot $InstallRoot -AppExe $AppExeName `
+                -UiExe $UiExeName -LogPath $helperLog | Out-Null
+            $rc = $LASTEXITCODE
+            if ($rc -eq 20) {
+                Write-Log 'WARN' "an interrupted install was rolled back to previous\ ($helperLog) -- starting $AppExePath"
+                if ($WhatIfOnly) { exit 0 }
+                Start-Process -FilePath $AppExePath -WorkingDirectory $CurrentDir | Out-Null
+                $recent = @($state.restarts) + @(Get-NowEpoch)
+                Write-State -Misses 0 -Restarts $recent
+                exit 0
+            }
+            if ($rc -eq 22) {
+                Write-Log 'INFO' 'app is down and an install journal is present but not stale yet -- standing down'
+                Write-State -Misses 0 -Restarts $state.restarts
+                exit 0
+            }
+            if ($rc -eq 23) {
+                Write-Log 'ERROR' "an interrupted install could NOT be rolled back ($helperLog) -- needs a human"
+                Write-State -Misses 0 -Restarts $state.restarts
+                exit 0
+            }
+            # 21: dropped (current\ was never touched) -- carry on with the normal checks.
+            Write-Log 'INFO' "install journal handled by update_helper (exit $rc)"
+        }
     }
     if (Test-PauseSentinel) {
         Write-Log 'INFO' 'app is down but the install pause sentinel is set -- standing down'
-        Write-State -Misses 0 -Restarts $state.restarts
-        exit 0
-    }
-    if (Test-InstallerRunning) {
-        Write-Log 'INFO' 'app is down but an installer appears to be running -- standing down'
         Write-State -Misses 0 -Restarts $state.restarts
         exit 0
     }
