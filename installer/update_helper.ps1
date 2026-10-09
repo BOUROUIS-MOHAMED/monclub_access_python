@@ -274,6 +274,12 @@ function Test-ClaimLive([System.IO.FileInfo] $Claim) {
     $claimPid = [int] $Matches[1]
     $proc = Get-Process -Id $claimPid -ErrorAction SilentlyContinue
     if (-not $proc -or $proc.ProcessName -notin @('powershell', 'pwsh')) { return $false }
+    # The restorer existed BEFORE it made the claim (claims are touched to "now" when made). A
+    # PowerShell that started later only reuses the pid -- e.g. the watchdog itself after a
+    # Fast Startup boot, which does not move LastBootUpTime (L4 inbox item 2).
+    try {
+        if ($proc.StartTime.ToUniversalTime() -gt $Claim.LastWriteTimeUtc.AddSeconds(5)) { return $false }
+    } catch { }
     $boot = Get-LastBootUtc
     return ($null -eq $boot -or $Claim.LastWriteTimeUtc -gt $boot)
 }

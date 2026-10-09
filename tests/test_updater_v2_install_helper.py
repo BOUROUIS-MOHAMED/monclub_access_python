@@ -451,3 +451,24 @@ def test_recover_in_setup_treats_any_journal_as_left_by_a_dead_setup(root: Path)
     finally:
         alive.kill()
         alive.wait()
+
+
+def test_a_claim_older_than_its_powershell_process_is_a_reused_pid_not_a_live_restorer(root: Path):
+    """After a Fast Startup boot LastBootUpTime does not move, so the boot rule alone would take
+    a PowerShell that merely reuses a dead restorer's pid (e.g. the watchdog) for the restorer.
+    A real restorer always started before it made (and touched) its claim."""
+    write_payload(root / "previous", "1.0.0")
+    (root / "current").mkdir()
+    ps = subprocess.Popen([str(POWERSHELL), "-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+    try:
+        time.sleep(1)
+        claim = root / "state" / f"install_journal.restoring-{ps.pid}.json"
+        claim.write_text(json.dumps({"phase": "copying", "from": "1.0.0", "to": "2.0.0",
+                                     "at": utc(-30), "setupPid": 0}), encoding="ascii")
+        made = time.time() - 120  # claim "made" 2 min before this PowerShell started
+        os.utime(claim, (made, made))
+        r = run_helper("recover", root)
+        assert r.returncode == 20, r.stdout + r.stderr
+    finally:
+        ps.kill()
+        ps.wait()
