@@ -73,8 +73,10 @@ $LastUpdate   = Join-Path $StateDir 'last_update.json'
 $BootOkPath   = Join-Path $StateDir 'boot_ok.json'
 $SentinelPath = Join-Path $InstallRoot '.update-in-progress'
 # Our installer images: monclub_access_<ver>.exe and Inno's monclub_access_<ver>.tmp; test
-# builds add _TESTFAIL_<mode> (hence "_"). Same pattern as lane L3's client (design 8.0).
-$SetupImageRe = '^monclub_(access|tv)_[0-9][0-9A-Za-z._\-]*\.(exe|tmp)$'
+# builds add _TESTFAIL_<mode> (hence "_"). Per component (design 8.0): Access and TV have their
+# own install roots and may both update at the same morning boot -- neither waits for the other.
+$SetupTarget  = if ($AppExe -ieq 'MonClubTV.exe') { 'tv' } else { 'access' }
+$SetupImageRe = '^monclub_' + $SetupTarget + '_[0-9][0-9A-Za-z._\-]*\.(exe|tmp)$'
 
 function Write-HelperLog([string] $Message) {
     $line = '{0} | update_helper {1} | {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Action, $Message
@@ -256,6 +258,18 @@ function Test-SetupRunning {
     return $false
 }
 
+# A restore claim (install_journal.restoring-<pid>.json) is live only when <pid> is a running
+# PowerShell AND the claim was written after the last boot: after a power cut mid-restore
+# Windows may give that pid to any other process, which must not stand everyone down forever.
+function Test-ClaimLive([System.IO.FileInfo] $Claim) {
+    if ($Claim.Name -notmatch '^install_journal\.restoring-(\d+)\.json$') { return $false }
+    $claimPid = [int] $Matches[1]
+    $proc = Get-Process -Id $claimPid -ErrorAction SilentlyContinue
+    if (-not $proc -or $proc.ProcessName -notin @('powershell', 'pwsh')) { return $false }
+    $boot = Get-LastBootUtc
+    return ($null -eq $boot -or $Claim.LastWriteTimeUtc -gt $boot)
+}
+
 function Get-LastBootUtc {
     try { return (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime() } catch { return $null }
 }
@@ -373,9 +387,7 @@ try {
             # A claim left by a restorer (app start-up, wrapper, watchdog, us): alive = a restore
             # is in progress, stand down; dead = it died mid-restore, hand the journal back.
             foreach ($claim in @(Get-ChildItem -LiteralPath $StateDir -Filter 'install_journal.restoring-*.json' -ErrorAction SilentlyContinue)) {
-                $claimPid = 0
-                if ($claim.Name -match '^install_journal\.restoring-(\d+)\.json$') { $claimPid = [int] $Matches[1] }
-                if ($claimPid -gt 0 -and (Get-Process -Id $claimPid -ErrorAction SilentlyContinue)) {
+                if (Test-ClaimLive $claim) {
                     Write-HelperLog "a restore is in progress (claim $($claim.Name), pid alive) -- standing down"
                     exit 22
                 }

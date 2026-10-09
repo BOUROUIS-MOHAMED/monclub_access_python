@@ -322,7 +322,8 @@ def test_recover_with_unparseable_journal_restores_only_when_previous_is_complet
 
 def test_recover_stands_down_while_another_restorer_holds_a_live_claim(root: Path):
     write_payload(root / "previous", "1.0.0")
-    alive = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    # Restorers are PowerShell processes (update_helper, L3's wrapper / start-up restorer).
+    alive = subprocess.Popen([str(POWERSHELL), "-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
     try:
         (root / "state" / f"install_journal.restoring-{alive.pid}.json").write_text("{}", encoding="ascii")
         r = run_helper("recover", root)
@@ -331,6 +332,22 @@ def test_recover_stands_down_while_another_restorer_holds_a_live_claim(root: Pat
     finally:
         alive.kill()
         alive.wait()
+
+
+def test_a_claim_whose_pid_was_reused_by_another_program_is_not_live(root: Path):
+    """After a power cut mid-restore Windows may hand the claim's pid to any process."""
+    write_payload(root / "previous", "1.0.0")
+    (root / "current").mkdir()
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        (root / "state" / f"install_journal.restoring-{other.pid}.json").write_text(
+            json.dumps({"phase": "copying", "from": "1.0.0", "to": "2.0.0", "at": utc(-30), "setupPid": 0}),
+            encoding="ascii")
+        r = run_helper("recover", root)
+        assert r.returncode == 20, r.stdout + r.stderr
+    finally:
+        other.kill()
+        other.wait()
 
 
 def test_recover_takes_back_the_journal_of_a_restorer_that_died(root: Path):

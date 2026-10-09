@@ -85,7 +85,7 @@ def test_a_live_restore_claim_makes_the_watchdog_stand_down_without_starting_the
     payload(tmp_path / "previous", "1.4.35")
     (tmp_path / "current").mkdir()
     (tmp_path / "state").mkdir()
-    alive = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    alive = sp.Popen([str(POWERSHELL), "-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
     try:
         (tmp_path / "state" / f"install_journal.restoring-{alive.pid}.json").write_text("{}", encoding="ascii")
         out = tick(tmp_path)
@@ -96,9 +96,24 @@ def test_a_live_restore_claim_makes_the_watchdog_stand_down_without_starting_the
         alive.wait()
 
 
-def test_installed_watchdog_finds_the_helper_beside_itself():
-    # MonClubAccess.iss installs update_helper.ps1 into {app}\watchdog, next to the script.
+def test_installed_watchdog_finds_the_helper_beside_itself(tmp_path: Path):
+    """Run it the INSTALLED way: script and helper side by side in {app}\\watchdog and no
+    -HelperPath. The E2E run found that default broken: $PSScriptRoot is empty inside a
+    param() default under Windows PowerShell 5.1, so every tick died."""
     iss = (REPO / "installer" / "MonClubAccess.iss").read_text(encoding="utf-8")
     assert 'Source: "update_helper.ps1"; DestDir: "{app}\\watchdog"' in iss
-    src = WATCHDOG.read_text(encoding="utf-8")
-    assert "Join-Path $PSScriptRoot 'update_helper.ps1'" in src
+    import shutil
+    wd = tmp_path / "watchdog"
+    wd.mkdir()
+    shutil.copy(WATCHDOG, wd / WATCHDOG.name)
+    shutil.copy(HELPER, wd / HELPER.name)
+    payload(tmp_path / "previous", "1.4.35")
+    (tmp_path / "current").mkdir()
+    journal(tmp_path, "copying", utc(-20))
+    r = subprocess.run([str(POWERSHELL), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                        str(wd / WATCHDOG.name), "-InstallRoot", str(tmp_path), "-WhatIfOnly"],
+                       capture_output=True, text=True, timeout=120)
+    log = tmp_path / "logs" / "watchdog.log"
+    out = log.read_text(encoding="utf-8-sig") if log.exists() else ""
+    assert "rolled back to previous" in out, out + r.stdout + r.stderr
+    assert (tmp_path / "current" / "MonClubAccess.exe").read_bytes() == b"exe 1.4.35"

@@ -90,7 +90,10 @@ param(
 
     # update_helper.ps1, installed beside this script by MonClubAccess.iss. A
     # parameter only so the tests can point it at installer/update_helper.ps1.
-    [string] $HelperPath = (Join-Path $PSScriptRoot 'update_helper.ps1')
+    # Empty = beside this script, resolved below: $PSScriptRoot is EMPTY inside a
+    # param() default under Windows PowerShell 5.1 (found by the E2E run: Join-Path
+    # threw and the whole tick died).
+    [string] $HelperPath = ''
 )
 
 Set-StrictMode -Version Latest
@@ -107,6 +110,9 @@ $LogPath      = Join-Path $LogDir      'watchdog.log'
 $StatePath    = Join-Path $LogDir      'watchdog-state.json'
 $SentinelPath = Join-Path $InstallRoot '.update-in-progress'
 $JournalPath  = Join-Path $InstallRoot 'state\install_journal.json'
+if ([string]::IsNullOrWhiteSpace($HelperPath)) {
+    $HelperPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'update_helper.ps1'
+}
 
 function Write-Log {
     param([string] $Level, [string] $Message)
