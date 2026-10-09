@@ -954,7 +954,9 @@ class TestInstallerWatchdogTask:
         files = _iss_section(text, "Files")
         for name in ("monclub_access_watchdog.ps1", "register_watchdog.ps1",
                      "monclub_access_watchdog_hidden.vbs"):
-            hits = [ln for ln in files if name in ln]
+            # A "Flags: dontcopy" entry is only extracted to {tmp} (updater v2: PrepareToInstall
+            # puts the new watchdog in place before the swap); it installs nothing.
+            hits = [ln for ln in files if name in ln and "dontcopy" not in ln]
             assert len(hits) == 1, f"{name}: {hits!r}"
             assert re.search(r'DestDir:\s*"\{app\}\\watchdog"', hits[0]), hits[0]
 
