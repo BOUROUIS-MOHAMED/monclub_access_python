@@ -25,6 +25,16 @@
 #define TauriExe "monclub-tv-ui.exe"
 #define DefaultInstallRoot "{localappdata}\MonClubTV"
 #define LegacyInstallRoot "{localappdata}\MonClub TV"
+; Inno's uninstall registry key for this AppId (HKCU, PrivilegesRequired=lowest).
+#define UninstallKeyName "{4A8D6A8A-7AC6-4C87-862D-2E5A6B644D27}_is1"
+; MonClub Access's key: the TV uninstall keeps the shared data while Access is installed (D26).
+#define OtherUninstallKeyName "{9B77A9C2-2B97-4F62-A9E8-4B4C65F3A9B1}_is1"
+
+#ifdef UPDATER_TEST_FAIL
+  ; Test-only build (build_installer.ps1 -TestFail). The file name says so, and
+  ; publish_github_release.ps1 refuses the release file such a build writes.
+  #define OutputBaseFilename OutputBaseFilename + "_TESTFAIL_" + UPDATER_TEST_FAIL
+#endif
 
 #define SetupIcon "assets\monclub_tv.ico"
 #define WizardImage "assets\wizard.bmp"
@@ -46,43 +56,72 @@ PrivilegesRequired=lowest
 UsePreviousAppDir=yes
 UsePreviousTasks=yes
 CloseApplications=yes
-CloseApplicationsFilter={#MainExe},{#TauriExe},MonClubTVUpdater.exe
+CloseApplicationsFilter={#MainExe},{#TauriExe}
 RestartApplications=no
 DisableProgramGroupPage=yes
+; D26: OVERWRITE the uninstall log instead of appending to it (Inno's default). Appending kept
+; every older version's entries -- 1.4.x recorded "[UninstallDelete] {commonappdata}\MonClub
+; Access" -- and an uninstall replays ALL of them, so the old whole-data-root delete still ran
+; even though this script no longer has it (E2E 2026-10-09, e2e\L2\21-*). Nothing is lost by
+; overwriting: [UninstallDelete] removes {app} entirely, neither installer ever had [Registry]
+; entries, and both shortcuts are listed in [UninstallDelete] in case an older install made
+; one whose task is unticked now.
+UninstallLogMode=overwrite
 OutputDir=..\release
 OutputBaseFilename={#OutputBaseFilename}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+; Always write Setup's log (%TEMP%\Setup Log <date> #<n>.txt), as /LOG would (D32): the 1.4.35
+; in-app update passes no /LOG. The v2 client passes /LOG=<install_root>\logs\update-<ver>-<ts>.log;
+; last_update.json records which file it was ("log").
+SetupLogging=yes
 
 [Tasks]
-Name: "startmenuicon"; Description: "Create a &Start Menu shortcut"; GroupDescription: "Additional icons:"; Flags: checkedonce
+; Start Menu shortcut: ticked for a new install; an existing install keeps its previous choice
+; (UsePreviousTasks=yes). NOT Flags: checkedonce -- it unticks a previously ticked task at every
+; update (Inno Setup source, Setup.WizardForm.pas, TWizardForm.CreateTaskButtons; D32, same fix
+; as MonClubAccess.iss).
+Name: "startmenuicon"; Description: "Create a &Start Menu shortcut"; GroupDescription: "Additional icons:"
 Name: "desktopicon"; Description: "Create a &Desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Dirs]
 Name: "{app}\current"
 Name: "{app}\downloads"
-Name: "{app}\downloads\windows"
-Name: "{app}\downloads\windows\stable"
-Name: "{app}\downloads\windows\beta"
 Name: "{app}\logs"
+Name: "{app}\state"
 
 [Files]
-Source: "{#StageDir}\*"; DestDir: "{app}\current"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Safe-swap helper (updater v2), extracted to {tmp} for Setup's own use.
+Source: "update_helper.ps1"; Flags: dontcopy
+; version.json and then the exe are copied LAST (Inno installs [Files] in script order): if
+; power is cut during the copy, a present exe means the whole payload is there, and a
+; version.json without the exe is never taken for an installed version (review #3 / #5).
+Source: "{#StageDir}\*"; Excludes: "\{#MainExe},\version.json"; DestDir: "{app}\current"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#StageDir}\version.json"; DestDir: "{app}\current"; Flags: ignoreversion
+Source: "{#StageDir}\{#MainExe}"; DestDir: "{app}\current"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\MonClubTV"; Filename: "{app}\current\{#MainExe}"; Tasks: startmenuicon
 Name: "{userdesktop}\MonClubTV"; Filename: "{app}\current\{#MainExe}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\current\{#MainExe}"; Description: "Launch MonClub TV"; Flags: nowait postinstall
+; Interactive installs only. A silent install/update starts the app itself in ssPostInstall
+; (update_safety.iss) and waits for it to prove it is healthy, rolling back if not.
+Filename: "{app}\current\{#MainExe}"; Description: "Launch MonClub TV"; Flags: nowait postinstall; Check: not WizardSilent
 
 [UninstallDelete]
+Type: files; Name: "{userprograms}\MonClubTV.lnk"
+Type: files; Name: "{userdesktop}\MonClubTV.lnk"
+Type: filesandordirs; Name: "{app}\previous"
+Type: filesandordirs; Name: "{app}\current.failed"
+Type: filesandordirs; Name: "{app}\state"
+Type: filesandordirs; Name: "{app}\downloads"
 Type: filesandordirs; Name: "{app}"
-Type: filesandordirs; Name: "{commonappdata}\MonClub TV"
-Type: filesandordirs; Name: "{localappdata}\MonClub TV"
-Type: filesandordirs; Name: "{userappdata}\MonClub TV"
-Type: filesandordirs; Name: "{userappdata}\MonClubTV"
+; D26: TV's data is NOT in "MonClub TV" folders (nothing reads them). It lives in the data
+; root SHARED with MonClub Access (app/core/utils.py DATA_ROOT = {commonappdata}\MonClub Access,
+; else {localappdata}\MonClub Access), sub-folder tv\ -- removed in
+; CurUninstallStepChanged(usPostUninstall).
 
 [Code]
 const
@@ -225,19 +264,6 @@ begin
   Log('Ensuring MonClub TV processes are stopped...');
   ExecAndLog('taskkill /F /T /IM "{#MainExe}"');
   ExecAndLog('taskkill /F /T /IM "{#TauriExe}"');
-  ExecAndLog('taskkill /F /T /IM "MonClubTVUpdater.exe"');
-end;
-
-procedure DeleteTreeIfExists(const PathValue: string);
-begin
-  if DirExists(PathValue) then
-  begin
-    Log('Deleting directory tree: ' + PathValue);
-    if DelTree(PathValue, True, True, True) then
-      Log('Deleted: ' + PathValue)
-    else
-      Log('Delete failed or partially failed: ' + PathValue);
-  end;
 end;
 
 function IsWebView2RuntimePresent(var Version: string): Boolean;
@@ -335,6 +361,8 @@ begin
     RuntimeCheckStatusLabel.Caption := 'Status: ready to install.';
 end;
 
+#include "update_safety.iss"
+
 function InitializeSetup(): Boolean;
 begin
   ExistingInstallRoot := DetectExistingInstallRoot();
@@ -343,14 +371,12 @@ begin
   if ExistingInstallDetected then
     TryReadInstalledVersion(ExistingInstallRoot, ExistingInstallVersion);
 
-  if SameVersionInstalled() then
+  // Same version only when current\ really holds it (exe + version.json, no leftover journal):
+  // a re-run installer must be able to repair a half-written current\ (review #5).
+  if SameVersionInstalled() and UpdCurrentComplete(ExistingInstallRoot) then
   begin
-    MsgBox(
-      'MonClub TV version ' + '{#AppVersion}' + ' is already installed on this PC.' + #13#10 +
-      'Nothing will be changed.',
-      mbInformation,
-      MB_OK
-    );
+    // D22: silent -> no box, ABORTED same_version, app relaunched (update_safety.iss).
+    UpdHandleSameVersion();
     Result := False;
     exit;
   end;
@@ -413,13 +439,74 @@ begin
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Root: string;
 begin
-  Result := '';
+  // NeedsRestart is never set: the 1.4.35 client starts Setup without /NORESTART.
+  Root := RemoveBackslashUnlessRoot(ExpandConstant('{app}'));
+  UpdSetPauseSentinel(Root);
 
   KillRunningMonClubProcesses();
   Sleep(900);
 
-  DeleteTreeIfExists(ExpandConstant('{app}\current'));
+  // Back up current\ -> previous\ and empty current\ (never DelTree it, D21). On failure the
+  // old app is restarted, ABORTED is recorded and Setup stops here.
+  Result := UpdPrepareBackup();
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    UpdPostInstall();
+end;
+
+procedure DeinitializeSetup();
+begin
+  UpdDeinitialize();
+end;
+
+function OtherProductInstalled(): Boolean;
+begin
+  Result := RegKeyExists(HKEY_CURRENT_USER, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#OtherUninstallKeyName}') or
+            RegKeyExists(HKEY_LOCAL_MACHINE, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#OtherUninstallKeyName}');
+end;
+
+procedure DeleteDataDir(const PathValue: string);
+begin
+  if DirExists(PathValue) then
+  begin
+    if DelTree(PathValue, True, True, True) then
+      Log('Deleted data: ' + PathValue)
+    else
+      Log('Could not fully delete data: ' + PathValue);
+  end;
+end;
+
+// D26. TV's own data is DATA_ROOT\tv (tv/storage.py: tv.db, config; app/core/tv_local_cache.py:
+// tv\media) -- always TV's, always removed. DATA_ROOT\shared (install.json, single-instance
+// locks) is shared with Access: removed only when Access is not installed. Everything else
+// under the root is Access's and is never deleted here; empty folders TV's start-up created
+// (ensure_dirs) are removed when they are empty, and the root when it is empty.
+procedure RemoveTvData(const Root: string);
+begin
+  if not DirExists(Root) then exit;
+  DeleteDataDir(AddBackslash(Root) + 'tv');
+  if OtherProductInstalled() then
+  begin
+    Log('MonClub Access is installed: keeping the shared data under ' + Root);
+    exit;
+  end;
+  DeleteDataDir(AddBackslash(Root) + 'shared');
+  // RemoveDir only removes EMPTY folders: Access data, if any, is never touched.
+  RemoveDir(AddBackslash(Root) + 'data\logs');
+  RemoveDir(AddBackslash(Root) + 'data\cache\images');
+  RemoveDir(AddBackslash(Root) + 'data\cache');
+  RemoveDir(AddBackslash(Root) + 'data');
+  RemoveDir(AddBackslash(Root) + 'access\logs');
+  RemoveDir(AddBackslash(Root) + 'access');
+  RemoveDir(AddBackslash(Root) + 'backups');
+  RemoveDir(AddBackslash(Root) + 'versions');
+  if RemoveDir(Root) then Log('Removed empty data root ' + Root);
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -428,5 +515,10 @@ begin
   begin
     KillRunningMonClubProcesses();
     Sleep(900);
+  end;
+  if CurUninstallStep = usPostUninstall then
+  begin
+    RemoveTvData(ExpandConstant('{commonappdata}\MonClub Access'));
+    RemoveTvData(ExpandConstant('{localappdata}\MonClub Access'));
   end;
 end;

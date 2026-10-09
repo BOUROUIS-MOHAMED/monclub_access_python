@@ -22,8 +22,6 @@ function Get-DesktopComponentMetadata {
         UiExeName = "monclub-access-ui.exe"
         UiStagingDir = ".\tauri-ui\component-shells\MonClubAccess"
         DefaultInstallRootName = "MonClubAccess"
-        UpdaterInstalledExe = "MonClubAccessUpdater.exe"
-        UpdaterSourceExe = "MonClubDesktopUpdater.exe"
         RequiresSdkDlls = $true
         Requires32BitPython = $true
       }
@@ -41,8 +39,6 @@ function Get-DesktopComponentMetadata {
         UiExeName = "monclub-tv-ui.exe"
         UiStagingDir = ".\tauri-ui\component-shells\MonClubTV"
         DefaultInstallRootName = "MonClubTV"
-        UpdaterInstalledExe = "MonClubTVUpdater.exe"
-        UpdaterSourceExe = "MonClubDesktopUpdater.exe"
         RequiresSdkDlls = $false
         Requires32BitPython = $false
       }

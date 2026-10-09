@@ -137,11 +137,6 @@ monclub_access_python/
 │   │   └── monclub_logo.png
 │   └── *.iss                      # Installer scripts
 │
-├── updater/                       # .NET 8.0 updater executable
-│   └── MonClubAccessUpdater/
-│       └── bin/Release/net8.0/win-x64/
-│           └── MonClubAccessUpdater.exe
-│
 ├── build/                         # Build artifacts
 ├── dist/                          # Distribution packages
 ├── release/                       # Release builds
@@ -297,13 +292,10 @@ monclub_access_python/
 **Purpose:** Check for and install application updates.
 
 **Workflow:**
-1. Periodically check GitHub releases
-2. Compare local version with latest
-3. Download installer if newer version available
-4. Launch `.NET updater` executable
-5. Updater installs and restarts app
-
-**Updater Location:** `updater/MonClubAccessUpdater/bin/Release/net8.0/win-x64/`
+Updates are full Inno Setup installers, run silently (updater v2; the .NET zip updater was
+deleted). The installer backs up `current\` to `previous\`, installs, starts the new version and
+rolls back if it does not report healthy; see `installer/update_safety.iss` and the updater v2
+design (MonClub docs, `access-updater-v2/design.md`).
 
 ### 4.9 Logging & Diagnostics
 

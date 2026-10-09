@@ -11,6 +11,13 @@ param(
 
   [switch]$SkipTauriBuild,
 
+  # Passed through to build_release.ps1 (see its parameters).
+  [switch]$SkipTests,
+  [switch]$E2ETestKeys,
+  [string]$SigningKeyId = "",
+  [string]$ReleaseNotesFile = "",
+  [string]$SignTool = "",
+
   [switch]$DryRun
 )
 
@@ -50,6 +57,11 @@ function Invoke-ReleaseBuild([string]$TargetComponent, [string]$ResolvedReleaseI
   if ($SkipTauriBuild) {
     $args += "-SkipTauriBuild"
   }
+  if ($SkipTests) { $args += "-SkipTests" }
+  if ($E2ETestKeys) { $args += "-E2ETestKeys" }
+  if ($SigningKeyId) { $args += @("-SigningKeyId", $SigningKeyId) }
+  if ($ReleaseNotesFile) { $args += @("-ReleaseNotesFile", $ReleaseNotesFile) }
+  if ($SignTool) { $args += @("-SignTool", $SignTool) }
   if ($DryRun) {
     $args += "-DryRun"
   }
@@ -61,22 +73,6 @@ function Invoke-ReleaseBuild([string]$TargetComponent, [string]$ResolvedReleaseI
   & powershell @args
   if ($LASTEXITCODE -ne 0) {
     throw "build_release.ps1 failed for $TargetComponent with exit code $LASTEXITCODE"
-  }
-}
-
-function Invoke-InstallerBuild([string]$TargetComponent) {
-  $args = @(
-    "-ExecutionPolicy", "Bypass",
-    "-File", (Join-Path $ROOT "build_installer.ps1"),
-    "-Component", $TargetComponent
-  )
-  if ($DryRun) {
-    $args += "-DryRun"
-  }
-
-  & powershell @args
-  if ($LASTEXITCODE -ne 0) {
-    throw "build_installer.ps1 failed for $TargetComponent with exit code $LASTEXITCODE"
   }
 }
 
@@ -108,17 +104,10 @@ foreach ($targetComponent in $components) {
   $targetMeta = Get-DesktopComponentMetadata -Component $targetComponent
   $versionInfo = Get-DesktopComponentVersionInfo -Component $targetComponent
 
-  Invoke-Step -Name ("Build release payload ({0})" -f $targetMeta.DisplayName) -Action {
+  # build_release.ps1 runs the gates, builds the payload, compiles the installer and writes
+  # the signed release file (release\release-<component>-<version>.json).
+  Invoke-Step -Name ("Build, package and sign ({0})" -f $targetMeta.DisplayName) -Action {
     Invoke-ReleaseBuild -TargetComponent $targetComponent -ResolvedReleaseId $ReleaseId
-  }
-
-  Invoke-Step -Name ("Build unified installer ({0})" -f $targetMeta.DisplayName) -Action {
-    if ($DryRun) {
-      $expectedPath = Join-Path $ROOT ("release\{0}" -f $versionInfo.InstallerFileName)
-      Write-Host ("DryRun installer target: {0}" -f $expectedPath) -ForegroundColor Yellow
-    } else {
-      Invoke-InstallerBuild -TargetComponent $targetComponent
-    }
   }
 }
 

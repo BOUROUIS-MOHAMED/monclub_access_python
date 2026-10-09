@@ -7,9 +7,9 @@ a human restarts it.
 
 Its two failure modes are opposite and both bad:
 
-  * restarting at the WRONG time -- racing the Inno Setup installer
-    (KillRunningMonClubProcesses) or MonClubAccessUpdater.exe while they are
-    swapping current\\ -- which can lock files mid-swap and break the update;
+  * restarting at the WRONG time -- racing the Inno Setup installer while it
+    swaps current\\ (updater v2: back up, refill, health wait) -- which can lock
+    files mid-swap and break the update;
   * standing down when it SHOULDN'T, which silently defeats the whole feature.
 
 The second is what these tests mostly guard. The installer-detection heuristic
@@ -275,7 +275,7 @@ class TestInstallerDetectionIsNarrow:
         "SetupHost",                      # runs for the whole of a Windows Update
         "vcredist_setup",
         "MonClubAccess",                  # the app itself
-        "MonClubAccessUpdater",           # handled by its own guard, not this one
+        "MonClubAccessUpdater",           # the deleted zip updater: not our installer
     ])
     def test_unrelated_processes_are_not_mistaken_for_our_installer(self, name: str):
         assert _installer_match(name) is False, (
@@ -283,7 +283,9 @@ class TestInstallerDetectionIsNarrow:
             f"watchdog down while the app is dead"
         )
 
-    @pytest.mark.parametrize("name", ["monclub_access", "monclub_access_1.4.33"])
+    # The last one: Inno runs the real setup work as %TEMP%\is-*.tmp\monclub_access_<ver>.tmp.
+    @pytest.mark.parametrize("name", ["monclub_access", "monclub_access_1.4.33", "monclub_access_1.5.0.tmp",
+                                      "monclub_access_1.5.1_TESTFAIL_health"])
     def test_our_own_installer_is_still_detected(self, name: str):
         assert _installer_match(name) is True
 
@@ -952,7 +954,9 @@ class TestInstallerWatchdogTask:
         files = _iss_section(text, "Files")
         for name in ("monclub_access_watchdog.ps1", "register_watchdog.ps1",
                      "monclub_access_watchdog_hidden.vbs"):
-            hits = [ln for ln in files if name in ln]
+            # A "Flags: dontcopy" entry is only extracted to {tmp} (updater v2: PrepareToInstall
+            # puts the new watchdog in place before the swap); it installs nothing.
+            hits = [ln for ln in files if name in ln and "dontcopy" not in ln]
             assert len(hits) == 1, f"{name}: {hits!r}"
             assert re.search(r'DestDir:\s*"\{app\}\\watchdog"', hits[0]), hits[0]
 
@@ -961,6 +965,9 @@ class TestInstallerWatchdogTask:
         stage = tmp_path / "stage" / "MonClubAccess"
         stage.mkdir(parents=True)
         (stage / "MonClubAccess.exe").write_text("stub")
+        (stage / "version.json").write_text('{"version": "0.0.0-test"}')  # build_installer.ps1 requires it
+        (stage / "_internal").mkdir()
+        (stage / "_internal" / "base_library.zip").write_text("stub")
         out = subprocess.run(
             [_iscc(), f"/O{tmp_path / 'out'}", "/DAppVersion=0.0.0-test",
              f"/DStageDir={stage}", "/DOutputBaseFilename=compile_test", str(INSTALLER)],

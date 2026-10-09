@@ -25,6 +25,16 @@
 #define TauriExe "monclub-access-ui.exe"
 #define DefaultInstallRoot "{localappdata}\MonClubAccess"
 #define LegacyInstallRoot "{localappdata}\MonClub Access"
+; Inno's uninstall registry key for this AppId (HKCU, PrivilegesRequired=lowest).
+#define UninstallKeyName "{9B77A9C2-2B97-4F62-A9E8-4B4C65F3A9B1}_is1"
+; MonClub TV's key: the Access uninstall keeps TV's data while TV is installed (D26).
+#define OtherUninstallKeyName "{4A8D6A8A-7AC6-4C87-862D-2E5A6B644D27}_is1"
+
+#ifdef UPDATER_TEST_FAIL
+  ; Test-only build (build_installer.ps1 -TestFail). The file name says so, and
+  ; publish_github_release.ps1 refuses the release file such a build writes.
+  #define OutputBaseFilename OutputBaseFilename + "_TESTFAIL_" + UPDATER_TEST_FAIL
+#endif
 
 ; Branding assets (relative to this .iss file)
 #define SetupIcon "assets\setup.ico"
@@ -47,18 +57,27 @@ PrivilegesRequired=lowest
 UsePreviousAppDir=yes
 UsePreviousTasks=yes
 CloseApplications=yes
-CloseApplicationsFilter={#MainExe},{#TauriExe},MonClubAccessUpdater.exe
+CloseApplicationsFilter={#MainExe},{#TauriExe}
 RestartApplications=no
 DisableProgramGroupPage=yes
+; D26: OVERWRITE the uninstall log instead of appending to it (Inno's default). Appending kept
+; every older version's entries -- 1.4.x recorded "[UninstallDelete] {commonappdata}\MonClub
+; Access" -- and an uninstall replays ALL of them, so the old whole-data-root delete still ran
+; even though this script no longer has it (E2E 2026-10-09, e2e\L2\21-*). Nothing is lost by
+; overwriting: [UninstallDelete] removes {app} entirely, neither installer ever had [Registry]
+; entries, and both shortcuts are listed in [UninstallDelete] in case an older install made
+; one whose task is unticked now.
+UninstallLogMode=overwrite
 OutputDir=..\release
 OutputBaseFilename={#OutputBaseFilename}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 ; Always write Setup's log (%TEMP%\Setup Log <date> #<n>.txt), as /LOG would. The
-; in-app update starts this installer with /VERYSILENT and no /LOG
-; (shared/update_runtime.py), so without it a silent update left no log at all --
-; including the watchdog registration's output ([Run], Flags: logoutput).
+; 1.4.35 in-app update starts this installer with /VERYSILENT and no /LOG, so without it a
+; silent update left no log at all -- including the watchdog registration's output ([Run],
+; Flags: logoutput). The v2 client passes /LOG=<install_root>\logs\update-<ver>-<ts>.log;
+; last_update.json records which file it was ("log").
 SetupLogging=yes
 
 [Tasks]
@@ -92,19 +111,31 @@ Name: "watchdog"; Description: "Keep MonClub Access running (start at logon, res
 [Dirs]
 Name: "{app}\current"
 Name: "{app}\downloads"
-Name: "{app}\downloads\windows"
-Name: "{app}\downloads\windows\stable"
-Name: "{app}\downloads\windows\beta"
 Name: "{app}\logs"
+Name: "{app}\state"
 
 [Files]
-Source: "{#StageDir}\*"; DestDir: "{app}\current"; Flags: ignoreversion recursesubdirs createallsubdirs
-; Watchdog scripts live OUTSIDE current\ on purpose: the updater deletes and
-; re-creates current\ wholesale, and the scheduled task's action path must stay
-; valid across an update.
+; Safe-swap helper (updater v2): extracted to {tmp} for Setup's own use (dontcopy) ...
+Source: "update_helper.ps1"; Flags: dontcopy
+; The new watchdog is also extracted (dontcopy) and put in place by PrepareToInstall BEFORE
+; current\ is emptied: on the 1.4.35 -> 1.5.0 hop, a power cut in the copy would otherwise leave
+; the OLD watchdog -- no journal rule -- standing down for ever on "exe missing" (review #3).
+Source: "..\packaging\watchdog\monclub_access_watchdog.ps1"; Flags: dontcopy
+; Watchdog scripts live OUTSIDE current\ on purpose: an update empties and refills
+; current\ (and a rollback refills it again), and the scheduled task's action path must
+; stay valid across both.
 Source: "..\packaging\watchdog\monclub_access_watchdog.ps1"; DestDir: "{app}\watchdog"; Flags: ignoreversion
 Source: "..\packaging\watchdog\register_watchdog.ps1";       DestDir: "{app}\watchdog"; Flags: ignoreversion
 Source: "..\packaging\watchdog\monclub_access_watchdog_hidden.vbs"; DestDir: "{app}\watchdog"; Flags: ignoreversion
+; ... and installed beside the watchdog, which applies the install-journal rule with it
+; (design section 8 step 12).
+Source: "update_helper.ps1"; DestDir: "{app}\watchdog"; Flags: ignoreversion
+; version.json and then the exe are copied LAST (Inno installs [Files] in script order): if
+; power is cut during the copy, a present exe means the whole payload is there, and a
+; version.json without the exe is never taken for an installed version (review #3 / #5).
+Source: "{#StageDir}\*"; Excludes: "\{#MainExe},\version.json"; DestDir: "{app}\current"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#StageDir}\version.json"; DestDir: "{app}\current"; Flags: ignoreversion
+Source: "{#StageDir}\{#MainExe}"; DestDir: "{app}\current"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\MonClubAccess"; Filename: "{app}\current\{#MainExe}"; Tasks: startmenuicon
@@ -126,7 +157,9 @@ Filename: "powershell.exe"; \
   Flags: runhidden runascurrentuser waituntilterminated logoutput; \
   Tasks: watchdog
 
-Filename: "{app}\current\{#MainExe}"; Description: "Launch MonClub Access"; Flags: nowait postinstall
+; Interactive installs only. A silent install/update starts the app itself in ssPostInstall
+; (update_safety.iss) and waits for it to prove it is healthy, rolling back if not.
+Filename: "{app}\current\{#MainExe}"; Description: "Launch MonClub Access"; Flags: nowait postinstall; Check: not WizardSilent
 
 [UninstallRun]
 ; Remove the scheduled task before {app} disappears, otherwise Task Scheduler is
@@ -137,11 +170,18 @@ Filename: "powershell.exe"; \
   RunOnceId: "RemoveMonClubWatchdog"
 
 [UninstallDelete]
+Type: files; Name: "{userprograms}\MonClubAccess.lnk"
+Type: files; Name: "{userdesktop}\MonClubAccess.lnk"
+Type: filesandordirs; Name: "{app}\previous"
+Type: filesandordirs; Name: "{app}\current.failed"
+Type: filesandordirs; Name: "{app}\state"
+Type: filesandordirs; Name: "{app}\downloads"
 Type: filesandordirs; Name: "{app}"
-Type: filesandordirs; Name: "{commonappdata}\MonClub Access"
-Type: filesandordirs; Name: "{localappdata}\MonClub Access"
 Type: filesandordirs; Name: "{userappdata}\MonClub Access"
 Type: filesandordirs; Name: "{userappdata}\MonClubAccess"
+; The DATA root ({commonappdata}\MonClub Access, else {localappdata}\MonClub Access --
+; app/core/utils.py::_candidate_data_roots) is SHARED with MonClub TV: it is removed in
+; CurUninstallStepChanged(usPostUninstall), keeping TV's part while TV is installed (D26).
 
 [Code]
 const
@@ -294,19 +334,6 @@ begin
   Log('Ensuring MonClub Access processes are stopped...');
   ExecAndLog('taskkill /F /T /IM "{#MainExe}"');
   ExecAndLog('taskkill /F /T /IM "{#TauriExe}"');
-  ExecAndLog('taskkill /F /T /IM "MonClubAccessUpdater.exe"');
-end;
-
-procedure DeleteTreeIfExists(const PathValue: string);
-begin
-  if DirExists(PathValue) then
-  begin
-    Log('Deleting directory tree: ' + PathValue);
-    if DelTree(PathValue, True, True, True) then
-      Log('Deleted: ' + PathValue)
-    else
-      Log('Delete failed or partially failed: ' + PathValue);
-  end;
 end;
 
 function ZkemkeeperClsid(): string;
@@ -402,6 +429,21 @@ begin
   else
     Regsvr := ExpandConstant('{sys}\regsvr32.exe');
 
+  // SILENT (in-app update): never 'runas'. A UAC prompt nobody answers blocked the whole
+  // silent update -- and the relaunch -- on PullSDK-only PCs that never had zkemkeeper
+  // registered (D23). A PC where it IS registered never gets here: the registration points
+  // at {app}\current\sdk\zkemkeeper.dll, the update refills that same path, and the
+  // ZkemkeeperIsRegistered check above returns before this line. Nothing in the app
+  // registers it later (there is no regsvr32 call in app/, shared/ or tv/), so a PC that
+  // needs it must run this installer interactively once, or the regsvr32 line as admin.
+  if WizardSilent() then
+  begin
+    Log('ZKEMKeeper COM is NOT registered and this is a silent install: not elevating. ' +
+        'MB2000-class terminals need it; run the installer interactively once, or as admin: ' +
+        Regsvr + ' /s "' + DllPath + '"');
+    Exit;
+  end;
+
   // Three separate defects are fixed here. All three had to be, because each
   // one alone was enough to stop a fingerprint turnstile from ever working:
   //
@@ -482,6 +524,14 @@ begin
     Regsvr := ExpandConstant('{syswow64}\regsvr32.exe')
   else
     Regsvr := ExpandConstant('{sys}\regsvr32.exe');
+
+  // Never raise a UAC prompt in a silent uninstall (nobody is there to answer it). The
+  // CLSID then points at a deleted file, which ZkemkeeperIsRegistered treats as unregistered.
+  if UninstallSilent() then
+  begin
+    Log('ZKEMKeeper: silent uninstall -- not elevating to unregister ' + DllPath);
+    Exit;
+  end;
 
   // Best-effort only: an uninstall must not stall on a declined UAC prompt.
   if ShellExec('runas', Regsvr, '/s /u "' + DllPath + '"', '',
@@ -659,6 +709,8 @@ begin
     RuntimeCheckStatusLabel.Caption := 'Status: ready to install.';
 end;
 
+#include "update_safety.iss"
+
 function InitializeSetup(): Boolean;
 begin
   ExistingInstallRoot := DetectExistingInstallRoot();
@@ -667,14 +719,12 @@ begin
   if ExistingInstallDetected then
     TryReadInstalledVersion(ExistingInstallRoot, ExistingInstallVersion);
 
-  if SameVersionInstalled() then
+  // Same version only when current\ really holds it (exe + version.json, no leftover journal):
+  // a re-run installer must be able to repair a half-written current\ (review #5).
+  if SameVersionInstalled() and UpdCurrentComplete(ExistingInstallRoot) then
   begin
-    MsgBox(
-      'MonClub Access version ' + '{#AppVersion}' + ' is already installed on this PC.' + #13#10 +
-      'Nothing will be changed.',
-      mbInformation,
-      MB_OK
-    );
+    // D22: silent -> no box, ABORTED same_version, app relaunched (update_safety.iss).
+    UpdHandleSameVersion();
     Result := False;
     exit;
   end;
@@ -738,50 +788,41 @@ begin
   end;
 end;
 
-function PauseSentinelPath(): string;
+// Review #3: the journal-aware watchdog and its helper must be in {app}\watchdog before
+// current\ is touched (on an update from 1.4.x the old watchdog has no journal rule).
+procedure InstallWatchdogEarly(const Root: string);
+var
+  Dir: string;
 begin
-  Result := ExpandConstant('{app}\.update-in-progress');
-end;
-
-procedure SetPauseSentinel();
-begin
-  // The watchdog scheduled task (Tasks: watchdog) restarts MonClub Access when it
-  // finds it not running. KillRunningMonClubProcesses is about to make exactly
-  // that true, for several minutes, while current\ is deleted and rewritten. If
-  // the watchdog fired in that window it would relaunch the app from a half-
-  // replaced current\ and hold file locks that break this install.
-  //
-  // Drop a sentinel the watchdog stands down on. It ages out after 30 minutes on
-  // the watchdog side, so an install that crashes before ssPostInstall cannot
-  // disable recovery permanently.
-  ForceDirectories(ExpandConstant('{app}'));
-  if SaveStringToFile(PauseSentinelPath(), 'install in progress', False) then
-    Log('Pause sentinel written: ' + PauseSentinelPath())
+  Dir := AddBackslash(Root) + 'watchdog';
+  if not DirExists(Dir) then exit;   // fresh install: [Files] puts them there
+  ExtractTemporaryFile('monclub_access_watchdog.ps1');
+  if FileCopy(UpdHelperPath(), Dir + '\update_helper.ps1', False) and
+     FileCopy(ExpandConstant('{tmp}\monclub_access_watchdog.ps1'), Dir + '\monclub_access_watchdog.ps1', False) then
+    Log('Watchdog + update_helper updated in ' + Dir + ' before the swap')
   else
-    Log('WARNING: could not write pause sentinel: ' + PauseSentinelPath());
-end;
-
-procedure ClearPauseSentinel();
-begin
-  if FileExists(PauseSentinelPath()) then
-  begin
-    if DeleteFile(PauseSentinelPath()) then
-      Log('Pause sentinel cleared.')
-    else
-      Log('WARNING: could not delete pause sentinel; it will age out on its own.');
-  end;
+    Log('WARNING: could not update ' + Dir + ' before the swap');
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Root: string;
 begin
-  Result := '';
+  // NeedsRestart is never set: the 1.4.35 client starts Setup without /NORESTART.
+  Root := RemoveBackslashUnlessRoot(ExpandConstant('{app}'));
 
-  SetPauseSentinel();
+  // The watchdog stands down on this sentinel while Setup stops the app, swaps current\
+  // and waits for the new version (it ages out after 30 min on the watchdog side).
+  UpdSetPauseSentinel(Root);
 
   KillRunningMonClubProcesses();
   Sleep(900);
 
-  DeleteTreeIfExists(ExpandConstant('{app}\current'));
+  InstallWatchdogEarly(Root);
+
+  // Back up current\ -> previous\ and empty current\ (never DelTree it, D21). On failure the
+  // old app is restarted, ABORTED is recorded and Setup stops here.
+  Result := UpdPrepareBackup();
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -789,9 +830,52 @@ begin
   if CurStep = ssPostInstall then
   begin
     RegisterZkemkeeper();
-    // Hand control back to the watchdog only once the new current\ is in place.
-    ClearPauseSentinel();
+    // Health wait / rollback / result, then the sentinel is cleared (update_safety.iss).
+    UpdPostInstall();
   end;
+end;
+
+procedure DeinitializeSetup();
+begin
+  UpdDeinitialize();
+end;
+
+function OtherProductInstalled(): Boolean;
+begin
+  Result := RegKeyExists(HKEY_CURRENT_USER, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#OtherUninstallKeyName}') or
+            RegKeyExists(HKEY_LOCAL_MACHINE, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#OtherUninstallKeyName}');
+end;
+
+procedure DeleteDataDir(const PathValue: string);
+begin
+  if DirExists(PathValue) then
+  begin
+    if DelTree(PathValue, True, True, True) then
+      Log('Deleted data: ' + PathValue)
+    else
+      Log('Could not fully delete data: ' + PathValue);
+  end;
+end;
+
+// D26. The data root is shared with MonClub TV (app/core/utils.py DATA_ROOT). TV keeps its
+// own data in DATA_ROOT\tv (tv/storage.py, app/core/tv_local_cache.py) and both apps use
+// DATA_ROOT\shared (install.json, single-instance locks). Access owns data\ (legacy combined
+// app.db -- which TV only READS to import the login, tv/auth_bridge.py -- logs, cache),
+// access\ (access.db, erase backups), backups\ and versions\. While TV is installed only
+// those go; otherwise the whole root, as before.
+procedure RemoveAccessData(const Root: string);
+begin
+  if not DirExists(Root) then exit;
+  if OtherProductInstalled() then
+  begin
+    Log('MonClub TV is installed: removing only the Access data under ' + Root);
+    DeleteDataDir(AddBackslash(Root) + 'data');
+    DeleteDataDir(AddBackslash(Root) + 'access');
+    DeleteDataDir(AddBackslash(Root) + 'backups');
+    DeleteDataDir(AddBackslash(Root) + 'versions');
+  end
+  else
+    DeleteDataDir(Root);
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -800,12 +884,17 @@ begin
   begin
     // Stop the watchdog from resurrecting the app we are about to remove.
     // [UninstallRun] unregisters the task, but that runs after this step.
-    SetPauseSentinel();
+    UpdSetPauseSentinel(RemoveBackslashUnlessRoot(ExpandConstant('{app}')));
 
     // Drop our own COM registration before {app} is deleted, otherwise the
     // CLSID is left pointing at a file that no longer exists.
     UnregisterZkemkeeper();
     KillRunningMonClubProcesses();
     Sleep(900);
+  end;
+  if CurUninstallStep = usPostUninstall then
+  begin
+    RemoveAccessData(ExpandConstant('{commonappdata}\MonClub Access'));
+    RemoveAccessData(ExpandConstant('{localappdata}\MonClub Access'));
   end;
 end;
