@@ -278,3 +278,40 @@ def test_the_uninstall_log_is_overwritten_so_old_data_deletes_do_not_replay(iss)
     assert not re.search(r"^\[Registry\]", src, re.M)  # overwrite is only safe without them
     ud = section(src, "UninstallDelete")
     assert 'Type: filesandordirs; Name: "{app}"' in ud
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell parser")
+def test_every_tracked_powershell_script_parses_and_has_no_lone_cr():
+    """Review finding: an edit turned '\r' of 'release\release-' into a CR byte; PowerShell
+    reads a lone CR as a line break and generate_installer.ps1 stopped parsing at all."""
+    # The scripts that build, install or run MonClub (not third-party tooling under .specify/).
+    files = [f for f in subprocess.run(["git", "ls-files", "*.ps1"], cwd=REPO, capture_output=True,
+                                       text=True).stdout.split()
+             if "/" not in f or f.split("/")[0] in ("installer", "packaging", "tools")]
+    assert "generate_installer.ps1" in files and "installer/update_helper.ps1" in files
+    for f in files:
+        data = (REPO / f).read_bytes()
+        assert data.replace(b"\r\n", b"").count(b"\r") == 0, f"{f}: lone CR byte"
+    assert parse_errors([REPO / f for f in files]) == []
+
+
+def parse_errors(paths) -> list[str]:
+    import tempfile
+    script = ("foreach ($f in $args) { $e = $null; "
+              "[void][System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$null, [ref]$e); "
+              "if ($e.Count) { Write-Output (\"$f : \" + $e[0].Message + ' @ ' + $e[0].Extent.StartLineNumber) } }")
+    with tempfile.TemporaryDirectory() as d:
+        checker = Path(d) / "parse_check.ps1"
+        checker.write_text(script, encoding="utf-8")
+        out = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(checker),
+                              *[str(p) for p in paths]], capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr
+    return [ln for ln in out.stdout.splitlines() if ln.strip()]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell parser")
+def test_the_parse_check_itself_catches_a_broken_script(tmp_path):
+    bad = tmp_path / "bad.ps1"
+    # Exactly the broken generate_installer.ps1 comment: the "\r" of "release\release" became a CR.
+    bad.write_bytes(b"# the signed release file (release" + bytes([13]) + b"elease-<component>.json)\r\n$x = 1\r\n")
+    assert len(parse_errors([bad])) == 1

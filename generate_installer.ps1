@@ -105,7 +105,7 @@ foreach ($targetComponent in $components) {
   $versionInfo = Get-DesktopComponentVersionInfo -Component $targetComponent
 
   # build_release.ps1 runs the gates, builds the payload, compiles the installer and writes
-  # the signed release file (releaseelease-<component>-<version>.json).
+  # the signed release file (release\release-<component>-<version>.json).
   Invoke-Step -Name ("Build, package and sign ({0})" -f $targetMeta.DisplayName) -Action {
     Invoke-ReleaseBuild -TargetComponent $targetComponent -ResolvedReleaseId $ReleaseId
   }
