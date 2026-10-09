@@ -362,3 +362,31 @@ def test_a_failed_restore_is_retried_once_keeps_the_journal_and_still_relaunches
     # Only a live restorer's claim skips the relaunch (that restorer starts the app).
     rip = prep[prep.index("'restore_in_progress'"):prep.index("if not PathHasInstalledPayload")]
     assert "UpdRelaunch" not in rip
+
+
+def test_no_native_command_redirects_stderr_under_stop_in_the_build_and_publish_scripts():
+    """L4's first real build_release run died at "python -c 'import pytest' 2>$null": under
+    $ErrorActionPreference = "Stop", Windows PowerShell 5.1 turns a native command's redirected stderr
+    into a terminating error. Native probes go through Invoke-NativeProbe."""
+    import re as _re
+
+    bad = _re.compile(r"^\s*(?:\$\w+\s*=\s*@?\(?)?(python|py|git|gh|npm|npx|cargo|robocopy|iscc)\b[^#\n]*2>(\$null|&1)", _re.I | _re.M)
+    for name in ("build_release.ps1", "publish_github_release.ps1", "build_installer.ps1"):
+        text = (REPO / name).read_text(encoding="utf-8")
+        assert not bad.findall(text), name
+    assert "function Invoke-NativeProbe" in (REPO / "build_release.ps1").read_text(encoding="utf-8")
+
+
+def test_invoke_native_probe_keeps_the_exit_code_and_does_not_throw_under_stop():
+    import subprocess as _sp
+
+    ps = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    text = (REPO / "build_release.ps1").read_text(encoding="utf-8")
+    fn = text[text.index("function Invoke-NativeProbe"):]
+    fn = fn[: fn.index("\n}") + 2]
+    script = ('$ErrorActionPreference = "Stop"\n' + fn + "\n"
+              "Invoke-NativeProbe { cmd /c \"echo boom 1>&2 & exit 3\" } | Out-Null\n"
+              "Write-Output (\"rc=\" + $LASTEXITCODE)\n")
+    r = _sp.run([ps, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60)
+    assert "rc=3" in r.stdout, r.stdout + r.stderr
+

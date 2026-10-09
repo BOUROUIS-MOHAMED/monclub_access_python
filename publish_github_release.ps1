@@ -25,6 +25,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Windows PowerShell 5.1 turns a native command's REDIRECTED stderr into a terminating
+# NativeCommandError under $ErrorActionPreference = "Stop": "python -c 'import pytest' 2>$null"
+# killed L4's first real build_release run on a fresh venv, and "gh release view <new tag> 2>$null"
+# (which prints "release not found") would kill every publish. Probes run under "Continue";
+# $LASTEXITCODE is kept for the caller.
+function Invoke-NativeProbe([scriptblock] $Command) {
+  $saved = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try { & $Command 2>$null } finally { $ErrorActionPreference = $saved }
+}
+
 $ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ROOT
 
@@ -60,10 +71,10 @@ if ($manifest.target -ne $Component -or $manifest.channel -ne $Channel -or $mani
 }
 $commit = [string]$release.buildCommit
 if ($commit -notmatch '^[0-9a-f]{40}$') { throw "Release file has no full build commit: '$commit'." }
-git cat-file -e "$commit^{commit}" 2>$null
+Invoke-NativeProbe { git cat-file -e "$commit^{commit}" } | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Build commit $commit is not in this repository." }
 # gh ignores --target when the tag already exists, and GitHub can only tag a pushed commit.
-$remoteBranches = @(git branch -r --contains $commit 2>$null | Where-Object { $_.Trim() })
+$remoteBranches = @(Invoke-NativeProbe { git branch -r --contains $commit } | Where-Object { "$_".Trim() })
 if ($remoteBranches.Count -eq 0) { throw "Build commit $commit is not on any remote branch: push it first." }
 
 $tag = [string]$release.githubTag   # tools/release_sign.py release_tag(): the one tag format
@@ -85,9 +96,9 @@ if ($Channel -eq "beta") {
   $extraFlags += "--latest"
 }
 
-gh release view $tag -R $Repo 2>$null | Out-Null
+Invoke-NativeProbe { gh release view $tag -R $Repo } | Out-Null
 if ($LASTEXITCODE -eq 0) { throw "Release $tag already exists: gh would ignore --target. Not publishing over it." }
-git ls-remote --exit-code --tags origin "refs/tags/$tag" 2>$null | Out-Null
+Invoke-NativeProbe { git ls-remote --exit-code --tags origin "refs/tags/$tag" } | Out-Null
 if ($LASTEXITCODE -eq 0) { throw "Tag $tag already exists on origin: it may point at another commit. Not publishing." }
 
 Write-Host "Creating release: $tag" -ForegroundColor Cyan

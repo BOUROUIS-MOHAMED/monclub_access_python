@@ -57,6 +57,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Windows PowerShell 5.1 turns a native command's REDIRECTED stderr into a terminating
+# NativeCommandError under $ErrorActionPreference = "Stop": "python -c 'import pytest' 2>$null"
+# killed L4's first real build_release run on a fresh venv, and "gh release view <new tag> 2>$null"
+# (which prints "release not found") would kill every publish. Probes run under "Continue";
+# $LASTEXITCODE is kept for the caller.
+function Invoke-NativeProbe([scriptblock] $Command) {
+  $saved = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try { & $Command 2>$null } finally { $ErrorActionPreference = $saved }
+}
+
 function Get-Sha256($Path) {
   return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
 }
@@ -323,7 +334,7 @@ if ($SkipTests) {
   Write-Host "-SkipTests given: the test suite was NOT run; the release file will say so." -ForegroundColor Yellow
 } else {
   Write-Host "Gate: test suite (pytest tests/ -q --ignore=tests/_pydeps)..." -ForegroundColor Yellow
-  python -c "import pytest" 2>$null
+  Invoke-NativeProbe { python -c "import pytest" } | Out-Null
   if ($LASTEXITCODE -ne 0) { python -m pip install -r .\requirements-dev.txt }
   python -m pytest tests/ -q --ignore=tests/_pydeps
   if ($LASTEXITCODE -ne 0) {
