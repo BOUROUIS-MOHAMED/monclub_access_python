@@ -25,9 +25,9 @@ from __future__ import annotations
 import os
 from typing import Dict
 
-PROD_KEYS: Dict[str, str] = {}
+PROD_KEYS: dict[str, str] = {}
 
-TEST_KEYS: Dict[str, str] = {
+TEST_KEYS: dict[str, str] = {
     "test-l2-2026-10": "b7a32fb80368ee93dda0c920d0c577852159b16d2fc9a3d921a17fc2f28777b0",
 }
 
