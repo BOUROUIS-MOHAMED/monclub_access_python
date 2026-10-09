@@ -16,8 +16,41 @@ param(
   # broken SQL statement shipped to a client before it was ever committed.
   [switch]$AllowDirty,
 
-  # Skip the pre-package source gates. For local experiments only.
+  # Skip the dirty-tree and SQL-arity gates. For local experiments only: the build is then
+  # NOT publishable (release file "publishable": false; publish_github_release.ps1 refuses it).
   [switch]$SkipChecks,
+
+  # Skip the test-suite gate (D30). Explicit only; written into the release file
+  # ("testsSkipped": true) and makes the build NOT publishable.
+  [switch]$SkipTests,
+
+  # Updater v2 E2E build (design.md section 9, L4): the frozen app trusts the TEST release key
+  # (shared/release_keys.py PROD_KEYS is rewritten for the PyInstaller run only, then put back)
+  # and the release file is signed with it. Never publishable.
+  [switch]$E2ETestKeys,
+
+  # Test-only installer failure injection (installer/update_safety.iss, design 8 step 9).
+  # Refused unless -E2ETestKeys: a release build can never carry it.
+  [ValidateSet("", "after_copy", "health", "crash")]
+  [string]$TestFail = "",
+
+  # Release signing key id (design 5.1). Default: the only key in shared/release_keys.py
+  # PROD_KEYS. Its private key is %USERPROFILE%\.monclub\release-signing\<id>.key.
+  [string]$SigningKeyId = "",
+
+  # Release notes for the release file (not signed; design 5.2).
+  [string]$ReleaseNotesFile = "",
+
+  # Override the installer URL written into the release file (test builds served from
+  # http://127.0.0.1). Default: the GitHub release asset URL.
+  [string]$InstallerUrl = "",
+
+  [string]$GithubRepo = "BOUROUIS-MOHAMED/monclub_access_python",
+
+  # Authenticode hook (owner decision O2: no certificate yet). When given, this program or
+  # script is called with the installer path as its only argument, BEFORE the SHA-256 is
+  # computed, and must exit 0.
+  [string]$SignTool = "",
 
   [switch]$DryRun
 )
@@ -98,37 +131,6 @@ function Wait-StagingUnlocked([string]$Dir, [int]$TimeoutSeconds = 120) {
 
     Write-Host ("Waiting for unlock... locked files: {0}" -f $locked.Count) -ForegroundColor Yellow
     Start-Sleep -Seconds 2
-  }
-}
-
-function Compress-ZipRobust([string]$FolderPath, [string]$ZipPath) {
-  for ($i = 1; $i -le 6; $i++) {
-    try {
-      Wait-StagingUnlocked -Dir $FolderPath -TimeoutSeconds 120
-      if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath -ErrorAction SilentlyContinue }
-      Write-Host "Compress-Archive attempt $i/6 ..." -ForegroundColor Yellow
-      Compress-Archive -Path $FolderPath -DestinationPath $ZipPath -Force
-      return
-    } catch {
-      if ($i -eq 6) { throw }
-      Start-Sleep -Seconds 2
-    }
-  }
-}
-
-function Tar-ZipRobust([string]$WorkingDir, [string]$FolderName, [string]$ZipPath) {
-  for ($i = 1; $i -le 6; $i++) {
-    try {
-      if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath -ErrorAction SilentlyContinue }
-      Write-Host "tar.exe attempt $i/6 ..." -ForegroundColor Yellow
-      $args = @("-a","-c","-f", $ZipPath, "-C", $WorkingDir, $FolderName)
-      $p = Start-Process -FilePath "tar.exe" -ArgumentList $args -NoNewWindow -PassThru -Wait
-      if ($p.ExitCode -ne 0) { throw "tar.exe failed with exit code $($p.ExitCode)" }
-      return
-    } catch {
-      if ($i -eq 6) { throw }
-      Start-Sleep -Seconds 2
-    }
   }
 }
 
@@ -226,6 +228,118 @@ if ($LASTEXITCODE -ne 0) {
   throw "Neither pywin32 nor comtypes is available in the packaging environment."
 }
 
+$gitCmd = Get-Command git -ErrorAction SilentlyContinue
+$git = @{
+  available = $false
+  commit = $null
+  branch = $null
+  dirty = $null
+}
+if ($gitCmd) {
+  $git.available = $true
+  # Full SHA: publish_github_release.ps1 tags exactly this commit (gh --target, D31).
+  $r1 = Try-Run "git" @("rev-parse","HEAD")
+  $r2 = Try-Run "git" @("rev-parse","--abbrev-ref","HEAD")
+  $r3 = Try-Run "git" @("status","--porcelain")
+  if ($r1.ok) { $git.commit = $r1.out }
+  if ($r2.ok) { $git.branch = $r2.out }
+  if ($r3.ok) { $git.dirty = (-not [string]::IsNullOrWhiteSpace($r3.out)) }
+}
+
+# --------------------------------------------------------------------------
+# Release gates. These run BEFORE the Tauri build and PyInstaller so a bad tree never
+# gets packaged (they used to run after PyInstaller, despite this comment).
+# --------------------------------------------------------------------------
+if (-not $SkipChecks) {
+
+  # Gate 1: the working tree must match HEAD.
+  # Rationale: the 1.4.20/1.4.21 artifacts were built from a dirty tree, so the
+  # shipped binary corresponded to no commit and could not be reproduced or
+  # reviewed. $git.dirty was already computed here and then silently discarded.
+  if ($git.available -and ($git.dirty -eq $true)) {
+    Write-Host "" 
+    Write-Host "BUILD BLOCKED - the working tree has uncommitted changes." -ForegroundColor Red
+    Write-Host "  The artifact would correspond to no commit and be unreproducible." -ForegroundColor Red
+    Write-Host "  Commit (or stash) first, or re-run with -AllowDirty if you accept that." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Uncommitted:" -ForegroundColor Yellow
+    git status --short
+    if (-not $AllowDirty) {
+      throw "Refusing to build from a dirty working tree (use -AllowDirty to override)."
+    }
+    Write-Host "-AllowDirty given - continuing from a dirty tree." -ForegroundColor Yellow
+  }
+
+  # Gate 2: no SQL statement may bind the wrong number of values.
+  # This is the exact defect that took a gym offline: sync_devices named 59
+  # columns and supplied 57, so every sync raised OperationalError and the whole
+  # transaction rolled back. Catching it here costs under a second.
+  $arityScript = Join-Path $PSScriptRoot "tools\check_sql_arity.py"
+  if (Test-Path $arityScript) {
+    Write-Host "Gate: SQL statement arity..." -ForegroundColor Yellow
+    python $arityScript app
+    if ($LASTEXITCODE -ne 0) {
+      throw "SQL arity check FAILED - see the mismatches above. This is the 1.4.21 class of bug; do not ship."
+    }
+  } else {
+    throw "Release gate missing: $arityScript"
+  }
+}
+
+
+# Gate 3 (always, -SkipChecks does not skip it): the release must be signable and the
+# client must trust a real key (design 5.1). A publishable build refuses an empty
+# PROD_KEYS or a "test-" key in it; an E2E build signs with the test key instead.
+if ($TestFail -and -not $E2ETestKeys) {
+  throw "-TestFail is test-only: it needs -E2ETestKeys (such a build is never publishable)."
+}
+if ($buildVersion.Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$') {
+  throw "Version '$($buildVersion.Version)' is not MAJOR.MINOR.PATCH[-pre] (design 5.2); build metadata (+...) is refused."
+}
+$releaseSign = Join-Path $ROOT "tools\release_sign.py"
+if ($E2ETestKeys) {
+  $SigningKeyId = "test-l2-2026-10"
+  $testKeyFile = Join-Path $ROOT "tests\fixtures\release_signing\$SigningKeyId.seed"
+  $testPublicKey = (python $releaseSign public-key --key-file $testKeyFile).Trim()
+  if ($LASTEXITCODE -ne 0 -or $testPublicKey -notmatch '^[0-9a-f]{64}$') { throw "Could not read the test release key." }
+  Write-Host "E2E build: trusts and signs with the TEST key $SigningKeyId -- NOT publishable." -ForegroundColor Yellow
+} else {
+  Write-Host "Gate: trusted release keys..." -ForegroundColor Yellow
+  python $releaseSign check-trust
+  if ($LASTEXITCODE -ne 0) {
+    throw "Release key gate FAILED: the client would trust no key or a test key (see above). Owner: tools\release_sign.py keygen, then shared\release_keys.py."
+  }
+  if ([string]::IsNullOrWhiteSpace($SigningKeyId)) {
+    $prodIds = @(python $releaseSign prod-key-ids | Where-Object { $_.Trim() })
+    if ($prodIds.Count -ne 1) { throw "Pass -SigningKeyId: PROD_KEYS has $($prodIds.Count) keys." }
+    $SigningKeyId = $prodIds[0].Trim()
+  }
+  python $releaseSign check-key --key-id $SigningKeyId
+  if ($LASTEXITCODE -ne 0) { throw "Signing key $SigningKeyId is missing or does not match PROD_KEYS (see above)." }
+}
+
+# Gate 4: the test suite (D30). -SkipTests must be explicit and makes the build NOT publishable.
+if ($SkipTests) {
+  Write-Host "-SkipTests given: the test suite was NOT run; the release file will say so." -ForegroundColor Yellow
+} else {
+  Write-Host "Gate: test suite (pytest tests/ -q --ignore=tests/_pydeps)..." -ForegroundColor Yellow
+  python -c "import pytest" 2>$null
+  if ($LASTEXITCODE -ne 0) { python -m pip install -r .\requirements-dev.txt }
+  python -m pytest tests/ -q --ignore=tests/_pydeps
+  if ($LASTEXITCODE -ne 0) {
+    # Any non-zero, including 5 (no tests collected), refuses the build.
+    throw "Test suite FAILED (pytest exit $LASTEXITCODE). Fix it, or pass -SkipTests for a non-publishable build."
+  }
+}
+
+$publishable = -not ($SkipTests -or $SkipChecks -or $E2ETestKeys -or $TestFail -or ($git.dirty -eq $true))
+if ($publishable -and ($git.commit -notmatch '^[0-9a-f]{40}$')) {
+  throw "A publishable build needs git: the release file records the built commit (publish tags it, D31)."
+}
+if (-not $publishable) {
+  Write-Host "This build is NOT publishable (SkipTests/SkipChecks/E2ETestKeys/TestFail/dirty tree)." -ForegroundColor Yellow
+}
+
 if ((-not $SkipTauriBuild) -or (-not (Test-Path $stagedUiExe))) {
   Write-Host "Preparing Tauri shell artifact..." -ForegroundColor Yellow
   & powershell -ExecutionPolicy Bypass -File (Join-Path $ROOT "build_tauri_shell.ps1") -Component $Component -Profile release
@@ -244,8 +358,31 @@ if (-not (Test-Path $specPath)) {
   throw "Spec file not found: $specPath"
 }
 
-Write-Host "Running PyInstaller..." -ForegroundColor Yellow
-python -m PyInstaller --noconfirm --clean $specPath
+# -E2ETestKeys: PyInstaller reads shared/release_keys.py from this tree, so PROD_KEYS is
+# rewritten to the test key for this run only and the original bytes are put back after
+# (a crash in between leaves a dirty tree, which the next build's dirty-tree gate refuses).
+$releaseKeysPath = Join-Path $ROOT "shared\release_keys.py"
+$releaseKeysOriginal = $null
+if ($E2ETestKeys) {
+  if (-not (Test-Path -LiteralPath $releaseKeysPath)) { throw "E2E build: $releaseKeysPath not found (lane L3 adds it)." }
+  $releaseKeysOriginal = [System.IO.File]::ReadAllBytes($releaseKeysPath)
+  $text = [System.Text.Encoding]::UTF8.GetString($releaseKeysOriginal)
+  $re = [regex]'(?m)^PROD_KEYS: dict\[str, str\] = \{[^\r\n]*\}[ \t]*\r?$'
+  if ($re.Matches($text).Count -ne 1) { throw "E2E build: expected exactly one single-line 'PROD_KEYS: dict[str, str] = {...}' in $releaseKeysPath." }
+  $text = $re.Replace($text, ('PROD_KEYS: dict[str, str] = {"' + $SigningKeyId + '": "' + $testPublicKey + '"}  # E2E BUILD ONLY'), 1)
+  [System.IO.File]::WriteAllText($releaseKeysPath, $text, (New-Object System.Text.UTF8Encoding($false)))
+  Write-Host "E2E build: PROD_KEYS temporarily set to the test key." -ForegroundColor Yellow
+}
+try {
+  Write-Host "Running PyInstaller..." -ForegroundColor Yellow
+  python -m PyInstaller --noconfirm --clean $specPath
+  if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
+} finally {
+  if ($null -ne $releaseKeysOriginal) {
+    [System.IO.File]::WriteAllBytes($releaseKeysPath, $releaseKeysOriginal)
+    Write-Host "E2E build: shared\release_keys.py restored." -ForegroundColor Yellow
+  }
+}
 
 if ($meta.RequiresSdkDlls) {
   $internalSdk = Join-Path $distAppDir "_internal\sdk"
@@ -293,62 +430,6 @@ if ([string]::IsNullOrWhiteSpace($ReleaseId)) {
   $ReleaseId = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss'Z'")
 }
 
-$gitCmd = Get-Command git -ErrorAction SilentlyContinue
-$git = @{
-  available = $false
-  commit = $null
-  branch = $null
-  dirty = $null
-}
-if ($gitCmd) {
-  $git.available = $true
-  $r1 = Try-Run "git" @("rev-parse","--short","HEAD")
-  $r2 = Try-Run "git" @("rev-parse","--abbrev-ref","HEAD")
-  $r3 = Try-Run "git" @("status","--porcelain")
-  if ($r1.ok) { $git.commit = $r1.out }
-  if ($r2.ok) { $git.branch = $r2.out }
-  if ($r3.ok) { $git.dirty = (-not [string]::IsNullOrWhiteSpace($r3.out)) }
-}
-
-# --------------------------------------------------------------------------
-# Release gates. These run BEFORE PyInstaller so a bad tree never gets packaged.
-# --------------------------------------------------------------------------
-if (-not $SkipChecks) {
-
-  # Gate 1: the working tree must match HEAD.
-  # Rationale: the 1.4.20/1.4.21 artifacts were built from a dirty tree, so the
-  # shipped binary corresponded to no commit and could not be reproduced or
-  # reviewed. $git.dirty was already computed here and then silently discarded.
-  if ($git.available -and ($git.dirty -eq $true)) {
-    Write-Host "" 
-    Write-Host "BUILD BLOCKED - the working tree has uncommitted changes." -ForegroundColor Red
-    Write-Host "  The artifact would correspond to no commit and be unreproducible." -ForegroundColor Red
-    Write-Host "  Commit (or stash) first, or re-run with -AllowDirty if you accept that." -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "Uncommitted:" -ForegroundColor Yellow
-    git status --short
-    if (-not $AllowDirty) {
-      throw "Refusing to build from a dirty working tree (use -AllowDirty to override)."
-    }
-    Write-Host "-AllowDirty given - continuing from a dirty tree." -ForegroundColor Yellow
-  }
-
-  # Gate 2: no SQL statement may bind the wrong number of values.
-  # This is the exact defect that took a gym offline: sync_devices named 59
-  # columns and supplied 57, so every sync raised OperationalError and the whole
-  # transaction rolled back. Catching it here costs under a second.
-  $arityScript = Join-Path $PSScriptRoot "tools\check_sql_arity.py"
-  if (Test-Path $arityScript) {
-    Write-Host "Gate: SQL statement arity..." -ForegroundColor Yellow
-    python $arityScript app
-    if ($LASTEXITCODE -ne 0) {
-      throw "SQL arity check FAILED - see the mismatches above. This is the 1.4.21 class of bug; do not ship."
-    }
-  } else {
-    throw "Release gate missing: $arityScript"
-  }
-}
-
 $baseName = "{0}-{1}" -f $artifactName, $ReleaseId
 New-Item -ItemType Directory -Force $releaseDir | Out-Null
 
@@ -368,7 +449,6 @@ $versionObj = [ordered]@{
   codename = $buildVersion.Codename
   mainExe = $meta.MainExe
   uiExe = $meta.UiExeName
-  updaterExe = $meta.UpdaterInstalledExe
   platform = "windows"
   channel = $Channel
   releaseId = $ReleaseId
@@ -377,6 +457,9 @@ $versionObj = [ordered]@{
   # tell which source a shipped exe came from. Tags are not a substitute here --
   # access_1.4.12 through access_1.4.21 all point at the same commit.
   git = $git
+  publishable = $publishable
+  testsSkipped = [bool]$SkipTests
+  e2eTestKeys = [bool]$E2ETestKeys
 }
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($versionPath, ($versionObj | ConvertTo-Json -Depth 5), $utf8NoBom)
@@ -386,7 +469,46 @@ Write-Host "Staging dist -> release staging (robocopy with retries)..." -Foregro
 Copy-TreeRobocopy $distAppDir $stagingApp
 Wait-StagingUnlocked -Dir $stagingApp -TimeoutSeconds 180
 
+# --------------------------------------------------------------------------
+# Installer, optional Authenticode hook, SHA-256 and the signed release file (design 5.3).
+# --------------------------------------------------------------------------
+$installerArgs = @("-ExecutionPolicy", "Bypass", "-File", (Join-Path $ROOT "build_installer.ps1"),
+                   "-Component", $Component, "-StageDir", $stagingApp)
+if ($TestFail) { $installerArgs += @("-TestFail", $TestFail) }
+& powershell @installerArgs
+if ($LASTEXITCODE -ne 0) { throw "build_installer.ps1 failed with exit code $LASTEXITCODE" }
+
+$installerName = Format-DesktopInstallerFileName -Component $Component -Version $buildVersion.Version
+if ($TestFail) {
+  $installerName = "{0}_TESTFAIL_{1}.exe" -f [System.IO.Path]::GetFileNameWithoutExtension($installerName), $TestFail
+}
+$installerPath = Join-Path $releaseDir $installerName
+if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) { throw "Installer not found: $installerPath" }
+
+if (-not [string]::IsNullOrWhiteSpace($SignTool)) {
+  Write-Host "Authenticode hook: $SignTool `"$installerPath`"" -ForegroundColor Yellow
+  & $SignTool $installerPath
+  if ($LASTEXITCODE -ne 0) { throw "-SignTool failed with exit code $LASTEXITCODE" }
+}
+
+$installerSha256 = Get-Sha256 $installerPath
+$signArgs = @($releaseSign, "sign", "--installer", $installerPath, "--target", $Component,
+              "--channel", $Channel, "--version", $buildVersion.Version, "--key-id", $SigningKeyId,
+              "--github-repo", $GithubRepo, "--codename", [string]$buildVersion.Codename)
+if ($git.commit) { $signArgs += @("--build-commit", $git.commit) }
+if ($SkipTests) { $signArgs += "--tests-skipped" }
+if (-not $publishable) { $signArgs += "--not-publishable" }
+if ($E2ETestKeys) { $signArgs += "--allow-test-keys" }
+if (-not [string]::IsNullOrWhiteSpace($InstallerUrl)) { $signArgs += @("--installer-url", $InstallerUrl) }
+if (-not [string]::IsNullOrWhiteSpace($ReleaseNotesFile)) { $signArgs += @("--notes-file", $ReleaseNotesFile) }
+python @signArgs
+if ($LASTEXITCODE -ne 0) { throw "Signing the release FAILED (see above)." }
+
 Write-Host "`nRelease OK" -ForegroundColor Green
+Write-Host "Installer : $installerPath"
+Write-Host "SHA-256   : $installerSha256"
+Write-Host ("Release   : {0}" -f (Join-Path $releaseDir ("release-{0}-{1}.json" -f $Component, $buildVersion.Version)))
+Write-Host "Publishable: $publishable"
 Write-Host "StageDir  : $stagingApp"
 Write-Host "Version   : $($buildVersion.Version)"
 if (-not [string]::IsNullOrWhiteSpace($buildVersion.Codename)) {
