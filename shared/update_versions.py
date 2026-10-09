@@ -10,9 +10,12 @@ from __future__ import annotations
 import re
 from typing import Optional, Tuple
 
+# A pre-release identifier is numeric without a leading zero, or alphanumeric (SemVer 2.0):
+# "1.5.0-01" would compare equal to "1.5.0-1" and let two rows carry the same version.
+_PRE_ID = r"(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
 _VERSION_RE = re.compile(
     r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
-    r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+    rf"(?:-({_PRE_ID}(?:\.{_PRE_ID})*))?$"
 )
 
 ParsedVersion = Tuple[int, int, int, Tuple[str, ...]]
