@@ -130,6 +130,9 @@ def test_setup_logging_reports_the_previous_run_once_its_handlers_exist(monkeypa
                         lambda lg: seen.append(len(lg.handlers)))
     zk = logging.getLogger("zkapp")
     saved = list(zk.handlers)
+    # setup_logging also sets propagate=False and the level: restore them, or every later caplog
+    # test on a zkapp.* logger captures nothing (9 tests of the full suite failed after this one).
+    saved_propagate, saved_level = zk.propagate, zk.level
     zk.handlers = []
     try:
         logger_mod.setup_logging("DEBUG")
@@ -139,6 +142,7 @@ def test_setup_logging_reports_the_previous_run_once_its_handlers_exist(monkeypa
             if h not in saved:
                 h.close()
         zk.handlers = saved
+        zk.propagate, zk.level = saved_propagate, saved_level
     assert seen == [len(added)] and len(added) >= 2  # the file handler is in place first
 
 
