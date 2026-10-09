@@ -284,7 +284,8 @@ class TestInstallerDetectionIsNarrow:
         )
 
     # The last one: Inno runs the real setup work as %TEMP%\is-*.tmp\monclub_access_<ver>.tmp.
-    @pytest.mark.parametrize("name", ["monclub_access", "monclub_access_1.4.33", "monclub_access_1.5.0.tmp"])
+    @pytest.mark.parametrize("name", ["monclub_access", "monclub_access_1.4.33", "monclub_access_1.5.0.tmp",
+                                      "monclub_access_1.5.1_TESTFAIL_health"])
     def test_our_own_installer_is_still_detected(self, name: str):
         assert _installer_match(name) is True
 

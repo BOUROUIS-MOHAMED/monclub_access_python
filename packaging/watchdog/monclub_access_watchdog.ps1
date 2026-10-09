@@ -221,7 +221,7 @@ function Test-InstallerRunning {
     #>
     try {
         $procs = Get-Process -ErrorAction SilentlyContinue |
-                 Where-Object { $_.ProcessName -match '^monclub_access(_[0-9][0-9a-zA-Z.\-]*)?$' }
+                 Where-Object { $_.ProcessName -match '^monclub_access(_[0-9][0-9a-zA-Z._\-]*)?$' }
         return (@($procs).Count -gt 0)
     } catch {
         return $false
@@ -261,8 +261,11 @@ try {
         Write-State -Misses 0 -Restarts $state.restarts
         exit 0
     }
-    if (Test-Path -LiteralPath $JournalPath) {
-        # Guard 2 (see .DESCRIPTION): BEFORE the sentinel and exe-missing guards.
+    $claims = @(Get-ChildItem -LiteralPath (Split-Path -Parent $JournalPath) -Filter 'install_journal.restoring-*.json' -ErrorAction SilentlyContinue)
+    if ((Test-Path -LiteralPath $JournalPath) -or $claims.Count -gt 0) {
+        # Guard 2 (see .DESCRIPTION): BEFORE the sentinel and exe-missing guards. A live
+        # claim (install_journal.restoring-<pid>.json) means another restorer is at work:
+        # update_helper answers 22 and we stand down instead of starting it mid-restore.
         if (-not (Test-Path -LiteralPath $HelperPath)) {
             Write-Log 'ERROR' "install journal found but $HelperPath is missing -- cannot recover"
         } else {
@@ -279,7 +282,7 @@ try {
                 exit 0
             }
             if ($rc -eq 22) {
-                Write-Log 'INFO' 'app is down and an install journal is present but not stale yet -- standing down'
+                Write-Log 'INFO' 'app is down and an install journal is not stale yet, or a restore is in progress -- standing down'
                 Write-State -Misses 0 -Restarts $state.restarts
                 exit 0
             }

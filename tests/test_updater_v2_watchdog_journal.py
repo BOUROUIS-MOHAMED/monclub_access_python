@@ -64,7 +64,7 @@ def test_a_fresh_journal_makes_the_watchdog_stand_down(tmp_path: Path):
     payload(tmp_path / "current", "1.5.0")
     journal(tmp_path, "verifying", utc(-1))
     out = tick(tmp_path)
-    assert "not stale yet -- standing down" in out, out
+    assert "not stale yet" in out and "standing down" in out, out
     assert (tmp_path / "state" / "install_journal.json").exists()
     assert (tmp_path / "current" / "MonClubAccess.exe").read_bytes() == b"exe 1.5.0"
 
@@ -77,6 +77,23 @@ def test_a_stale_backing_up_journal_is_dropped_and_the_normal_checks_go_on(tmp_p
     assert "miss 1/2" in out, out  # the ordinary two-tick confirmation follows
     assert (tmp_path / "current" / "MonClubAccess.exe").read_bytes() == b"exe 1.4.35"
     assert not (tmp_path / "state" / "install_journal.json").exists()
+
+
+def test_a_live_restore_claim_makes_the_watchdog_stand_down_without_starting_the_app(tmp_path: Path):
+    import subprocess as sp
+    import sys
+    payload(tmp_path / "previous", "1.4.35")
+    (tmp_path / "current").mkdir()
+    (tmp_path / "state").mkdir()
+    alive = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        (tmp_path / "state" / f"install_journal.restoring-{alive.pid}.json").write_text("{}", encoding="ascii")
+        out = tick(tmp_path)
+        assert "restore is in progress -- standing down" in out, out
+        assert not (tmp_path / "current" / "MonClubAccess.exe").exists()
+    finally:
+        alive.kill()
+        alive.wait()
 
 
 def test_installed_watchdog_finds_the_helper_beside_itself():

@@ -72,7 +72,9 @@ $JournalPath  = Join-Path $StateDir 'install_journal.json'
 $LastUpdate   = Join-Path $StateDir 'last_update.json'
 $BootOkPath   = Join-Path $StateDir 'boot_ok.json'
 $SentinelPath = Join-Path $InstallRoot '.update-in-progress'
-$SetupImageRe = '^monclub_(access|tv)_[0-9][0-9A-Za-z.\-]*\.(exe|tmp)$'
+# Our installer images: monclub_access_<ver>.exe and Inno's monclub_access_<ver>.tmp; test
+# builds add _TESTFAIL_<mode> (hence "_"). Same pattern as lane L3's client (design 8.0).
+$SetupImageRe = '^monclub_(access|tv)_[0-9][0-9A-Za-z._\-]*\.(exe|tmp)$'
 
 function Write-HelperLog([string] $Message) {
     $line = '{0} | update_helper {1} | {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Action, $Message
@@ -368,6 +370,22 @@ try {
         }
 
         'recover' {
+            # A claim left by a restorer (app start-up, wrapper, watchdog, us): alive = a restore
+            # is in progress, stand down; dead = it died mid-restore, hand the journal back.
+            foreach ($claim in @(Get-ChildItem -LiteralPath $StateDir -Filter 'install_journal.restoring-*.json' -ErrorAction SilentlyContinue)) {
+                $claimPid = 0
+                if ($claim.Name -match '^install_journal\.restoring-(\d+)\.json$') { $claimPid = [int] $Matches[1] }
+                if ($claimPid -gt 0 -and (Get-Process -Id $claimPid -ErrorAction SilentlyContinue)) {
+                    Write-HelperLog "a restore is in progress (claim $($claim.Name), pid alive) -- standing down"
+                    exit 22
+                }
+                if (Test-Path -LiteralPath $JournalPath) {
+                    Remove-Item -LiteralPath $claim.FullName -Force -ErrorAction SilentlyContinue
+                } else {
+                    try { [System.IO.File]::Move($claim.FullName, $JournalPath) } catch { }
+                }
+                Write-HelperLog "stale claim $($claim.Name) (restorer gone) -- journal handed back"
+            }
             if (-not (Test-Path -LiteralPath $JournalPath)) { exit 0 }
             if (Test-SetupRunning) {
                 Write-HelperLog 'install journal present but a Setup is running -- standing down'
@@ -375,8 +393,11 @@ try {
             }
             $journal = $null
             try { $journal = Get-Content -LiteralPath $JournalPath -Raw | ConvertFrom-Json } catch { }
-            $phase = ''; $jFrom = ''; $jTo = ''; $at = $null
+            $phase = ''; $jFrom = ''; $jTo = ''; $at = $null; $jSetupPid = 0
             if ($journal) {
+                if ($journal.PSObject.Properties.Name -contains 'setupPid') {
+                    try { $jSetupPid = [int] $journal.setupPid } catch { $jSetupPid = 0 }
+                }
                 if ($journal.PSObject.Properties.Name -contains 'phase') { $phase = [string] $journal.phase }
                 if ($journal.PSObject.Properties.Name -contains 'from') { $jFrom = [string] $journal.from }
                 if ($journal.PSObject.Properties.Name -contains 'to') { $jTo = [string] $journal.to }
@@ -394,7 +415,10 @@ try {
             }
             $nowUtc = [DateTime]::UtcNow
             $boot = Get-LastBootUtc
-            $stale = (($nowUtc - $at).TotalMinutes -gt $StaleMinutes) -or ($null -ne $boot -and $at -lt $boot)
+            # The Setup that wrote it is gone (killed / crashed): no need to wait the 10 minutes.
+            # Liveness by PID, not by name, so a renamed installer still counts as running.
+            $setupGone = $jSetupPid -gt 0 -and -not (Get-Process -Id $jSetupPid -ErrorAction SilentlyContinue)
+            $stale = (($nowUtc - $at).TotalMinutes -gt $StaleMinutes) -or ($null -ne $boot -and $at -lt $boot) -or $setupGone
             if (-not $stale) {
                 Write-HelperLog ("install journal phase={0} is only {1:N0} s old and no reboot since -- not stale yet" -f $phase, ($nowUtc - $at).TotalSeconds)
                 exit 22

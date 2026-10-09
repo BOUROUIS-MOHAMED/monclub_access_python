@@ -224,9 +224,10 @@ def test_relaunch_starts_once_and_then_sees_it_running(root: Path, stub_exe: byt
 # ---------------------------------------------------------------- recover (journal rule)
 
 
-def write_journal(root: Path, phase: str, at: str) -> None:
+def write_journal(root: Path, phase: str, at: str, setup_pid: int = 0) -> None:
     (root / "state" / "install_journal.json").write_text(
-        json.dumps({"phase": phase, "from": "1.0.0", "to": "2.0.0", "at": at, "setupPid": 0}), encoding="ascii")
+        json.dumps({"phase": phase, "from": "1.0.0", "to": "2.0.0", "at": at, "setupPid": setup_pid}),
+        encoding="ascii")
 
 
 @pytest.mark.parametrize("phase", ["copying", "verifying", "restoring"])
@@ -267,6 +268,29 @@ def test_recover_stands_down_on_a_fresh_journal(root: Path):
     assert (root / "state" / "install_journal.json").exists()
 
 
+def test_recover_treats_a_fresh_journal_whose_setup_died_as_stale(root: Path):
+    """Setup killed mid-swap without a reboot: its PID is gone, no 10-minute wait."""
+    write_payload(root / "previous", "1.0.0")
+    (root / "current").mkdir()
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    write_journal(root, "copying", utc(-1), setup_pid=dead.pid)
+    r = run_helper("recover", root)
+    assert r.returncode == 20, r.stdout + r.stderr
+
+
+def test_recover_stands_down_while_the_journal_setup_pid_is_alive(root: Path):
+    """A renamed installer is not matched by image name; its live PID still protects it."""
+    write_payload(root / "previous", "1.0.0")
+    alive = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        write_journal(root, "copying", utc(-1), setup_pid=alive.pid)
+        assert run_helper("recover", root).returncode == 22
+    finally:
+        alive.kill()
+        alive.wait()
+
+
 def test_recover_treats_a_journal_written_before_the_last_boot_as_stale(root: Path):
     write_payload(root / "previous", "1.0.0")
     (root / "current").mkdir()
@@ -294,6 +318,33 @@ def test_recover_with_unparseable_journal_restores_only_when_previous_is_complet
     r = run_helper("recover", root)
     assert r.returncode == 21  # no previous\ -> nothing to restore, journal dropped
     assert not (root / "state" / "install_journal.json").exists()
+
+
+def test_recover_stands_down_while_another_restorer_holds_a_live_claim(root: Path):
+    write_payload(root / "previous", "1.0.0")
+    alive = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        (root / "state" / f"install_journal.restoring-{alive.pid}.json").write_text("{}", encoding="ascii")
+        r = run_helper("recover", root)
+        assert r.returncode == 22, r.stdout
+        assert "restore is in progress" in r.stdout
+    finally:
+        alive.kill()
+        alive.wait()
+
+
+def test_recover_takes_back_the_journal_of_a_restorer_that_died(root: Path):
+    write_payload(root / "previous", "1.0.0")
+    (root / "current").mkdir()
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    (root / "state" / f"install_journal.restoring-{dead.pid}.json").write_text(
+        json.dumps({"phase": "restoring", "from": "1.0.0", "to": "2.0.0", "at": utc(-30), "setupPid": 0}),
+        encoding="ascii")
+    r = run_helper("recover", root)
+    assert r.returncode == 20, r.stdout + r.stderr
+    assert tree(root / "current") == tree(root / "previous")
+    assert not list((root / "state").glob("install_journal*"))
 
 
 def test_recover_without_journal_does_nothing(root: Path):
