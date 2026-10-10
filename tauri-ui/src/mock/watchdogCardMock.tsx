@@ -2,8 +2,11 @@
 // redesign: the real card over a SIMULATED GET/POST /api/v2/watchdog -- no Python app, no task.
 // Served by the Vite dev server only (watchdog-mock.html). ?state=on|off|missing|error|stood|dev
 // picks the starting status; ?lang=en starts in English. The switch works (in memory).
+// ?api=http://127.0.0.1:<port>&token=<X-Local-Token> instead talks to a REAL local API (no simulation):
+// used by the E2E with docs/access-updater-v2/e2e/watchdog-settings/wd_api_host.py.
 import ReactDOM from "react-dom/client";
 import WatchdogCard from "@/components/WatchdogCard";
+import { configureApiBaseUrl, setAuthToken } from "@/api/client";
 import { installSemanticTokenStyles } from "@/theme/colors";
 import { saveLang, type WatchdogStatus } from "@/lib/watchdogStatus";
 import "@/index.css";
@@ -39,8 +42,14 @@ const params = new URLSearchParams(window.location.search);
 saveLang(params.get("lang") === "en" ? "en" : "fr");
 let current: WatchdogStatus = { ...base, ...(STATES[params.get("state") || "on"] || {}) };
 
+const realApi = params.get("api");
+if (realApi) {
+  configureApiBaseUrl(realApi);
+  setAuthToken(params.get("token") || "");
+}
+
 const realFetch = window.fetch.bind(window);
-window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+if (!realApi) window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = String(input instanceof Request ? input.url : input);
   if (!url.includes("/api/v2/watchdog")) return realFetch(input, init);
   await new Promise((r) => setTimeout(r, 400));

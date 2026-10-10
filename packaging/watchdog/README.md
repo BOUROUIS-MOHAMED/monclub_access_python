@@ -21,26 +21,32 @@ These scripts are that missing piece.
 
 ## Installing
 
-Ship it by ticking **"Keep MonClub Access running"** during setup.
+**The Windows task's own state is the preference** (design §12, owner decision O7,
+2026-10-10): *Enabled* = on, *Disabled* = off (an operator, the cutover runbook or the Access
+Settings switch chose it), *missing* = never decided. The installer runs `register_watchdog.ps1`
+on **every** install and update, silent or not (`[Run]` has no task condition):
 
-- **A new install: ticked by default** (owner decision, 2026-09-26).
-- **An existing install keeps its previous choice** (`UsePreviousTasks=yes`): ticked
-  stays ticked, unticked stays unticked. An install whose version predates the box
-  has no recorded choice and gets it **unticked** — it changes two behaviours at
-  once (start at logon *and* restart on death), and a routine update, the silent
-  in-app one included, must never give a PC a startup entry by itself.
-- "New" means no trace of an old install: neither Inno's uninstall record nor the
-  files (`IsFreshInstall` in `MonClubAccess.iss`). It takes two `[Tasks]` entries
-  with the same name, one of them shown. **Not `checkedonce`**: in Inno Setup's own
-  code a previously *ticked* `checkedonce` task comes back **unticked**, and a task
-  missing from the previous install's record keeps its base state
-  (`Setup.WizardForm.pas`, `CreateTaskButtons`, tag `is-6_5_4`).
-- **A disabled task stays disabled.** Ticked, the installer runs
-  `register_watchdog.ps1`, which replaces the task with the current definition — and
-  keeps it **disabled** when someone had disabled it (`Disable-ScheduledTask`, e.g. the
-  cutover runbook). It prints `State: Disabled (kept)`; `Enable-ScheduledTask -TaskName
-  'MonClub Access Watchdog'` turns it back on. **Ticking the box never re-enables a
-  disabled task; only `Enable-ScheduledTask` does.** "Disabled" is read from the task's
+- **Task missing → registered ENABLED** (`-WhenMissing Enabled`, the default). This is the
+  one-time switch-on for PCs installed before the box existed (`UsePreviousTasks` kept them
+  unticked), and it reaches them with the first update that carries this installer.
+- **A new install whose "Keep MonClub Access running" box is unticked → registered DISABLED**
+  (`-WhenMissing Disabled`, `State: Disabled (chosen at install)`), so the choice is recorded and
+  later updates do not switch it on (`WatchdogWhenMissing` in `MonClubAccess.iss`: only
+  `IsFreshInstall and not WizardIsTaskSelected('watchdog')`; an explicit `/TASKS="!watchdog"` on a
+  silent fresh install counts too). The box is shown, ticked, **on a new install only**; on an
+  existing install it would decide nothing, so it is not shown -- the Access Settings card is the
+  control there. "New" means no trace of an old install: neither Inno's uninstall record nor the
+  files (`IsFreshInstall`). **Not `checkedonce`**: in Inno Setup's own code a previously *ticked*
+  `checkedonce` task comes back **unticked** (`Setup.WizardForm.pas`, `CreateTaskButtons`, tag
+  `is-6_5_4`). `[CODE; TEST: test_watchdog_script.py::TestRegisterWhenMissing,
+  ::TestInstallerWatchdogTask; E2E 2026-10-10 (a), (d) in `docs/access-updater-v2/e2e/watchdog-settings/`]`
+- **An enabled task is refreshed and stays enabled.** `[E2E (c)]`
+- **A disabled task stays disabled.** The script replaces the task with the current definition —
+  and keeps it **disabled** when someone had disabled it (`Disable-ScheduledTask`, e.g. the
+  cutover runbook, or the Settings switch). It prints `State: Disabled (kept)`; the Settings
+  switch or `Enable-ScheduledTask -TaskName 'MonClub Access Watchdog'` turns it back on. **An
+  install never re-enables a disabled task.** `[E2E (b): off via the Settings API, then a silent
+  update kept it Disabled]` "Disabled" is read from the task's
   definition (`Settings.Enabled = False`) as well as its `State`: Microsoft's
   `TASK_STATE_DISABLED` means "disabled and no instances of the task are queued or
   running", so a disabled task caught while a check runs reads `Running` -- the script
@@ -53,8 +59,8 @@ Ship it by ticking **"Keep MonClub Access running"** during setup.
   put-back is read back: a task that was disabled and came back enabled is disabled
   again, and **removed** if even that does not hold -- no task rather than an enabled
   one. The run still fails. A task that was **removed** (`-Remove`, an uninstall) is not
-  "disabled": the next install with the box ticked registers it enabled. Installers
-  built before `18863bc` re-registered it **enabled**.
+  "disabled": the next install registers it enabled (or disabled for a new install with the box
+  unticked). Installers built before `18863bc` re-registered it **enabled**.
 - **Every run leaves a trace** in `<InstallRoot>\logs\watchdog-register.log` (below). The
   installer runs the script hidden and nothing in it reads the script's exit code
   (Inno's `[Run]` section documents no exit-code handling); its output also goes into
@@ -62,9 +68,14 @@ Ship it by ticking **"Keep MonClub Access running"** during setup.
   `%TEMP%` as `Setup Log <date> #<n>.txt` -- written even by the in-app update, which
   passes no `/LOG`. Whether `logoutput` captures every line (`Write-Host`, warnings) on a
   real install is `[UNVERIFIED]`; the script's own log does not depend on it.
-- Unticked, the installer does not touch an existing task at all -- but it still
-  replaces the three files in `<InstallRoot>\watchdog\` (`[Files]` has no task
-  condition), so an existing task runs the new check script.
+- The three files in `<InstallRoot>\watchdog\` are replaced at every install (`[Files]` has no
+  task condition), so an existing task runs the new check script.
+- **Settings:** the Access Settings page has a "Keep MonClub Access running (watchdog)" card
+  (`tauri-ui/src/components/WatchdogCard.tsx`) over `GET` / `POST /api/v2/watchdog`
+  (`access/watchdog_control.py`): status, and a switch that runs `Enable-` / `Disable-ScheduledTask`
+  (registering the task first through `<InstallRoot>\watchdog\register_watchdog.ps1` when it is
+  missing) -- never `Unregister`. Each change is a `SETTINGS` line in `watchdog-register.log`
+  naming the signed-in account. See the guide §11.9.
 - **One Windows account per PC.** The install is per Windows user
   (`PrivilegesRequired=lowest`, `{localappdata}\MonClubAccess`), but the task name is one
   per PC (root folder of Task Scheduler), and every account's Access shares one data
@@ -95,10 +106,10 @@ Enable-ScheduledTask -TaskName 'MonClub Access Watchdog'
 Get-ScheduledTaskInfo 'MonClub Access Watchdog' | Select NextRunTime
 ```
 
-`NextRunTime` must be a date and time (see below). Whether the time trigger, whose
-start was the registration moment, gives a `NextRunTime` right after a later
-`Enable-ScheduledTask` is **not verified**; if it is empty, no check runs before the
-next Windows logon (the logon trigger).
+`NextRunTime` must be a date and time (see below). After a Disable, an
+`Enable-ScheduledTask` gives the task a `NextRunTime` and it runs on its own `[E2E 2026-10-10 (e):
+enabled 01:38 through the Settings API, the task ran at 01:39:21, result 0]`; if it is ever
+empty, no check runs before the next Windows logon (the logon trigger).
 
 and to remove it:
 
@@ -215,7 +226,7 @@ Priorities"). So Access started by this task -- task → `wscript.exe` → `powe
 `Start-Process` -- probably ran below normal `[UNVERIFIED: the chain was never measured]`,
 while Access makes the door decisions. `register_watchdog.ps1` now sets **priority 5**
 (`2f3d5bd`) `[CODE, TEST with the Task Scheduler stubbed]`. A task registered by an older
-script keeps 7 until the script registers it again (a ticked install, or by hand). Check
+script keeps 7 until the script registers it again (any install since design §12, or by hand). Check
 on a PC, after the watchdog has restarted Access:
 
 ```powershell

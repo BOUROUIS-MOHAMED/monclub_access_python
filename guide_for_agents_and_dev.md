@@ -58,7 +58,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The one-shot credentials re-send at startup — what it drops, its marker table, its place and catch in `init_db` (`db.py::_force_one_credentials_resend`, `::_run_one_shot_credentials_resend`, `local_one_shot_steps`; `tools/bench_credential_resend.py`) | §3.1b "The upgrade window" |
 | What happens when an `init_db` step fails — the five schema migrations and the inline `device_write_hold.pin_scheme` `ALTER` that stop startup, the steps that log and go on, a `try` or an `import logging` added inside `init_db` (`db.py::init_db`, `::_relax_firmware_profiles_not_null`, `::_rebuild_sync_users_without_legacy_fingerprint`, `::_ensure_main_account_id_column`, `::_ensure_pin_scheme_column`, `sync_device_store.py::ensure_ultra_merge_device_columns`, `::_run_one_shot_credentials_resend`) | §3.2d "A failing migration stops startup", §3.1b "The upgrade window" |
 | Anything in `app/core/v2/` (the server clock, the v2 client, the notice socket, leases, commands, ownership backup, problem reports, loss re-add), `access/v2_routes.py`, or a lease-gate call site (`ultra_engine.py::_v2_writes_blocked` and the `_lease_gate` calls, `device_sync.py`, `realtime_agent.py`, `device_attendance.py`, `ultra_worker_pool.py::devices_to_drive`, `access/local_api_routes.py::LEASE_GATED_HANDLERS` / `SCANNER_GATED_HANDLERS`) | §3.9 |
-| The software updater client — check / verify / download / install / start-up gate / journal restore / loop guard / telemetry / update pages (`shared/update_runtime.py`, `shared/release_manifest.py`, `shared/ed25519.py`, `shared/release_keys.py`, `shared/update_versions.py`, `shared/update_files.py`, `shared/update_wrapper.py`, `shared/update_startup.py`, `access/update_runtime.py`, the update handlers in `local_access_api_v2.py`, `UpdatePage.tsx` / `TvUpdatePage.tsx`); the installer half — the safe swap, journal, health wait, same-version / zkemkeeper rules, uninstall data (`installer/MonClubAccess.iss`, `installer/MonClubTV.iss`, `installer/update_safety.iss`, `installer/update_helper.ps1`), the watchdog's journal rule (`packaging/watchdog/monclub_access_watchdog.ps1`), the build / sign / publish gates (`build_release.ps1`, `tools/release_sign.py`, `publish_github_release.ps1`) | §11 Software updates |
+| The software updater client — check / verify / download / install / start-up gate / journal restore / loop guard / telemetry / update pages (`shared/update_runtime.py`, `shared/release_manifest.py`, `shared/ed25519.py`, `shared/release_keys.py`, `shared/update_versions.py`, `shared/update_files.py`, `shared/update_wrapper.py`, `shared/update_startup.py`, `access/update_runtime.py`, the update handlers in `local_access_api_v2.py`, `UpdatePage.tsx` / `TvUpdatePage.tsx`); the installer half — the safe swap, journal, health wait, same-version / zkemkeeper rules, uninstall data (`installer/MonClubAccess.iss`, `installer/MonClubTV.iss`, `installer/update_safety.iss`, `installer/update_helper.ps1`), the watchdog's journal rule (`packaging/watchdog/monclub_access_watchdog.ps1`), the watchdog task's registration and its Settings control (`packaging/watchdog/register_watchdog.ps1`, the `[Run]` entry and `WatchdogWhenMissing` in `MonClubAccess.iss`, `access/watchdog_control.py`, the `_handle_watchdog_*` handlers in `local_access_api_v2.py`, `tauri-ui/src/components/WatchdogCard.tsx`), the build / sign / publish gates (`build_release.ps1`, `tools/release_sign.py`, `publish_github_release.ps1`) | §11 Software updates |
 | What `push_safety.check_bulk_removal` defers (`add_only`, `handover_release`) or lets through (a Confirm-removal approval) | §3.2g, §3.9 |
 | The removal log (`db.py::_log_v2_removal` in `clear_device_revocation_state` / `delete_device_sync_state`) | §3.4a, §3.9 |
 | The Erase-content wizard or the write hold (`app/core/erase_wizard.py` — incl. `::refill_roster`, `::held_waiting_count`, `EraseWizard._refill_check`, and since lane 1c `::_sync_staleness` / `::_sync_max_age_sec` with `app.py`'s `_last_sync_ok_mono` stamp, `::terminal_people` / `::not_refilled` / `::_bind_not_refilled` / `KEEP_MARK`, `::_refill_recheck`, `::_prune_now` / `::_folder_times`, `::_no_answer`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s codes —, `app/core/device_hold.py` — incl. `load(release_unstarted=)` and the `erase-prep`/`erase` phases —, `db.py::set_device_write_hold` / `::clear_device_write_hold` / `::list_device_write_holds`, `::begin_device_erase`, `::release_unstarted_erase_holds`, `::undo_device_erase_record` / `::device_list_is_authoritative` (lane 1f), `erase_wizard.py::check_erase_switch` / `monclub_api.py::get_erase_wizard_switch` (the gym's server switch), `erase_wizard.py::prune_erase_backups` (30-day retention), `::retire_device_records`, `::invalidate_device_records`, `device_sync.py::_filter_users_for_device(quiet=)`, `PullSDKDevice.ERASABLE_TABLES`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s offline answer, the hold in `ultra_engine.py::_v2_writes_blocked`, the worker's `_connected_addr` (`::_connect` / `::_disconnect`), `device_sync.py`'s three hold checks, `v2/handlers.py::device_reconcile`, `app.py`'s start-up `device_hold.load()` and `_sync_tick`'s `device_hold.ensure_loaded()`, `ownership.py::OwnershipSync._worker_idle`, the `erase` routes and handlers, `local_access_api_v2.py::_refuse_held_or_frozen`, `PullSDKDevice.count_table_strict` / `::read_table_strict` / `::erase_table`, `ZKStandaloneDevice.read_device_status` / `::read_user_templates` and the listing's `privilege`, `tauri-ui/src/components/EraseWizardDialog.tsx`) | §3.2h, pullsdk_guide §5, zkemkeeper_guide §4 |
@@ -5858,7 +5858,7 @@ extracted to `{tmp}` and also installed into `{app}\watchdog`). `[CODE]`
 - **The 1.4.35 → 1.5.0 bootstrap hop** (old client, no wrapper, Setup started from inside
   `current\`) works with this installer. `[E2E L2 01/F01]` Residual: a Setup that aborts before
   any Pascal runs (corrupt download, Windows < 10) on that hop leaves the PC without Access
-  until the watchdog (if ticked) or a person starts it — only the v2 client's wrapper covers
+  until the watchdog (on by default since design §12, unless turned off) or a person starts it — only the v2 client's wrapper covers
   that, from the second hop on.
 - **Failure injection (tests only):** `ISCC /DUPDATER_TEST_FAIL=after_copy|health|crash`
   (any other value: compile error) builds `<base>_<ver>_TESTFAIL_<mode>.exe`;
@@ -5873,10 +5873,11 @@ logs to `{app}\logs\update-recover.log`. The helper path is resolved in the body
 PowerShell 5.1 `$PSScriptRoot` is empty inside a `param()` default (every tick died that way in
 L2's first E2E). The watchdog is not rolled back with the app (it works with any version).
 `[CODE; TEST: test_updater_v2_watchdog_journal.py; E2E L2 10/F10 — a power cut during the health
-wait, one tick of the installed watchdog → ROLLED_BACK interrupted]` The watchdog task is still
-unticked by default on existing installs (D39, owner product choice). It is a scheduled task
-(`register_watchdog.ps1`: at logon + every few minutes, `ExecutionTimeLimit` 5 min,
-`MultipleInstances IgnoreNew`) `[CODE]`. It starts the app only after two misses at least 90 s apart and
+wait, one tick of the installed watchdog → ROLLED_BACK interrupted]` It is the per-user scheduled
+task `MonClub Access Watchdog` (`register_watchdog.ps1`: at logon + every 2 min, `ExecutionTimeLimit`
+5 min, `MultipleInstances IgnoreNew`) `[CODE]`. **MonClub TV has no watchdog** (no task, no check script -- its
+`{app}\watchdog\` holds only `update_helper.ps1` -- and no Settings card) — after a TV crash or an interrupted TV update, TV comes back only when someone
+starts it or its installer relaunches it. `[CODE: MonClubTV.iss installs no watchdog script and has no [Run] registration]` The Access watchdog starts the app only after two misses at least 90 s apart and
 refuses after 5 restarts in 60 min (its crash-loop guard): after a real reboot on the dev PC Access was running
 about 2.5 min after Windows started `[FIELD: L4 E2E 2026-10-09]` — a morning start-up install begins only then.
 **After a power cut during the file copy only the watchdog (or re-running the installer, whose `recover -InSetup`
@@ -5884,6 +5885,69 @@ repairs) brings Access back:** the exe and `version.json` are copied last, so un
 shortcut has nothing to start and the app's own start-up journal check cannot run `[FIELD: L4 E2E (k) —
 the watchdog restored previous 88 s after the cut]`. The app's own start-at-logon is the HKCU `Run` value
 `MonClubAccess` written by `app/ui/app.py` when `start_on_system_startup` is set `[CODE]`.
+
+### 11.9a The watchdog is on by default; Settings turns it off (design §12, O7, 2026-10-10)
+
+**The Windows task's own state is the preference:** Enabled = on, Disabled = off, missing = never
+decided. D39 ("unticked by default on existing installs") is superseded.
+
+- **Installer** (`MonClubAccess.iss` `[Run]`, no `Tasks:` / `Check:`): every install and update, silent
+  or not, runs `{app}\watchdog\register_watchdog.ps1 -InstallRoot {app} -WhenMissing
+  {code:WatchdogWhenMissing}`. Missing task → registered **Enabled** (the one-time switch-on for PCs
+  installed before the box existed; 1.5.0 carries it to every PC on the first hop); an existing
+  Disabled task stays Disabled (`State: Disabled (kept)` — protects a Settings "off" and the cutover
+  runbook); an existing enabled task is refreshed, stays enabled; a **new** install whose box is
+  unticked → registered **Disabled** (`State: Disabled (chosen at install)`; `WatchdogWhenMissing` =
+  `IsFreshInstall and not WizardIsTaskSelected('watchdog')`, both read before the install). The box is
+  shown on new installs only. Uninstall still removes the task. The install-journal ordering of §11.8
+  is untouched (the new watchdog + helper are put in place by `PrepareToInstall`; registration is a
+  `[Run]` entry after the file copy). `[CODE; TEST: test_watchdog_script.py::TestRegisterWhenMissing,
+  ::TestInstallerWatchdogTask; E2E 2026-10-10 (a) 1.4.27 without a task → Enabled, (c) enabled stays
+  enabled, (b) Settings-off survives a silent update, (d) interactive new install unticked →
+  Disabled, (u) uninstall removes it — docs/access-updater-v2/e2e/watchdog-settings/]`
+- **Order inside Setup:** the `[Run]` registration runs **before** the post-install health wait
+  (`launch-wait`) `[FIELD: setup.log of E2E (a)]`; a freshly registered task first runs 2 min after
+  registration `[FIELD]`, and a check that lands during the wait stands down on the journal / Setup
+  rule (§11.9). Registration takes ≈ 10 s (the hidden-launcher probe) `[FIELD]`.
+- **Local API** (`access/watchdog_control.py`, routes in `access/local_api_routes.py`): `GET
+  /api/v2/watchdog` → `{ok, watchdog: {registered, enabled, state, lastRunAt, lastResult,
+  lastResultCode, nextRunAt, intervalMinutes, restartsLastHour, stoodDown, stoodDownReason,
+  scriptPath, lastLogEntry, lastError, available, installRoot, checkedAt}}`; `POST {enabled: bool}` →
+  `Enable-` / `Disable-ScheduledTask` (registered first through the installed `register_watchdog.ps1`
+  with `-WhenMissing` = the wanted state when missing), then the fresh status. **Never unregisters.**
+  Gate: the per-session X-Local-Token, like `PATCH /api/v2/config` (not in `_AUTH_EXEMPT`). 409
+  `WATCHDOG_UNAVAILABLE` outside an installed build (a source run resolves no install root unless
+  `MONCLUB_WATCHDOG_INSTALL_ROOT` names one — on a dev PC `%LOCALAPPDATA%\MonClubAccess` may be a real
+  install) or when `{app}\watchdog\register_watchdog.ps1` is missing; 409 `WATCHDOG_BUSY` while an Access
+  Setup runs (`update_files.setup_is_running(target="access")`, unknown = running), the pause
+  sentinel is under 30 min old, or another change is running; 502 `WATCHDOG_FAILED` with the fresh
+  status when the change failed or did not take. Who changed it: an app-log line `[Watchdog] turned
+  ON/OFF by Settings (<email>)` and a `SETTINGS` line in `{app}\logs\watchdog-register.log`. `[CODE;
+  TEST: test_watchdog_settings_api.py]`
+- **How it reads:** one hidden PowerShell per read (`CREATE_NO_WINDOW` + `SW_HIDE`, `-NonInteractive`,
+  timeouts 20 s read / 30 s change / 120 s register; `subprocess.run` kills it on timeout) in the
+  request's own thread (`ThreadingHTTPServer`), never on the app's main loop; a 5 s cache. Its JSON is
+  ASCII-only (localized Windows errors) with epoch-second dates (a never-run task's 1999-11-30 → null).
+  *Enabled* is the definition's `Settings.Enabled` and not `State` `Disabled` (a disabled task caught
+  mid-check reads `Running`, as in `register_watchdog.ps1`). `restartsLastHour` comes from
+  `{app}\logs\watchdog-state.json` `restarts` (epoch integers only); `lastLogEntry` is the last line of
+  `watchdog.log` (`fromLastCheck` when it is not older than the task's `LastRunTime` − 5 s: the healthy
+  path logs nothing, so a plain OK means Access was running). **`stoodDown` is partly predictive:**
+  true when 5+ restarts fall in the last 60 min (the watchdog's cap: it will not restart Access again
+  before the oldest of them ages out), or when the newest "NOT restarting again" line is inside the
+  last 60 min and after the last restart. The log stamps follow the PC's calendar (`Get-Date
+  -Format`); an unparseable stamp is kept as `rawAt`. `[CODE; TEST; real read-only PowerShell tests]`
+- **Settings card** (`tauri-ui/src/components/WatchdogCard.tsx`, logic and FR/EN texts in
+  `src/lib/watchdogStatus.ts`; on the Access ConfigPage after "Démarrage Windows"): chip On / Off /
+  Not installed / Error / Stood down after repeated crashes, last check + result, the switch (locked
+  outside an installed build or while saving), a confirm before turning off ("Access will not restart
+  by itself after a crash or an interrupted update"), FR by default with its own FR/EN toggle. It
+  reads on mount, after a change and on Refresh — no polling. Dev-only mock:
+  `tauri-ui/watchdog-mock.html` (`?state=…`, or `?api=…&token=…` against a real local API). `[TEST:
+  watchdogStatus.test.ts; E2E (e): real card + real handlers + real Task Scheduler, through a test
+  host — the frozen app / Tauri shell were not exercised (the card is behind the login)]`
+- **Enable after Disable resumes checks:** `[E2E (e): enabled 01:38, the task ran by itself at
+  01:39:21, result 0]`.
 
 ### 11.10 Uninstall and data (D26)
 
