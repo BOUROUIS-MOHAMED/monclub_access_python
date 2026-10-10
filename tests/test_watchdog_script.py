@@ -381,7 +381,8 @@ param(
     [string] $LeavesTask,      # 'yes': the failing registration (RegisterFails) still created
                                # the new task, enabled, before it threw
     [string] $UnregisterNewFails, # 'yes': Unregister-ScheduledTask throws once the new task is registered
-    [string] $Mode             # 'register', or 'remove' (-Remove)
+    [string] $Mode,            # 'register', or 'remove' (-Remove)
+    [string] $WhenMissing      # '' = the script's default; else passed as -WhenMissing
 )
 $ErrorActionPreference = 'Stop'
 Import-Module ScheduledTasks
@@ -505,8 +506,10 @@ try {
         & $Script -TaskName $TaskName -InstallRoot $InstallRoot -Remove `
             -InformationVariable iv -WarningVariable wv 3>$null 6>$null | Out-Null
     } else {
+        $extra = @{}
+        if ($WhenMissing) { $extra['WhenMissing'] = $WhenMissing }
         & $Script -TaskName $TaskName -InstallRoot $InstallRoot -WatchdogScript $WatchdogScript `
-            -InformationVariable iv -WarningVariable wv 3>$null 6>$null | Out-Null
+            @extra -InformationVariable iv -WarningVariable wv 3>$null 6>$null | Out-Null
     }
 } catch {
     $err = $_.Exception.Message
@@ -541,6 +544,8 @@ def _register(
     leaves_task: bool = False,
     unregister_new_fails: bool = False,
     mode: str = "register",
+    when_missing: str = "",
+    expect_register: bool = True,
 ) -> dict:
     """Run the shipped register_watchdog.ps1 once against a stubbed Task Scheduler.
 
@@ -569,7 +574,8 @@ def _register(
          "-XmlHonoured", "fails" if xml_fails else ("yes" if xml_honoured else "no"),
          "-LeavesTask", "yes" if leaves_task else "no",
          "-UnregisterNewFails", "yes" if unregister_new_fails else "no",
-         "-Mode", mode],
+         "-Mode", mode,
+         "-WhenMissing", when_missing],
         capture_output=True, text=True, timeout=120, check=False,
     )
     assert "LEAKED" not in out.stdout, (
@@ -580,7 +586,7 @@ def _register(
     lines = [ln for ln in out.stdout.splitlines() if ln.startswith("RESULT ")]
     assert lines, f"harness gave no result: stdout={out.stdout!r} stderr={out.stderr!r}"
     result = json.loads(lines[-1][len("RESULT "):])
-    if mode == "register":
+    if mode == "register" and expect_register:
         assert any(c.startswith("register") for c in result["calls"]), (
             f"the script never reached the stubbed Register-ScheduledTask: {result!r}"
         )
@@ -834,6 +840,73 @@ class TestRegisterLeavesATrace:
         assert "export" not in r["calls"]
 
 
+@pytest.mark.skipif(winps is None, reason="Windows PowerShell (powershell.exe) not available")
+@pytest.mark.skipif(not REGISTER.exists(), reason=f"{REGISTER} missing")
+class TestRegisterWhenMissing:
+    """Design section 12 (owner decision O7): the installer runs the script on EVERY
+    install and update. ``-WhenMissing`` only decides the state of a task that does not
+    exist yet -- Enabled (the default: the one-time switch-on for PCs installed before the
+    box existed) or Disabled (a fresh install whose box was unticked: the choice is recorded
+    so later updates do not switch it on). A task that exists keeps its state."""
+
+    def test_a_missing_task_is_registered_enabled_by_default(self, tmp_path: Path):
+        r = _register(tmp_path, initial="none")
+        assert r["error"] == "", r
+        assert r["registered"]["enabled"] is True, r
+        assert r["final"] == "Ready", r
+
+    def test_a_missing_task_is_registered_enabled_when_asked(self, tmp_path: Path):
+        r = _register(tmp_path, initial="none", when_missing="Enabled")
+        assert r["error"] == "", r
+        assert r["registered"]["enabled"] is True, r
+        assert r["final"] == "Ready", r
+
+    def test_a_missing_task_is_registered_disabled_when_the_box_was_unticked(self, tmp_path: Path):
+        r = _register(tmp_path, initial="none", when_missing="Disabled")
+        assert r["error"] == "", r
+        assert r["registered"]["enabled"] is False, (
+            f"an unticked fresh install must record OFF, not register it enabled: {r!r}"
+        )
+        assert r["final"] == "Disabled", r
+        assert "enable" not in r["calls"], r
+        assert re.search(r"State:\s+Disabled \(chosen at install\)", r["output"]), r["output"]
+        assert "State: Disabled (chosen at install)" in r["log"], r["log"]
+
+    def test_disabled_when_missing_is_enforced_if_windows_registers_it_enabled(self, tmp_path: Path):
+        r = _register(tmp_path, initial="none", when_missing="Disabled", honour_enabled=False)
+        assert r["error"] == "", r
+        assert r["calls"].index("register") < r["calls"].index("disable"), r["calls"]
+        assert r["final"] == "Disabled", r
+
+    def test_disabled_when_missing_never_leaves_an_enabled_task(self, tmp_path: Path):
+        """Nothing keeps it disabled and there is no old task to put back: no task at all
+        (the next update registers it enabled -- the default) beats an enabled one now."""
+        r = _register(tmp_path, initial="none", when_missing="Disabled",
+                      honour_enabled=False, disable_works=False)
+        assert "could not be kept disabled" in r["error"], r
+        assert "Ready" not in r["final"].split(","), r
+
+    def test_an_existing_disabled_task_stays_disabled_whatever_when_missing_says(self, tmp_path: Path):
+        r = _register(tmp_path, initial="Disabled", when_missing="Enabled")
+        assert r["error"] == "", r
+        assert r["registered"]["enabled"] is False, r
+        assert r["final"] == "Disabled", r
+        assert re.search(r"State:\s+Disabled \(kept\)", r["output"]), r["output"]
+
+    def test_an_existing_enabled_task_stays_enabled_whatever_when_missing_says(self, tmp_path: Path):
+        r = _register(tmp_path, initial="Ready", when_missing="Disabled")
+        assert r["error"] == "", r
+        assert r["registered"]["enabled"] is True, r
+        assert r["final"] == "Ready", r
+        assert "disable" not in r["calls"], r
+
+    def test_an_unknown_value_is_refused_before_any_task_is_touched(self, tmp_path: Path):
+        r = _register(tmp_path, initial="Ready", when_missing="Maybe", expect_register=False)
+        assert r["error"], r
+        assert r["calls"] == [], r
+        assert r["final"] == "Ready", r
+
+
 def _iss_section(text: str, name: str) -> list[str]:
     """The non-comment lines of one [Section] of the .iss, continuations joined."""
     lines: list[str] = []
@@ -867,8 +940,16 @@ def _iscc() -> str | None:
 
 @pytest.mark.skipif(not INSTALLER.exists(), reason=f"{INSTALLER} missing")
 class TestInstallerWatchdogTask:
-    """"Keep MonClub Access running": ticked for a NEW install, and an existing
-    install keeps its previous choice (owner decision, 2026-09-26).
+    """"Keep MonClub Access running": shown, ticked, for a NEW install only. Since
+    design section 12 (owner decision O7, 2026-10-10) the box no longer decides
+    whether the task is registered -- the installer registers it on EVERY install
+    and update and the Windows task's own state is the preference. The box only
+    decides the state of a task that does not exist yet on a fresh install
+    (unticked = registered DISABLED). An existing install shows no box: the
+    Access Settings switch is the control there.
+
+    The history below is why the box is not shown on an update (it used to be,
+    unticked, because of the Inno behaviour described):
 
     What Inno Setup does with these lines is its own code, not ours, read from
     its source (Setup.WizardForm.pas, TWizardForm.CreateTaskButtons, tag
@@ -893,16 +974,14 @@ class TestInstallerWatchdogTask:
             "without UsePreviousTasks=yes an update forgets the previous choice"
         )
 
-    def test_ticked_only_when_the_install_is_new(self):
+    def test_the_box_is_shown_ticked_and_only_on_a_new_install(self):
+        """On an update the box would decide nothing (a missing task is registered
+        ENABLED, an existing one keeps its state), so it is not shown there."""
         tasks = self._tasks()
-        assert len(tasks) == 2, f"expected the two watchdog entries, got: {tasks!r}"
-        fresh = [ln for ln in tasks if re.search(r"Check:\s*IsFreshInstall\b", ln)]
-        existing = [ln for ln in tasks if re.search(r"Check:\s*not\s+IsFreshInstall\b", ln)]
-        assert len(fresh) == 1 and len(existing) == 1, tasks
-        assert "unchecked" not in fresh[0], f"a new install must get it ticked: {fresh[0]!r}"
-        assert re.search(r"Flags:[^;]*\bunchecked\b", existing[0]), (
-            f"an existing install with no recorded choice must get it unticked: {existing[0]!r}"
-        )
+        assert len(tasks) == 1, f"expected one watchdog entry, got: {tasks!r}"
+        assert re.search(r"Check:\s*IsFreshInstall\b", tasks[0]), tasks[0]
+        assert not re.search(r"Check:\s*not\s+IsFreshInstall\b", tasks[0]), tasks[0]
+        assert "unchecked" not in tasks[0], f"a new install must get it ticked: {tasks[0]!r}"
 
     def test_checkedonce_is_not_used(self):
         """Not on any task: the Start Menu shortcut used it, and was unticked at
@@ -928,12 +1007,34 @@ class TestInstallerWatchdogTask:
             body,
         ), body
 
-    def test_the_register_script_runs_only_when_the_box_is_ticked(self):
+    def test_the_register_script_runs_on_every_install_and_update(self):
+        """Design section 12: not only when the box is ticked -- that kept the watchdog
+        off on every PC installed before the box existed (UsePreviousTasks kept it
+        unticked)."""
         text = INSTALLER.read_text(encoding="utf-8", errors="replace")
         runs = [ln for ln in _iss_section(text, "Run") if "register_watchdog.ps1" in ln]
         assert len(runs) == 1, runs
-        assert re.search(r"Tasks:\s*watchdog\b", runs[0]), runs[0]
+        assert not re.search(r"\bTasks:", runs[0]), (
+            f"the registration must not depend on a task box any more: {runs[0]!r}"
+        )
+        assert not re.search(r"\bCheck:", runs[0]), runs[0]
         assert "-Remove" not in runs[0]
+        assert re.search(r"-WhenMissing\s+\{code:WatchdogWhenMissing\}", runs[0]), runs[0]
+        assert re.search(r"Flags:[^;]*\brunascurrentuser\b", runs[0]), runs[0]
+        assert re.search(r"Flags:[^;]*\brunhidden\b", runs[0]), runs[0]
+
+    def test_only_a_new_install_with_the_box_unticked_registers_it_disabled(self):
+        text = INSTALLER.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r"function WatchdogWhenMissing\(Param: string\): string;.*?\nend;", text, re.S)
+        assert m, "WatchdogWhenMissing is gone from the [Code] section"
+        body = re.sub(r"//[^\n]*", "", m.group(0))
+        assert re.search(
+            r"if\s+IsFreshInstall\s+and\s+\(\s*not\s+WizardIsTaskSelected\('watchdog'\)\s*\)\s+then\s+"
+            r"Result\s*:=\s*'Disabled'\s+else\s+Result\s*:=\s*'Enabled'\s*;",
+            body,
+        ), body
+        # Nothing else may decide it (an update must never record OFF by itself).
+        assert body.count("Result :=") == 2, body
 
     def test_setup_always_writes_its_log(self):
         """The in-app update starts the installer with /VERYSILENT and no /LOG
