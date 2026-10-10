@@ -38,8 +38,10 @@ export interface WatchdogStatus {
 
 export type WatchdogChip = "loading" | "on" | "off" | "notInstalled" | "error" | "stoodDown";
 
+// A failed read shows Error even when an older status is on screen (that status may be stale).
 export function watchdogChip(status: WatchdogStatus | null, fetchError: string | null): WatchdogChip {
-  if (!status) return fetchError ? "error" : "loading";
+  if (fetchError) return "error";
+  if (!status) return "loading";
   if (status.lastError || status.registered === null) return "error";
   if (!status.registered) return "notInstalled";
   if (!status.enabled) return "off";
@@ -64,8 +66,8 @@ export function needsConfirm(nextEnabled: boolean): boolean {
   return !nextEnabled;
 }
 
-export function switchDisabled(status: WatchdogStatus | null, busy: boolean): boolean {
-  return busy || !status || !status.available || status.registered === null;
+export function switchDisabled(status: WatchdogStatus | null, busy: boolean, fetchError: string | null = null): boolean {
+  return busy || !!fetchError || !status || !status.available || status.registered === null;
 }
 
 const fr = {

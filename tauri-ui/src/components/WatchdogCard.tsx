@@ -22,9 +22,9 @@ import {
   watchdogChip, watchdogTexts, type Lang, type WatchdogStatus,
 } from "@/lib/watchdogStatus";
 
-// Registering a missing task makes the server probe its hidden launcher (up to 30 s) before
-// Register-ScheduledTask; the server itself gives up after 120 s.
-const CHANGE_TIMEOUT_MS = 150_000;
+// The server's worst case for one change: read 20 s + register 120 s (its hidden-launcher probe
+// alone may take 30 s) + read 20 s + Enable/Disable 30 s + read 20 s = 210 s (review #3).
+const CHANGE_TIMEOUT_MS = 240_000;
 
 export default function WatchdogCard() {
   const [lang, setLang] = useState<Lang>(() => loadLang());
@@ -42,6 +42,7 @@ export default function WatchdogCard() {
       const res = await get<{ ok: boolean; watchdog: WatchdogStatus }>("/watchdog");
       setStatus(res.watchdog);
       setFetchError(null);
+      setChangeError(null);
     } catch (e) {
       setFetchError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -125,7 +126,7 @@ export default function WatchdogCard() {
               id="watchdog-switch"
               data-testid="watchdog-switch"
               checked={status?.enabled === true}
-              disabled={switchDisabled(status, busy)}
+              disabled={switchDisabled(status, busy || loading, fetchError)}
               onCheckedChange={(checked: boolean) => onSwitch(checked)}
             />
           </div>

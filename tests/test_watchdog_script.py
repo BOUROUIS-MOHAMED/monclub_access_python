@@ -382,7 +382,8 @@ param(
                                # the new task, enabled, before it threw
     [string] $UnregisterNewFails, # 'yes': Unregister-ScheduledTask throws once the new task is registered
     [string] $Mode,            # 'register', or 'remove' (-Remove)
-    [string] $WhenMissing      # '' = the script's default; else passed as -WhenMissing
+    [string] $WhenMissing,     # '' = the script's default; else passed as -WhenMissing
+    [string] $GetFails         # 'yes': a Get-ScheduledTask with -ErrorAction Stop fails (not "not found")
 )
 $ErrorActionPreference = 'Stop'
 Import-Module ScheduledTasks
@@ -398,6 +399,7 @@ $global:LeavesTask = ($LeavesTask -eq 'yes')
 $global:UnregNewFails = ($UnregisterNewFails -eq 'yes')
 $global:Expected   = $TaskName
 $global:Registered = $null
+$global:StubGetFails = ($GetFails -eq 'yes')
 function global:New-FakeTask([string] $Path, [string] $State, [bool] $Enabled) {
     # State is the runtime state; Settings.Enabled is the definition, as on a real
     # task (a disabled task whose check is running can read 'Running').
@@ -425,7 +427,13 @@ function global:Get-ScheduledTask {
     param([string] $TaskName, [string] $TaskPath, $ErrorAction)
     if ($TaskName -ne $global:Expected) { throw "stub: unexpected task name '$TaskName'" }
     [void] $global:Calls.Add('get')
-    $global:Tasks | Where-Object { -not $TaskPath -or $_.TaskPath -eq $TaskPath }
+    if ($global:StubGetFails -and $ErrorAction -eq 'Stop') { throw 'stub: CIM query failed' }
+    $found = @($global:Tasks | Where-Object { -not $TaskPath -or $_.TaskPath -eq $TaskPath })
+    if ($found.Count -eq 0 -and $ErrorAction -eq 'Stop') {
+        # What the real cmdlet does for an unknown name (category ObjectNotFound).
+        Write-Error -Message 'stub: No MSFT_ScheduledTask objects found' -Category ObjectNotFound -ErrorAction Stop
+    }
+    $found
 }
 function global:Export-ScheduledTask {
     param([string] $TaskName, [string] $TaskPath)
@@ -546,6 +554,7 @@ def _register(
     mode: str = "register",
     when_missing: str = "",
     expect_register: bool = True,
+    get_fails: bool = False,
 ) -> dict:
     """Run the shipped register_watchdog.ps1 once against a stubbed Task Scheduler.
 
@@ -575,7 +584,8 @@ def _register(
          "-LeavesTask", "yes" if leaves_task else "no",
          "-UnregisterNewFails", "yes" if unregister_new_fails else "no",
          "-Mode", mode,
-         "-WhenMissing", when_missing],
+         "-WhenMissing", when_missing,
+         "-GetFails", "yes" if get_fails else "no"],
         capture_output=True, text=True, timeout=120, check=False,
     )
     assert "LEAKED" not in out.stdout, (
@@ -899,6 +909,15 @@ class TestRegisterWhenMissing:
         assert r["registered"]["enabled"] is True, r
         assert r["final"] == "Ready", r
         assert "disable" not in r["calls"], r
+
+    def test_a_failed_query_is_not_a_missing_task(self, tmp_path: Path):
+        """Review #6: a read that FAILS (not "not found") must not make a disabled task
+        "missing" and register it enabled -- the run fails and the task is left alone."""
+        r = _register(tmp_path, initial="Disabled", get_fails=True, expect_register=False)
+        assert "Could not read scheduled task" in r["error"], r
+        assert not any(c.startswith("register") or c == "unregister" for c in r["calls"]), r["calls"]
+        assert r["final"] == "Disabled", r
+        assert "FAILED" in r["log"], r["log"]
 
     def test_an_unknown_value_is_refused_before_any_task_is_touched(self, tmp_path: Path):
         r = _register(tmp_path, initial="Ready", when_missing="Maybe", expect_register=False)

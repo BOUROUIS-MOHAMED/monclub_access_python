@@ -59,9 +59,6 @@ _RESULT_OK = {0, 0x41300, 0x41302}
 _RESULT_RUNNING = {0x41301, 0x41325}
 _RESULT_NOT_RUN = {0x41303}
 
-# The watchdog's crash-loop refusal (monclub_access_watchdog.ps1, restart-rate cap).
-_CAP_MARKER = "NOT restarting again"
-
 Runner = Callable[[Sequence[str], float], Tuple[int, str, str]]
 
 
@@ -272,6 +269,7 @@ class WatchdogControl:
         self._setup_running = setup_running or _access_setup_running
         self._cache_sec = cache_sec
         self._cache: Optional[Tuple[float, Dict[str, Any]]] = None
+        self._cache_gen = 0  # bumped by every invalidation: a read started before it is not cached
         self._cache_lock = threading.Lock()
         self._change_lock = threading.Lock()
 
@@ -367,14 +365,18 @@ class WatchdogControl:
         with self._cache_lock:
             if self._cache and self._cache_sec > 0 and self._now() - self._cache[0] < self._cache_sec:
                 return dict(self._cache[1])
+            gen = self._cache_gen
         result = self._build_status(self._query_task())
         with self._cache_lock:
-            self._cache = (self._now(), result)
+            # A change finished while this read ran: its status is newer than ours (review #5).
+            if gen == self._cache_gen:
+                self._cache = (self._now(), result)
         return dict(result)
 
     def _invalidate(self) -> None:
         with self._cache_lock:
             self._cache = None
+            self._cache_gen += 1
 
     def _build_status(self, task: Dict[str, Any]) -> Dict[str, Any]:
         now = self._now()
@@ -399,24 +401,18 @@ class WatchdogControl:
             )
             last_entry = parsed
 
+        # The watchdog refuses a restart exactly when 5+ of its restarts fall inside the last 60 min
+        # (monclub_access_watchdog.ps1). So this is the rule, read from the same epoch stamps --
+        # PREDICTIVE: the page is served by a running Access, so it says "would not restart it if it
+        # stopped now", not that a refusal is happening. Its own "NOT restarting again" log line is
+        # no extra signal: it is written only while that count holds (review #1).
         stood_down = False
         reason: Optional[str] = None
         if len(restarts) >= MAX_RESTARTS_PER_WINDOW:
             stood_down = True
-            until = iso_utc(min(restarts[-MAX_RESTARTS_PER_WINDOW:]) + RATE_WINDOW_SEC)
+            until = iso_utc(sorted(restarts)[-MAX_RESTARTS_PER_WINDOW] + RATE_WINDOW_SEC)
             reason = (f"Access was restarted {len(restarts)} times in the last 60 min; the watchdog "
                       f"will not restart it again before {until}")
-        else:
-            # The refusal line itself: newest cap line, inside the hour, after the last restart.
-            last_restart = max(self._restarts(), default=0)
-            for ln in reversed(lines):
-                if _CAP_MARKER in ln:
-                    cap = self._parse_log_line(ln)
-                    cap_at = cap.get("epoch")
-                    if cap_at is not None and cap_at > now - RATE_WINDOW_SEC and cap_at > last_restart:
-                        stood_down = True
-                        reason = cap["message"]
-                    break
 
         intervals = task.get("intervals") if registered else None
         return {
@@ -550,6 +546,7 @@ class WatchdogControl:
                     f"the watchdog task did not change (it reads {current['state'] or 'unknown'})", current)
             self._append_register_log("SETTINGS", f"{want} by {actor} (was {before})")
             with self._cache_lock:
+                self._cache_gen += 1
                 self._cache = (self._now(), current)
             return dict(current)
         finally:

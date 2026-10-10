@@ -5932,10 +5932,12 @@ decided. D39 ("unticked by default on existing installs") is superseded.
   mid-check reads `Running`, as in `register_watchdog.ps1`). `restartsLastHour` comes from
   `{app}\logs\watchdog-state.json` `restarts` (epoch integers only); `lastLogEntry` is the last line of
   `watchdog.log` (`fromLastCheck` when it is not older than the task's `LastRunTime` − 5 s: the healthy
-  path logs nothing, so a plain OK means Access was running). **`stoodDown` is partly predictive:**
-  true when 5+ restarts fall in the last 60 min (the watchdog's cap: it will not restart Access again
-  before the oldest of them ages out), or when the newest "NOT restarting again" line is inside the
-  last 60 min and after the last restart. The log stamps follow the PC's calendar (`Get-Date
+  path logs nothing, so a plain OK means Access was running). **`stoodDown` is predictive:** true
+  exactly when 5+ restarts fall in the last 60 min — the watchdog's own cap rule, from the same epoch
+  stamps: it would not restart Access if it stopped now, until the 5th-newest restart is an hour old
+  (the time is in `stoodDownReason`). The page is served by a running Access, so it never shows a
+  refusal in progress; the watchdog's "NOT restarting again" log line is written only while that
+  count holds, so it adds nothing (review #1). The log stamps follow the PC's calendar (`Get-Date
   -Format`); an unparseable stamp is kept as `rawAt`. `[CODE; TEST; real read-only PowerShell tests]`
 - **Settings card** (`tauri-ui/src/components/WatchdogCard.tsx`, logic and FR/EN texts in
   `src/lib/watchdogStatus.ts`; on the Access ConfigPage after "Démarrage Windows"): chip On / Off /
@@ -5947,7 +5949,16 @@ decided. D39 ("unticked by default on existing installs") is superseded.
   watchdogStatus.test.ts; E2E (e): real card + real handlers + real Task Scheduler, through a test
   host — the frozen app / Tauri shell were not exercised (the card is behind the login)]`
 - **Enable after Disable resumes checks:** `[E2E (e): enabled 01:38, the task ran by itself at
-  01:39:21, result 0]`.
+  01:39:21, result 0]`. **Register-first through the API** (POST on a PC with no task) runs the same
+  installed `register_watchdog.ps1` the installer runs (E2E'd), but that API path itself is
+  `[TEST only; UNVERIFIED E2E]` — every E2E POST met an existing task.
+- **Not changed (review, reported):** the registration adds ≈ 10 s to every update's downtime (it
+  runs after `PrepareToInstall` stopped the app and before the health wait; it did so before on PCs
+  with the box ticked) and has no overall deadline (`waituntilterminated`; only the launcher probe is
+  capped at 30 s). A task Windows will not keep disabled on a new unticked install is removed, and the
+  next update then registers it enabled (logged FAILED). A query that FAILS (not "not found") ends the
+  registration with the task untouched (`ObjectNotFound` is the only "missing") `[CODE; TEST:
+  ::test_a_failed_query_is_not_a_missing_task]`.
 
 ### 11.10 Uninstall and data (D26)
 

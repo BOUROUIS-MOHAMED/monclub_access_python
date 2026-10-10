@@ -307,7 +307,20 @@ $principal = New-ScheduledTaskPrincipal `
 # A MISSING task takes the -WhenMissing state (design section 12): Disabled only for
 # a fresh install whose box was unticked. It goes through the same "keep it
 # disabled" path below -- read back, disabled again, never left enabled.
-$existingTasks = @(Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+#
+# "Missing" must mean missing: -ErrorAction SilentlyContinue cannot tell "no such task" from a
+# query that failed (CIM hiccup), and a failed read of a DISABLED task would then register it
+# ENABLED -- on every update since design section 12. Only ObjectNotFound (what Get-ScheduledTask
+# raises for an unknown name; an enum, not localized text) counts as missing; any other error
+# ends the run before the task is touched (review #6).
+try {
+    $existingTasks = @(Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop)
+} catch {
+    if ($_.CategoryInfo.Category -ne [System.Management.Automation.ErrorCategory]::ObjectNotFound) {
+        throw "Could not read scheduled task '$TaskName' (left untouched): $($_.Exception.Message)"
+    }
+    $existingTasks = @()
+}
 $keepDisabled = @($existingTasks | Where-Object { Test-WatchdogTaskDisabled $_ }).Count -gt 0
 $disabledLabel = 'Disabled (kept)'
 if ($existingTasks.Count -eq 0 -and $WhenMissing -eq 'Disabled') {

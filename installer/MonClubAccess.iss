@@ -315,8 +315,8 @@ end;
 
 function IsFreshInstall(): Boolean;
 begin
-  // Picks which of the two [Tasks] "watchdog" entries is shown: ticked for a
-  // new install, unticked by default otherwise. "Existing" is read both ways
+  // Shows the [Tasks] "watchdog" box (new installs only) and, in WatchdogWhenMissing,
+  // lets an unticked box register the task disabled. "Existing" is read both ways
   // on purpose -- Inno's own uninstall record (PrevAppDir, from 'Inno Setup:
   // App Path') and the files this script already detects -- so an install
   // with either one left behind is never mistaken for a new one.

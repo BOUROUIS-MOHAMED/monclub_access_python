@@ -54,6 +54,11 @@ test("chip: nothing read yet", () => {
   assert.equal(watchdogChip(null, "Failed to fetch"), "error");
 });
 
+test("a failed refresh shows Error and locks the switch even with an older status on screen", () => {
+  assert.equal(watchdogChip(status(), "Failed to fetch"), "error");
+  assert.equal(switchDisabled(status(), false, "Failed to fetch"), true);
+});
+
 test("chip colours", () => {
   assert.equal(chipVariant("on"), "success");
   assert.equal(chipVariant("stoodDown"), "warning");

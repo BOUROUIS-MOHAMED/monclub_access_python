@@ -202,32 +202,26 @@ class TestWatchdogFiles:
         assert s["stoodDown"] is True
         assert "5" in s["stoodDownReason"]
 
-    def test_a_logged_refusal_after_the_last_restart_is_a_stand_down(self, root: Path):
-        """The state file was trimmed (fewer than 5 inside the hour now) but the watchdog's
-        last word was the crash-loop refusal, after its last restart and inside the hour."""
+    def test_a_refusal_whose_restarts_have_aged_out_is_over(self, root: Path):
+        """Review #1: 5 restarts 10:00-10:05, refusal logged at 10:50; at 11:03 fewer than 5 are
+        inside the hour, so the watchdog WOULD restart Access again -- not stood down any more."""
+        stamps = [int(NOW - 3780 + i * 120) for i in range(5)]  # 2 of them older than an hour
         write_bom_utf8(root / "logs" / "watchdog-state.json",
-                       json.dumps({"misses": 2, "missAt": int(NOW - 120), "restarts": [int(NOW - 3500)]}))
+                       json.dumps({"misses": 2, "missAt": int(NOW - 120), "restarts": stamps}))
         write_bom_utf8(root / "logs" / "watchdog.log", (
-            f"{local_stamp(NOW - 300)} | ERROR | app is down but it has already been restarted 5 time(s) "
+            f"{local_stamp(NOW - 780)} | ERROR | app is down but it has already been restarted 5 time(s) "
             f"in the last 60 min -- NOT restarting again. This build is crash-looping and needs a human.\n"))
         s = control(root, FakeRunner(task_json())).status()
+        assert s["restartsLastHour"] == 3
+        assert s["stoodDown"] is False
+
+    def test_the_stand_down_ends_when_the_fifth_newest_restart_is_an_hour_old(self, root: Path):
+        stamps = [int(NOW - 3000), int(NOW - 2000), int(NOW - 1000), int(NOW - 500), int(NOW - 100),
+                  int(NOW - 50)]
+        write_bom_utf8(root / "logs" / "watchdog-state.json", json.dumps({"restarts": stamps}))
+        s = control(root, FakeRunner(task_json())).status()
         assert s["stoodDown"] is True
-        assert "NOT restarting again" in s["stoodDownReason"]
-
-    def test_an_old_refusal_is_not_a_stand_down(self, root: Path):
-        write_bom_utf8(root / "logs" / "watchdog.log", (
-            f"{local_stamp(NOW - 7200)} | ERROR | app is down but it has already been restarted 5 time(s) "
-            f"in the last 60 min -- NOT restarting again.\n"))
-        s = control(root, FakeRunner(task_json())).status()
-        assert s["stoodDown"] is False
-
-    def test_a_refusal_followed_by_a_restart_is_over(self, root: Path):
-        write_bom_utf8(root / "logs" / "watchdog-state.json",
-                       json.dumps({"misses": 0, "missAt": 0, "restarts": [int(NOW - 100)]}))
-        write_bom_utf8(root / "logs" / "watchdog.log", (
-            f"{local_stamp(NOW - 600)} | ERROR | app is down ... -- NOT restarting again.\n"))
-        s = control(root, FakeRunner(task_json())).status()
-        assert s["stoodDown"] is False
+        assert wc.iso_utc(NOW - 2000 + 3600) in s["stoodDownReason"]
 
     def test_a_corrupt_state_file_counts_nothing(self, root: Path):
         (root / "logs" / "watchdog-state.json").write_text("{not json", encoding="utf-8")
@@ -421,6 +415,31 @@ class TestSetEnabled:
                 c.set_enabled(False, actor="t")
         finally:
             c._change_lock.release()
+
+    def test_a_read_that_started_before_a_change_does_not_overwrite_its_status(self, root: Path):
+        """Review #5: GET misses the cache and runs its query; a POST finishes meanwhile; the
+        GET's older answer must not become the cached status."""
+        c = wc.WatchdogControl(install_root=root, runner=None, now=lambda: NOW,
+                               setup_running=lambda: False, cache_sec=60)
+        disabled = task_json(state="Disabled", settingsEnabled=False)
+        answers = [disabled, (0, "", ""), task_json()]
+
+        def runner(args, timeout):
+            if not answers:
+                return 0, json.dumps(disabled), ""
+            a = answers.pop(0)
+            return (0, json.dumps(a), "") if isinstance(a, dict) else a
+
+        def slow_get_runner(args, timeout):
+            # The GET's own query: while it "runs", a change turns the task on.
+            c._runner = runner
+            c.set_enabled(True, actor="t")
+            return 0, json.dumps(disabled), ""
+
+        c._runner = slow_get_runner
+        stale = c.status()
+        assert stale["enabled"] is False  # the GET itself answers what it read
+        assert c.status()["enabled"] is True  # but the cache holds the change's status
 
     def test_a_change_drops_the_cached_status(self, root: Path):
         runner = FakeRunner(task_json(), task_json(), (0, "", ""),
