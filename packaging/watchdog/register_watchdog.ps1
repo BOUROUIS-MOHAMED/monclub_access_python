@@ -19,14 +19,26 @@
 
     Registering a per-user task for yourself needs no elevation.
 
-    A task that already exists and is DISABLED stays disabled: it is registered
-    again with the current definition, still disabled. The installer runs this
-    script on every install and update where its box is ticked, so this is what
-    keeps an update from switching the watchdog back on. To turn it on:
+    The Windows task's own state is the preference (design section 12, owner
+    decision O7): Enabled = on, Disabled = off (an operator, the cutover runbook or
+    the Access Settings switch chose it), missing = never decided. The installer
+    runs this script on EVERY install and update, silent or not:
+      * a task that already exists and is DISABLED stays disabled: it is registered
+        again with the current definition, still disabled -- an update never
+        switches the watchdog back on;
+      * a task that exists and is enabled is refreshed and stays enabled;
+      * a MISSING task is registered in the -WhenMissing state: Enabled (the
+        default -- the one-time switch-on for PCs installed before the box existed)
+        or Disabled (a fresh install whose box was unticked: the choice is recorded,
+        so later updates do not switch it on).
+    To turn it on: the Access Settings switch, or
         Enable-ScheduledTask -TaskName 'MonClub Access Watchdog'
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File register_watchdog.ps1
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File register_watchdog.ps1 -WhenMissing Disabled
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File register_watchdog.ps1 -Remove
@@ -38,6 +50,10 @@ param(
     [string] $InstallRoot = (Join-Path $env:LOCALAPPDATA 'MonClubAccess'),
     [string] $WatchdogScript,
     [int]    $IntervalMinutes = 2,
+    # State of a task that does not exist yet (see .DESCRIPTION). An existing task
+    # keeps its own state whatever this says.
+    [ValidateSet('Enabled', 'Disabled')]
+    [string] $WhenMissing = 'Enabled',
     [switch] $Remove
 )
 
@@ -287,10 +303,30 @@ $principal = New-ScheduledTaskPrincipal `
 # until someone runs Enable-ScheduledTask. No task, or an enabled one, is
 # registered enabled, as before. "Disabled" is the definition's, not only the
 # runtime State (Test-WatchdogTaskDisabled).
-$keepDisabled = @(
-    Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue |
-        Where-Object { Test-WatchdogTaskDisabled $_ }
-).Count -gt 0
+#
+# A MISSING task takes the -WhenMissing state (design section 12): Disabled only for
+# a fresh install whose box was unticked. It goes through the same "keep it
+# disabled" path below -- read back, disabled again, never left enabled.
+#
+# "Missing" must mean missing: -ErrorAction SilentlyContinue cannot tell "no such task" from a
+# query that failed (CIM hiccup), and a failed read of a DISABLED task would then register it
+# ENABLED -- on every update since design section 12. Only ObjectNotFound (what Get-ScheduledTask
+# raises for an unknown name; an enum, not localized text) counts as missing; any other error
+# ends the run before the task is touched (review #6).
+try {
+    $existingTasks = @(Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop)
+} catch {
+    if ($_.CategoryInfo.Category -ne [System.Management.Automation.ErrorCategory]::ObjectNotFound) {
+        throw "Could not read scheduled task '$TaskName' (left untouched): $($_.Exception.Message)"
+    }
+    $existingTasks = @()
+}
+$keepDisabled = @($existingTasks | Where-Object { Test-WatchdogTaskDisabled $_ }).Count -gt 0
+$disabledLabel = 'Disabled (kept)'
+if ($existingTasks.Count -eq 0 -and $WhenMissing -eq 'Disabled') {
+    $keepDisabled = $true
+    $disabledLabel = 'Disabled (chosen at install)'
+}
 if ($keepDisabled) {
     $settings.Enabled = $false
 }
@@ -403,11 +439,15 @@ if ($keepDisabled) {
                          "error ($($_.Exception.Message)); task now: $(Get-WatchdogTaskSummary)")
             }
         }
-        throw ("Scheduled task '$TaskName' was disabled before and could not be kept disabled; " +
+        throw ("Scheduled task '$TaskName' was to stay disabled ($disabledLabel) and could not be kept disabled; " +
                "$left (task now: $(Get-WatchdogTaskSummary)). If it reads Ready or Running, run: " +
                "Disable-ScheduledTask -TaskName '$TaskName'")
     }
-    Write-Host "Registered scheduled task '$TaskName' and KEPT IT DISABLED, as it was before."
+    if ($disabledLabel -eq 'Disabled (kept)') {
+        Write-Host "Registered scheduled task '$TaskName' and KEPT IT DISABLED, as it was before."
+    } else {
+        Write-Host "Registered scheduled task '$TaskName' DISABLED: the install was told to leave the watchdog off."
+    }
     Write-Host "It runs no check until you enable it: Enable-ScheduledTask -TaskName '$TaskName'"
 } else {
     Write-Host "Registered scheduled task '$TaskName' (every $IntervalMinutes min, and at logon)."
@@ -415,7 +455,7 @@ if ($keepDisabled) {
 Write-Host "Watchdog script: $WatchdogScript"
 Write-Host "Install root:    $InstallRoot"
 Write-Host "Launch mode:     $launchMode"
-Write-Host "State:           $(if ($keepDisabled) { 'Disabled (kept)' } else { 'Enabled' })"
+Write-Host "State:           $(if ($keepDisabled) { $disabledLabel } else { 'Enabled' })"
 Write-RegisterLog 'OK' ('State: {0} | Launch mode: {1} | task now: {2} | install root: {3}' -f
-    $(if ($keepDisabled) { 'Disabled (kept)' } else { 'Enabled' }), $launchMode,
+    $(if ($keepDisabled) { $disabledLabel } else { 'Enabled' }), $launchMode,
     (Get-WatchdogTaskSummary), $InstallRoot)

@@ -90,26 +90,26 @@ SetupLogging=yes
 ; below). An update records that choice, so a PC already updated once keeps it unticked.
 Name: "startmenuicon"; Description: "Create a &Start Menu shortcut"; GroupDescription: "Additional icons:"
 Name: "desktopicon"; Description: "Create a &Desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
-; "Keep MonClub Access running" registers a per-user scheduled task that both starts
-; MonClub Access at logon and restarts it if the backend process dies.
+; "Keep MonClub Access running" = the per-user scheduled task 'MonClub Access Watchdog'
+; that starts MonClub Access at logon and restarts it if the backend process dies.
 ;
-; TICKED for a NEW install, UNTICKED by default on an existing one (owner decision,
-; 2026-09-26). Hence two entries with the same name, exactly one of them shown
-; (IsFreshInstall below). On an existing install Inno then restores the previous
-; choice from the uninstall key (UsePreviousTasks=yes): ticked stays ticked, unticked
-; stays unticked. An install whose version predates this box has no recorded choice,
-; and the unticked entry keeps it off: a routine update -- the silent in-app one
-; included -- must never give a PC a new startup entry by itself.
+; Design section 12 (owner decision O7, 2026-10-10): the Windows task's own state is the
+; preference -- Enabled = on, Disabled = off, missing = never decided -- and the [Run]
+; entry below registers it on EVERY install and update, box or no box. This box only
+; decides a task that does not exist yet on a NEW install: ticked (the default) =
+; registered enabled, unticked = registered DISABLED, so the choice is recorded and later
+; updates do not switch it on (WatchdogWhenMissing below).
 ;
-; NOT Flags: checkedonce. It does the opposite of what it sounds like here: a task
-; previously SELECTED comes back unchecked, and a task missing from the previous
-; install's lists falls back to its base state (Inno Setup source,
-; Setup.WizardForm.pas, TWizardForm.CreateTaskButtons).
+; Shown for a NEW install only. On an existing install it would decide nothing (a missing
+; task is registered ENABLED -- the one-time switch-on for PCs installed before the box
+; existed, which UsePreviousTasks kept unticked -- and an existing task keeps its state),
+; so it is not shown there: the Access Settings switch is the control on an installed PC.
+; (It used to be a second, unticked entry for existing installs; that is gone.)
 ;
-; Ticked on an existing install, the [Run] entry below re-registers the task; a task
-; that exists and is DISABLED stays disabled (register_watchdog.ps1).
+; NOT Flags: checkedonce. It does the opposite of what it sounds like: a task previously
+; SELECTED comes back unchecked (Inno Setup source, Setup.WizardForm.pas,
+; TWizardForm.CreateTaskButtons).
 Name: "watchdog"; Description: "Keep MonClub Access running (start at logon, restart if it stops)"; GroupDescription: "Reliability:"; Check: IsFreshInstall
-Name: "watchdog"; Description: "Keep MonClub Access running (start at logon, restart if it stops)"; GroupDescription: "Reliability:"; Flags: unchecked; Check: not IsFreshInstall
 
 [Dirs]
 Name: "{app}\current"
@@ -145,20 +145,21 @@ Name: "{userprograms}\MonClubAccess"; Filename: "{app}\current\{#MainExe}"; Task
 Name: "{userdesktop}\MonClubAccess"; Filename: "{app}\current\{#MainExe}"; Tasks: desktopicon
 
 [Run]
-; Register the watchdog BEFORE launching the app, and only when the task is ticked.
-; Unticked, an existing task is left exactly as it is. Ticked, the script replaces
-; the task with the current definition, keeping it DISABLED if it was disabled -- an
-; update must never switch the watchdog back on (register_watchdog.ps1).
+; Register the watchdog on EVERY install and update, silent or not (design section 12).
+; The script replaces the task with the current definition and keeps its state: an
+; existing DISABLED task stays disabled -- an update must never switch the watchdog back
+; on (the Settings "off", the cutover runbook's Disable-ScheduledTask) -- an enabled one
+; stays enabled, and a MISSING one is registered in the -WhenMissing state (Enabled,
+; except a new install whose box was unticked: WatchdogWhenMissing).
 ; runascurrentuser keeps it a per-user task (PrivilegesRequired=lowest, and the app
 ; needs the interactive desktop session for its tray icon and Tauri window -- a
 ; SYSTEM task would start it in session 0 where nobody can see it).
 ; logoutput: the script's output goes into Setup's log (SetupLogging=yes). Nothing reads
 ; its exit code; the script also writes its outcome to {app}\logs\watchdog-register.log.
 Filename: "powershell.exe"; \
-  Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\watchdog\register_watchdog.ps1"" -InstallRoot ""{app}"""; \
+  Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\watchdog\register_watchdog.ps1"" -InstallRoot ""{app}"" -WhenMissing {code:WatchdogWhenMissing}"; \
   StatusMsg: "Registering the MonClub Access watchdog..."; \
-  Flags: runhidden runascurrentuser waituntilterminated logoutput; \
-  Tasks: watchdog
+  Flags: runhidden runascurrentuser waituntilterminated logoutput
 
 ; Interactive installs only. A silent install/update starts the app itself in ssPostInstall
 ; (update_safety.iss) and waits for it to prove it is healthy, rolling back if not.
@@ -314,12 +315,25 @@ end;
 
 function IsFreshInstall(): Boolean;
 begin
-  // Picks which of the two [Tasks] "watchdog" entries is shown: ticked for a
-  // new install, unticked by default otherwise. "Existing" is read both ways
+  // Shows the [Tasks] "watchdog" box (new installs only) and, in WatchdogWhenMissing,
+  // lets an unticked box register the task disabled. "Existing" is read both ways
   // on purpose -- Inno's own uninstall record (PrevAppDir, from 'Inno Setup:
   // App Path') and the files this script already detects -- so an install
   // with either one left behind is never mistaken for a new one.
   Result := (not ExistingInstallDetected) and (WizardForm.PrevAppDir = '');
+end;
+
+function WatchdogWhenMissing(Param: string): string;
+begin
+  // The state register_watchdog.ps1 gives the watchdog task when it does NOT exist yet
+  // (an existing task keeps its own state). Disabled only for a NEW install whose
+  // "Keep MonClub Access running" box is unticked -- interactively, or by an explicit
+  // /TASKS / /MERGETASKS="!watchdog" on a silent one (a plain silent install takes the
+  // ticked default). Every update: Enabled -- the one-time switch-on for PCs installed
+  // before the box existed (design section 12). Both inputs of IsFreshInstall are read
+  // before the install (InitializeSetup, the wizard's PrevAppDir), not from the new files.
+  if IsFreshInstall and (not WizardIsTaskSelected('watchdog')) then Result := 'Disabled' else Result := 'Enabled';
+  Log('Watchdog task, if missing, will be registered: ' + Result);
 end;
 
 procedure ExecAndLog(const CmdLine: string);
