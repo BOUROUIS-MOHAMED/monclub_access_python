@@ -6749,6 +6749,68 @@ def _handle_tv_update_version_info(ctx: _Ctx) -> None:
     _handle_component_update_version_info(ctx)
 
 
+# ==================== 9b) WATCHDOG (design section 12, owner decision O7) ====================
+# The per-user scheduled task 'MonClub Access Watchdog': its status, and the Settings switch
+# (Enable-/Disable-ScheduledTask, registered first when missing, never unregistered). Gated
+# like PATCH /api/v2/config: the per-session X-Local-Token (not in _AUTH_EXEMPT). The
+# PowerShell calls run in this request's thread, hidden and time-bounded
+# (access/watchdog_control.py), never on the app's main loop.
+
+def _watchdog_control(ctx: _Ctx):
+    control = getattr(ctx.app, "_watchdog_control", None)
+    if control is None:
+        from access.watchdog_control import shared_control
+
+        control = shared_control()
+    return control
+
+
+def _watchdog_actor() -> str:
+    """Who changed it, for the logs: the Access account signed in on this PC."""
+    try:
+        from access.store import load_auth_token
+
+        auth = load_auth_token()
+        email = (getattr(auth, "email", None) or "").strip() if auth else ""
+        return f"Settings ({email})" if email else "Settings (no account signed in)"
+    except Exception:
+        return "Settings (account unknown)"
+
+
+def _handle_watchdog_status(ctx: _Ctx) -> None:
+    ctx.send_json(200, {"ok": True, "watchdog": _watchdog_control(ctx).status()})
+
+
+def _handle_watchdog_set(ctx: _Ctx) -> None:
+    from access.watchdog_control import WatchdogBusy, WatchdogError, WatchdogUnavailable
+
+    body = ctx.body()
+    enabled = body.get("enabled") if isinstance(body, dict) else None
+    if not isinstance(enabled, bool):
+        ctx.send_json(400, {"ok": False, "error": "body must be {\"enabled\": true|false}"})
+        return
+    actor = _watchdog_actor()
+    word = "ON" if enabled else "OFF"
+    control = _watchdog_control(ctx)
+    try:
+        status = control.set_enabled(enabled, actor=actor)
+    except WatchdogUnavailable as exc:
+        ctx.app.logger.warning("[Watchdog] turn %s by %s refused: %s", word, actor, exc)
+        ctx.send_json(409, {"ok": False, "code": "WATCHDOG_UNAVAILABLE", "error": str(exc)})
+        return
+    except WatchdogBusy as exc:
+        ctx.app.logger.warning("[Watchdog] turn %s by %s refused: %s", word, actor, exc)
+        ctx.send_json(409, {"ok": False, "code": "WATCHDOG_BUSY", "error": str(exc)})
+        return
+    except WatchdogError as exc:
+        ctx.app.logger.error("[Watchdog] turn %s by %s FAILED: %s", word, actor, exc)
+        ctx.send_json(502, {"ok": False, "code": "WATCHDOG_FAILED", "error": str(exc),
+                            "watchdog": exc.status})
+        return
+    ctx.app.logger.info("[Watchdog] turned %s by %s (task now: %s)", word, actor, status.get("state"))
+    ctx.send_json(200, {"ok": True, "watchdog": status})
+
+
 # ==================== 10) LOCAL DB TOOLS ====================
 
 def _handle_access_storage_status(ctx: _Ctx) -> None:
