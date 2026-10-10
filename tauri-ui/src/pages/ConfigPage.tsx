@@ -41,6 +41,7 @@ import {
 } from "lucide-react";
 import type { DiscoveredDevice } from "@/api/types";
 import { useScanCard } from "@/hooks/useScanCard";
+import WatchdogCard from "@/components/WatchdogCard";
 import {
   DEFAULT_FEEDBACK_ANIMATIONS,
   DEFAULT_FEEDBACK_SOUNDS,
@@ -500,6 +501,9 @@ export default function ConfigPage() {
           </div>
         </CardContent>
       </Card>
+
+      {/* Watchdog (design section 12) — self-contained card */}
+      <WatchdogCard />
 
       {/* Favorites overlay position — always visible */}
       <Card>
