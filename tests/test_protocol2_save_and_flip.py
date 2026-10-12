@@ -532,10 +532,11 @@ def test_a_hold_and_restore_round_trip_preserves_every_sync_users_column(db):
                 validTo="2026-09-30", secondCardId="2222", image="img-b64",
                 fingerprints=[{"fingerId": 1, "templateData": "TPL=="}, {"fingerId": 6, "templateData": "X"}],
                 faceId="F2", accountUsernameId="user2", qrCodePayload="QR2", birthday="1990-01-02",
-                imageSource="S3", userImageStatus="OK", userProfileImage="p.png")
+                imageSource="S3", userImageStatus="OK", userProfileImage="p.png",
+                fees=[{"name": "Casier", "dueDate": "2026-09-25", "required": False, "paid": True}])
     db.save_sync_cache_delta(_v2([full, _row(5)]), MEMBERS_ONLY)
     before = _user_row(2)
-    assert set(before) == set(dbmod._SYNC_USER_COLUMNS) and len(before) == 20
+    assert set(before) == set(dbmod._SYNC_USER_COLUMNS) and len(before) == 21
     assert all(v is not None for v in before.values()), before
     _flip(db, "2026-09-20T07:30:00+01:00")
     assert _ids("sync_users") == {5}

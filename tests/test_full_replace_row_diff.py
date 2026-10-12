@@ -363,20 +363,20 @@ def test_full_refresh_still_bumps_local_state_generation_when_nothing_changed(db
 def test_full_refresh_statements_bind_every_column(db):
     """The INSERT/UPDATE are LITERAL statements inside _apply_full_users_refresh (so
     tools/check_sql_arity.py, the release gate, verifies them) and must bind exactly the
-    20 values _sync_user_row_values produces, in _SYNC_USER_COLUMNS order (the v1.4.20
+    21 values _sync_user_row_values produces, in _SYNC_USER_COLUMNS order (the v1.4.20
     59/57 INSERT is why this is pinned). 20 since main_account_id joined the diffed tuple
-    (guide §3.2d)."""
+    (guide §3.2d), 21 since fees_json did (member fees F3c, guide §3.12)."""
     import inspect
     import re
 
     src = inspect.getsource(db._apply_full_users_refresh)
     values = db._sync_user_row_values({})
-    assert len(values) == len(db._SYNC_USER_COLUMNS) == 20
+    assert len(values) == len(db._SYNC_USER_COLUMNS) == 21
 
     insert = re.search(r"INSERT INTO sync_users\s*\((.*?)\)\s*VALUES\s*\((.*?)\)", src, re.S)
     assert insert, "literal INSERT not found in _apply_full_users_refresh"
     assert [c.strip() for c in insert.group(1).split(",")] == list(db._SYNC_USER_COLUMNS)
-    assert insert.group(2).count("?") == 20
+    assert insert.group(2).count("?") == 21
 
     update = re.search(r"UPDATE sync_users SET(.*?)WHERE rowid=\?", src, re.S)
     assert update, "literal UPDATE not found in _apply_full_users_refresh"

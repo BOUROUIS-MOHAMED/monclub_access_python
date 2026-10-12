@@ -401,6 +401,10 @@ def normalize_global_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
         # Number of simultaneous member cards the TV popup can display.
         # Default 3 matches the "3 turnstiles firing at once" case in the gym.
         "popup_lanes": _clamp_int(raw.get("popupLanes"), 3, 1, 5),
+
+        # Member fees F3c: the entry screen's "expires soon" window, in days. Same range and
+        # default as the backend (FeeSettingsProvider: 1-30, 7). guide §3.12.
+        "fee_due_soon_days": _clamp_int(raw.get("feeDueSoonDays"), 7, 1, 30),
     }
 
 

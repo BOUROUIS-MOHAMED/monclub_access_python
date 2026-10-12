@@ -733,6 +733,52 @@ def _ensure_column(conn: sqlite3.Connection, table: str, col_name: str, col_def_
         pass
 
 
+def _ensure_column_forcing_refresh(
+    conn: sqlite3.Connection,
+    table: str,
+    col_name: str,
+    col_def_sql: str,
+    token_keys: tuple[str, ...],
+) -> bool:
+    """Add ``table.col_name``; when it is NEWLY added, drop ``token_keys`` from
+    sync_version_tokens so the next getSyncData sends that section in FULL.
+
+    For a column only the backend can fill (member fees F3c, guide §3.12:
+    ``sync_users.fees_json`` with the two member tokens, ``sync_access_software_settings.
+    fee_due_soon_days`` with ``settingsVersion``). The backend's tokens do not move because a
+    client upgraded, so without the drop every cached row would stay NULL until some unrelated
+    change re-sent it -- a member with an unpaid fee would show none.
+
+    Same mechanism and order as ``_ensure_main_account_id_column`` (guide §3.2d): the DELETE
+    runs BEFORE the ALTER, so both sit in the one transaction ``init_db`` commits, and an error
+    escapes ``init_db`` (a failing migration stops startup) and rolls both back. ONE-SHOT: acts
+    only while the column is absent. On a fresh database the table was just created without the
+    column and there are no tokens to drop. A table that does not exist is left alone.
+    Returns True when the column was added."""
+    cols = set(_table_columns(conn, table))
+    if not cols or col_name in cols:
+        return False
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_version_tokens (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+    )
+    placeholders = ",".join("?" * len(token_keys))
+    dropped = int(conn.execute(
+        f"DELETE FROM sync_version_tokens WHERE key IN ({placeholders})", tuple(token_keys),
+    ).rowcount or 0)
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_def_sql}")
+    logging.getLogger(__name__).warning(
+        "[DB] %s.%s added; dropped %d sync token(s) of %s so the next getSyncData re-sends "
+        "that section in full and fills the column (guide §3.12).",
+        table, col_name, dropped, list(token_keys),
+    )
+    return True
+
+
 # The two member progress markers. Dropping BOTH makes the next getSyncData run a FULL
 # member refresh (sync_scope.strip_all_member_version_tokens documents the same pair).
 _MEMBER_VERSION_TOKEN_KEYS = ("membersVersion", "membersUpdatedAfter")
@@ -981,6 +1027,68 @@ def _member_main_account_id(u: Dict[str, Any]) -> Any:
     if value is None:
         value = u.get("main_account_id")
     return value
+
+
+# Member fees F3c (guide §3.12). Backend contract (member fees F3 §1b): a users[] row may carry
+# "fees": [{name, dueDate, required, paid}] -- only fees not cancelled, not paused, not settled;
+# absent or null when the member has none. Stored as sync_users.fees_json. DISPLAY ONLY: the
+# entry screen judges them (tauri-ui src/lib/feeAlerts.ts); no access decision reads them.
+def _fee_due_date_text(value: Any) -> Optional[str]:
+    """A fee due date as "YYYY-MM-DD": the backend's ISO text, or a [y, m, d] array."""
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        try:
+            return f"{int(value[0]):04d}-{int(value[1]):02d}-{int(value[2]):02d}"
+        except (TypeError, ValueError):
+            return None
+    if value is None:
+        return None
+    text = str(value).strip()[:10]
+    return text if len(text) == 10 and text[4] == "-" and text[7] == "-" else None
+
+
+def _member_fees_list(raw: Any) -> List[Dict[str, Any]]:
+    """The member's fee lines as a clean list, from the backend's list or a stored JSON text.
+
+    Each item is {name, dueDate ("YYYY-MM-DD" or None), required, paid}; an item with no name is
+    dropped and unreadable input reads as no fees. Sorted, so the same fees always encode alike:
+    the full-refresh diff compares the stored text."""
+    if isinstance(raw, (bytes, bytearray)):
+        raw = bytes(raw).decode("utf-8", errors="replace")
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            raw = json.loads(text)
+        except Exception:
+            return []
+    if not isinstance(raw, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        out.append({
+            "name": name,
+            "dueDate": _fee_due_date_text(item.get("dueDate")),
+            "required": item.get("required") is True,
+            "paid": item.get("paid") is True,
+        })
+    out.sort(key=lambda f: (f["name"], f["dueDate"] or "", f["required"], f["paid"]))
+    return out
+
+
+def _member_fees_json(u: Dict[str, Any]) -> Optional[str]:
+    """The sync_users.fees_json value of a member dict (the backend's ``fees`` or a cached row's
+    ``fees_json``): NULL when the member has no fee line."""
+    raw = u.get("fees")
+    if raw is None:
+        raw = u.get("fees_json")
+    fees = _member_fees_list(raw)
+    return json.dumps(fees, ensure_ascii=False, separators=(",", ":")) if fees else None
 
 
 def _refresh_member_account_links(cur: Any) -> None:
@@ -1267,6 +1375,9 @@ def _create_protocol2_tables(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    # Member fees F3c: _SYNC_USER_COLUMNS gained fees_json and a hold or a restore copies column
+    # for column, so the held copy carries it too (guide §3.12).
+    _ensure_column(conn, "sync_users_held", "fees_json", "fees_json TEXT")
 
 
 def get_access_v2_state() -> Dict[str, Any]:
@@ -2316,6 +2427,12 @@ def init_db() -> None:
         # The PERSON behind a member row (backend mainAccountId). NULL until the members
         # section is re-fetched, which the helper forces exactly once. guide §3.2d.
         _ensure_main_account_id_column(conn, column_was_present=_main_account_col_before)
+        # Member fees F3c: the fee lines of the entry screen. ONE forced FULL member refresh
+        # when an existing table gains the column (guide §3.12). After the rebuild, like
+        # every sync_users column above.
+        _ensure_column_forcing_refresh(
+            conn, "sync_users", "fees_json", "fees_json TEXT", _MEMBER_VERSION_TOKEN_KEYS,
+        )
 
         # F-005: UNIQUE index on (user_id, active_membership_id) to prevent duplicate rows
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_users_uid_amid ON sync_users(user_id, active_membership_id) WHERE user_id IS NOT NULL AND active_membership_id IS NOT NULL;")
@@ -2423,6 +2540,12 @@ def init_db() -> None:
         _ensure_column(conn, "sync_access_software_settings", "ultra_sync_yield_to_rtlog", "ultra_sync_yield_to_rtlog INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "created_at", "created_at TEXT")
         _ensure_column(conn, "sync_access_software_settings", "updated_at", "updated_at TEXT")
+        # Member fees F3c: accessSoftwareSettings.feeDueSoonDays (backend 1-30, default 7).
+        # settingsVersion dropped once so the next sync re-sends the settings (guide §3.12).
+        _ensure_column_forcing_refresh(
+            conn, "sync_access_software_settings", "fee_due_soon_days",
+            "fee_due_soon_days INTEGER", ("settingsVersion",),
+        )
 
         # -----------------------------
         # devices (matches GymDeviceDto)
@@ -4414,8 +4537,8 @@ def upsert_delta_users(users: list[dict]) -> None:
                     first_card_id, second_card_id, image,
                     fingerprints_json, face_id, account_username_id,
                     qr_code_payload, birthday, image_source, user_image_status,
-                    user_profile_image, main_account_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    user_profile_image, main_account_id, fees_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     u.get("userId"), am_id, m_id,
@@ -4429,6 +4552,7 @@ def upsert_delta_users(users: list[dict]) -> None:
                     u.get("imageSource"), u.get("userImageStatus"),
                     u.get("userProfileImage"),
                     _member_main_account_id(u),
+                    _member_fees_json(u),
                 ),
             )
         _refresh_member_account_links(conn)
@@ -5170,10 +5294,11 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
 
                         manual_sync_mode,
                         ultra_sync_yield_to_rtlog,
+                        fee_due_soon_days,
 
                         created_at,
                         updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         gym_id=excluded.gym_id,
                         access_server_host=excluded.access_server_host,
@@ -5210,6 +5335,7 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
 
                         manual_sync_mode=excluded.manual_sync_mode,
                         ultra_sync_yield_to_rtlog=excluded.ultra_sync_yield_to_rtlog,
+                        fee_due_soon_days=excluded.fee_due_soon_days,
 
                         created_at=excluded.created_at,
                         updated_at=excluded.updated_at
@@ -5251,6 +5377,7 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
 
                         _bool_to_i(s.get("manualSyncMode", s.get("manual_sync_mode", False)), default=0),
                         _bool_to_i(s.get("ultraSyncYieldToRtlog", s.get("ultra_sync_yield_to_rtlog", False)), default=0),
+                        _to_int_or_none(s.get("feeDueSoonDays")),
 
                         _safe_str(s.get("createdAt"), ""),
                         _safe_str(s.get("updatedAt"), updated_at) or updated_at,
@@ -5285,8 +5412,8 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     fingerprints_json,
                     face_id, account_username_id, qr_code_payload, birthday,
                     image_source, user_image_status, user_profile_image,
-                    main_account_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    main_account_id, fees_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     u.get("userId"),
@@ -5309,6 +5436,7 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     u.get("userImageStatus"),
                     u.get("userProfileImage"),
                     _member_main_account_id(u),
+                    _member_fees_json(u),
                 ),
             )
         _refresh_member_account_links(cur)
@@ -5692,8 +5820,9 @@ def _upsert_sync_access_software_settings_row(
             optional_data_sync_delay_minutes,
             manual_sync_mode,
             ultra_sync_yield_to_rtlog,
+            fee_due_soon_days,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             gym_id=excluded.gym_id,
             access_server_host=excluded.access_server_host,
@@ -5721,6 +5850,7 @@ def _upsert_sync_access_software_settings_row(
             optional_data_sync_delay_minutes=excluded.optional_data_sync_delay_minutes,
             manual_sync_mode=excluded.manual_sync_mode,
             ultra_sync_yield_to_rtlog=excluded.ultra_sync_yield_to_rtlog,
+            fee_due_soon_days=excluded.fee_due_soon_days,
             created_at=excluded.created_at,
             updated_at=excluded.updated_at
         """,
@@ -5752,6 +5882,7 @@ def _upsert_sync_access_software_settings_row(
             _to_int_or_none(settings.get("optionalDataSyncDelayMinutes", 60)),
             _bool_to_i(settings.get("manualSyncMode", settings.get("manual_sync_mode", False)), default=0),
             _bool_to_i(settings.get("ultraSyncYieldToRtlog", settings.get("ultra_sync_yield_to_rtlog", False)), default=0),
+            _to_int_or_none(settings.get("feeDueSoonDays")),
             _safe_str(settings.get("createdAt"), ""),
             _safe_str(settings.get("updatedAt"), updated_at) or updated_at,
         ),
@@ -5779,8 +5910,8 @@ def _upsert_sync_user_row(cur: sqlite3.Cursor, member: Dict[str, Any]) -> None:
             fingerprints_json,
             face_id, account_username_id, qr_code_payload, birthday,
             image_source, user_image_status, user_profile_image,
-            main_account_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            main_account_id, fees_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             member.get("userId"),
@@ -5803,6 +5934,7 @@ def _upsert_sync_user_row(cur: sqlite3.Cursor, member: Dict[str, Any]) -> None:
             member.get("userImageStatus"),
             member.get("userProfileImage"),
             _member_main_account_id(member),
+            _member_fees_json(member),
         ),
     )
 
@@ -6058,6 +6190,9 @@ _SYNC_USER_COLUMNS: tuple[str, ...] = (
     # diffed tuple on purpose -- a row whose ONLY change is a newly-arrived mainAccountId
     # must compare unequal, or the forced refresh of §3.2d would leave it NULL forever.
     "main_account_id",
+    # Member fees F3c (guide §3.12). APPENDED for the same reason: a row whose ONLY change is
+    # its fee lines must compare unequal, or a fee paid at the desk would stay "unpaid".
+    "fees_json",
 )
 # Schema affinities (CREATE TABLE sync_users + the _ensure_column migrations): the four
 # ids are INTEGER, every other column is TEXT.
@@ -6070,7 +6205,7 @@ _SYNC_USER_COLUMN_IS_INTEGER: tuple[bool, ...] = tuple(
 
 
 def _sync_user_row_values(u: Dict[str, Any]) -> tuple:
-    """The 20 values the sync_users INSERT binds, in _SYNC_USER_COLUMNS order.
+    """The 21 values the sync_users INSERT binds, in _SYNC_USER_COLUMNS order.
 
     Mirrors the delta-branch INSERT exactly -- same activeMembershipId -> membershipId
     fallback, same key aliases, same json.dumps of the templates -- so a full and a
@@ -6095,6 +6230,7 @@ def _sync_user_row_values(u: Dict[str, Any]) -> tuple:
         u.get("userImageStatus"),
         u.get("userProfileImage"),
         _member_main_account_id(u),
+        _member_fees_json(u),
     )
 
 
@@ -6228,8 +6364,8 @@ def _apply_full_users_refresh(
                     full_name, phone, email, valid_from, valid_to,
                     first_card_id, second_card_id, image,
                     fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
-                    image_source, user_image_status, user_profile_image, main_account_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    image_source, user_image_status, user_profile_image, main_account_id, fees_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 vals,
             )
@@ -6248,7 +6384,7 @@ def _apply_full_users_refresh(
                     first_card_id=?, second_card_id=?, image=?,
                     fingerprints_json=?, face_id=?, account_username_id=?, qr_code_payload=?, birthday=?,
                     image_source=?, user_image_status=?, user_profile_image=?,
-                    main_account_id=?
+                    main_account_id=?, fees_json=?
                 WHERE rowid=?
                 """,
                 vals + (hit[0],),
@@ -6565,8 +6701,8 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                                     first_card_id, second_card_id, image,
                                     fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
                                     image_source, user_image_status, user_profile_image,
-                                    main_account_id
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    main_account_id, fees_json
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
                                 (
                                     u.get("userId"), am_id, m_id,
@@ -6581,6 +6717,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                                     u.get("userImageStatus"),
                                     u.get("userProfileImage"),
                                     _member_main_account_id(u),
+                                    _member_fees_json(u),
                                 ),
                             )
                             upserted_count += 1
@@ -6940,6 +7077,8 @@ def _coerce_user_row_to_payload(u: Dict[str, Any]) -> Dict[str, Any]:
         "accountUsernameId": g("accountUsernameId", "account_username_id", "usernameId", "username_id"),
         "qrCodePayload": g("qrCodePayload", "qr_code_payload"),
         "birthday": g("birthday"),
+        # Member fees F3c: the entry screen's fee lines, [] when none (guide §3.12).
+        "fees": _member_fees_list(g("fees", "fees_json")),
     }
 
 
@@ -7162,6 +7301,8 @@ def _coerce_sync_access_software_settings_row_to_payload(
         "optionalDataSyncDelayMinutes": d.get("optional_data_sync_delay_minutes"),
         "manualSyncMode": bool(int(d.get("manual_sync_mode") or 0)),
         "ultraSyncYieldToRtlog": bool(int(d.get("ultra_sync_yield_to_rtlog") or 0)),
+        # Member fees F3c: None until the backend sends it (the reader defaults to 7).
+        "feeDueSoonDays": d.get("fee_due_soon_days"),
         "createdAt": d.get("created_at"),
         "updatedAt": d.get("updated_at"),
     }
@@ -7190,6 +7331,7 @@ def load_sync_access_software_settings() -> Optional[Dict[str, Any]]:
                 optional_data_sync_delay_minutes,
                 manual_sync_mode,
                 ultra_sync_yield_to_rtlog,
+                fee_due_soon_days,
                 created_at, updated_at
             FROM sync_access_software_settings
             WHERE id=1
@@ -7584,6 +7726,7 @@ def _fetch_sync_cache_snapshot() -> Dict[str, Any] | None:
                 optional_data_sync_delay_minutes,
                 manual_sync_mode,
                 ultra_sync_yield_to_rtlog,
+                fee_due_soon_days,
                 created_at, updated_at
             FROM sync_access_software_settings
             WHERE id=1

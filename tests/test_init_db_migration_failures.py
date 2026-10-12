@@ -26,6 +26,7 @@ _WRAPPED = (
     "_rebuild_sync_users_without_legacy_fingerprint",
     "_ensure_main_account_id_column",
     "_ensure_pin_scheme_column",
+    "_ensure_column_forcing_refresh",
 )
 
 
