@@ -56,7 +56,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The QR allowed-days step (`access_verification.py::verify_totp`'s date step, `::current_access_days`, `access_dates.py::qr_date_verdict`, `::effective_credentials`) | §3.1b "Allowed days" |
 | Renewal ordering — which old pins are held, when they are removed (`ultra_engine.py::_neutralise_revoked_pins`, `::_remove_released_holds`, `device_sync.py::_sync_one_device` holds) | §3.4f, §3.2g |
 | The one-shot credentials re-send at startup — what it drops, its marker table, its place and catch in `init_db` (`db.py::_force_one_credentials_resend`, `::_run_one_shot_credentials_resend`, `local_one_shot_steps`; `tools/bench_credential_resend.py`) | §3.1b "The upgrade window" |
-| What happens when an `init_db` step fails — the five schema migrations and the inline `device_write_hold.pin_scheme` `ALTER` that stop startup, the steps that log and go on, a `try` or an `import logging` added inside `init_db` (`db.py::init_db`, `::_relax_firmware_profiles_not_null`, `::_rebuild_sync_users_without_legacy_fingerprint`, `::_ensure_main_account_id_column`, `::_ensure_pin_scheme_column`, `sync_device_store.py::ensure_ultra_merge_device_columns`, `::_run_one_shot_credentials_resend`) | §3.2d "A failing migration stops startup", §3.1b "The upgrade window" |
+| What happens when an `init_db` step fails — the six schema migrations and the inline `device_write_hold.pin_scheme` `ALTER` that stop startup, the steps that log and go on, a `try` or an `import logging` added inside `init_db` (`db.py::init_db`, `::_relax_firmware_profiles_not_null`, `::_rebuild_sync_users_without_legacy_fingerprint`, `::_ensure_main_account_id_column`, `::_ensure_pin_scheme_column`, `::_ensure_column_forcing_refresh`, `sync_device_store.py::ensure_ultra_merge_device_columns`, `::_run_one_shot_credentials_resend`) | §3.2d "A failing migration stops startup", §3.1b "The upgrade window" |
 | Anything in `app/core/v2/` (the server clock, the v2 client, the notice socket, leases, commands, ownership backup, problem reports, loss re-add), `access/v2_routes.py`, or a lease-gate call site (`ultra_engine.py::_v2_writes_blocked` and the `_lease_gate` calls, `device_sync.py`, `realtime_agent.py`, `device_attendance.py`, `ultra_worker_pool.py::devices_to_drive`, `access/local_api_routes.py::LEASE_GATED_HANDLERS` / `SCANNER_GATED_HANDLERS`) | §3.9 |
 | The software updater client — check / verify / download / install / start-up gate / journal restore / loop guard / telemetry / update pages (`shared/update_runtime.py`, `shared/release_manifest.py`, `shared/ed25519.py`, `shared/release_keys.py`, `shared/update_versions.py`, `shared/update_files.py`, `shared/update_wrapper.py`, `shared/update_startup.py`, `access/update_runtime.py`, the update handlers in `local_access_api_v2.py`, `UpdatePage.tsx` / `TvUpdatePage.tsx`); the installer half — the safe swap, journal, health wait, same-version / zkemkeeper rules, uninstall data (`installer/MonClubAccess.iss`, `installer/MonClubTV.iss`, `installer/update_safety.iss`, `installer/update_helper.ps1`), the watchdog's journal rule (`packaging/watchdog/monclub_access_watchdog.ps1`), the watchdog task's registration and its Settings control (`packaging/watchdog/register_watchdog.ps1`, the `[Run]` entry and `WatchdogWhenMissing` in `MonClubAccess.iss`, `access/watchdog_control.py`, the `_handle_watchdog_*` handlers in `local_access_api_v2.py`, `tauri-ui/src/components/WatchdogCard.tsx`), the build / sign / publish gates (`build_release.ps1`, `tools/release_sign.py`, `publish_github_release.ps1`) | §11 Software updates |
 | What `push_safety.check_bulk_removal` defers (`add_only`, `handover_release`) or lets through (a Confirm-removal approval) | §3.2g, §3.9 |
@@ -64,6 +64,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The Erase-content wizard or the write hold (`app/core/erase_wizard.py` — incl. `::refill_roster`, `::held_waiting_count`, `EraseWizard._refill_check`, and since lane 1c `::_sync_staleness` / `::_sync_max_age_sec` with `app.py`'s `_last_sync_ok_mono` stamp, `::terminal_people` / `::not_refilled` / `::_bind_not_refilled` / `KEEP_MARK`, `::_refill_recheck`, `::_prune_now` / `::_folder_times`, `::_no_answer`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s codes —, `app/core/device_hold.py` — incl. `load(release_unstarted=)` and the `erase-prep`/`erase` phases —, `db.py::set_device_write_hold` / `::clear_device_write_hold` / `::list_device_write_holds`, `::begin_device_erase`, `::release_unstarted_erase_holds`, `::undo_device_erase_record` / `::device_list_is_authoritative` (lane 1f), `erase_wizard.py::check_erase_switch` / `monclub_api.py::get_erase_wizard_switch` (the gym's server switch), `erase_wizard.py::prune_erase_backups` (30-day retention), `::retire_device_records`, `::invalidate_device_records`, `device_sync.py::_filter_users_for_device(quiet=)`, `PullSDKDevice.ERASABLE_TABLES`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s offline answer, the hold in `ultra_engine.py::_v2_writes_blocked`, the worker's `_connected_addr` (`::_connect` / `::_disconnect`), `device_sync.py`'s three hold checks, `v2/handlers.py::device_reconcile`, `app.py`'s start-up `device_hold.load()` and `_sync_tick`'s `device_hold.ensure_loaded()`, `ownership.py::OwnershipSync._worker_idle`, the `erase` routes and handlers, `local_access_api_v2.py::_refuse_held_or_frozen`, `PullSDKDevice.count_table_strict` / `::read_table_strict` / `::erase_table`, `ZKStandaloneDevice.read_device_status` / `::read_user_templates` and the listing's `privilege`, `tauri-ui/src/components/EraseWizardDialog.tsx`) | §3.2h, pullsdk_guide §5, zkemkeeper_guide §4 |
 | What a turnstile's heartbeat line reports as waiting (`device_sync.py::count_waiting_pins`, `ultra_engine.py::_count_waiting_pins` and the snapshot's `failed_pins`, `_sync_one_device`'s `_last_waiting_pins`, `realtime_agent.py::get_status_snapshot`'s `failedPins`, `pc_identity.py::build_heartbeat_payload`, `::_report_held_turnstiles` and its `held` key, `erase_wizard.py::held_waiting_count`, the wizard's `_set_waiting`) | §3.10 |
 | Who writes to `access.db` — the DbWriter, `_run_db_write_sync` (its lanes, `priority=`, the inline nested call, the 60 s wait), a write outside it, the tripwire's allowlist (`tests/test_db_single_writer.py::ALLOWED_DIRECT`), which writes are in the door lane (`db.py::insert_access_history`, `::save_agent_rtlog_state`), the AGENT history claim (`realtime_agent.py::DecisionService.run`'s `F-013` block) | §3.11 |
+| The member fee lines of the entry screen -- what is stored, how it reaches the popup, how the screen judges and draws it (`db.py::_member_fees_json`, `::_member_fees_list`, `::_ensure_column_forcing_refresh`, `sync_users.fees_json` in `_SYNC_USER_COLUMNS` and the five member writers, `sync_access_software_settings.fee_due_soon_days`, `settings_reader.py::normalize_global_settings`'s `fee_due_soon_days`, `access_types.py::NotificationRequest.fees`, `ultra_engine.py::_enqueue_notification(user_fees=)`, `ultra_pc_entry.py::member_popup_fields`, `realtime_agent.py::_popup_payload_from_request`, `tauri-ui/src/lib/feeAlerts.ts`, `PopupWindow.tsx` `AFeeLine` / `AFeeMark`) | §3.12 |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -1523,7 +1524,7 @@ stays NULL: MEMBERSHIP devices are unaffected, ACCOUNT devices withhold everyone
 
 **A failing migration stops startup — on purpose (owner's decision, 2026-09-25).** `init_db` calls
 `_relax_firmware_profiles_not_null`, `_rebuild_sync_users_without_legacy_fingerprint`,
-`_ensure_main_account_id_column`, `_ensure_pin_scheme_column` and `sync_device_store.py::ensure_ultra_merge_device_columns` (ULTRA merge plan 2: four device columns, `devicesVersion` dropped once on an upgrade) with no `try` -- and, since lane 1e, runs the
+`_ensure_main_account_id_column`, `_ensure_pin_scheme_column`, `sync_device_store.py::ensure_ultra_merge_device_columns` (ULTRA merge plan 2: four device columns, `devicesVersion` dropped once on an upgrade) and `_ensure_column_forcing_refresh` (member fees F3c, §3.12: `sync_users.fees_json` and `sync_access_software_settings.fee_due_soon_days`, their tokens dropped once on an upgrade) with no `try` -- and, since lane 1e, runs the
 inline `ALTER TABLE device_write_hold ADD COLUMN pin_scheme` with none either (§3.2h; its column check is a `PRAGMA`
 read that raises since lane 1f, not `_table_columns`, which answers `[]` on a read error and so turned that error into
 a misleading "duplicate column name") `[TEST: test_init_db_migration_failures.py::
@@ -4724,6 +4725,71 @@ worker's `hist-writer-<device>` thread (`ultra_engine.py::_enqueue_history` → 
 (`HIST_WRITE_Q_FULL`), and never waits on the database. Only a rowcount of 1 goes on to the backend
 history queue. The lane shortens that thread's wait; the door never waited on it (the terminal opens
 on its own in ULTRA, §3). `[CODE]`
+
+### 3.12 Member fees on the entry screen (member fees F3c, 2026-10-11)
+
+**Display only.** A member's fee lines reach the entry screen (`PopupWindow.tsx`) and are drawn
+there; nothing in a door decision, a device push or the history reads them. A member the server
+blocks for an unpaid required fee (F2, rule 10) is not in the roster, so the turnstile refuses
+them and the screen, which shows no refused scan (`SHOW_DENIED_ENTRIES = false`), shows nothing
+(owner decision D6). `[CODE: card_decision.py, access_verification.py and device_sync.py read no
+`fees` key; device_sync.py::_compute_desired_hash hashes named fields only; db.py's member change
+detection compares access fields only]`
+
+**What the server sends.** Each `users[]` row -- v1, protocol 2 and the fast patch's
+`payload.member` -- may carry `fees: [{name, dueDate, required, paid}]`: only fees not
+cancelled, not paused and not settled; absent or null when the member has none (backend member
+fees F3 contract §1b). `accessSoftwareSettings.feeDueSoonDays` (backend 1-30, default 7) comes
+with the settings section. `[UNVERIFIED against the live backend: written before F3a was built;
+the tests feed the contract's shape]`
+
+**Where the PC keeps them.** `sync_users.fees_json` (TEXT; NULL when the member has no line),
+written by all five member writers -- `save_sync_cache`, `save_sync_cache_delta` (full mode: the
+per-row diff, `_apply_full_users_refresh`; delta mode), `upsert_delta_users`,
+`_upsert_sync_user_row` (the fast patch and the protocol-2 promotion of an upcoming member) --
+through one encoder, `db.py::_member_fees_json` (cleaned and sorted, so the same fees always
+store the same text). `fees_json` is APPENDED to `_SYNC_USER_COLUMNS`: a row whose only change is
+a fee paid at the desk compares unequal and is rewritten, and `sync_users_held` carries the column
+because a hold or a restore copies those columns one for one. `_coerce_user_row_to_payload` hands
+the lines back as `fees` (a list, `[]` when none; `db.py::_member_fees_list`). `feeDueSoonDays`
+is `sync_access_software_settings.fee_due_soon_days`, read through
+`settings_reader.py::normalize_global_settings` as `fee_due_soon_days`, clamped 1-30, 7 when NULL.
+`[TEST: tests/test_member_fees_access.py; tests/test_full_replace_row_diff.py::
+test_full_refresh_statements_bind_every_column (21 columns);
+tests/test_protocol2_save_and_flip.py::test_a_hold_and_restore_round_trip_preserves_every_sync_users_column]`
+
+**The upgrade.** Both columns arrive NULL and the backend's `membersVersion` / `settingsVersion`
+do not move because a client upgraded, so `init_db` drops them ONCE when an existing table gains
+its column: `db.py::_ensure_column_forcing_refresh` (the DELETE before the ALTER, one
+transaction, no `try` -- the same rules as `_ensure_main_account_id_column`, §3.2d). The next
+`getSyncData` then carries the members and the settings in full and fills the columns.
+`[TEST: tests/test_member_fees_access.py::test_an_upgraded_database_gains_both_columns_and_refetches_members_and_settings_once,
+::test_the_helper_drops_only_the_named_tokens_and_only_once, ::test_the_column_and_the_token_drop_commit_together;
+tests/test_init_db_migration_failures.py::test_a_failing_migration_raises_its_own_error_and_the_next_start_completes]`
+Residual: the forced refresh fills the lines only if the backend already sends them (F3a live)
+when the PC upgrades. A PC upgraded earlier shows a member's lines only once that member's row is
+re-sent (a membership or fee change, a full refresh). Release Access after F3a is deployed.
+
+**How they reach the screen.** `access_types.py::NotificationRequest.fees` (default `[]`). ULTRA:
+`ultra_engine.py::_enqueue_notification(user_fees=)` from `_handle_allow` (turnstile-decided
+entry) and `_handle_totp_rescue` (QR), and from `ultra_pc_entry.py::member_popup_fields`'s
+`user_fees` (staff rescue, PC-decided cards); `_handle_deny` has no member and sends none. AGENT:
+`realtime_agent.py`'s request from the verified member. `realtime_agent.py::_popup_payload_from_request`
+publishes `fees` and `feeDueSoonDays`; it reads the setting (`_popup_fee_due_soon_days`, through the
+30 s settings cache) only for an event that carries fees, on the local API thread that drains the
+popup queue, never on the door path. `[TEST: tests/test_member_fees_popup.py]`
+
+**How the screen judges them.** `tauri-ui/src/lib/feeAlerts.ts`, against the PC's LOCAL day
+(`localDayNumber`), so the lines stay right offline over several days: overdue = due date before
+today; unpaid = not paid or overdue; due soon = paid and today <= due date <= today + N, N =
+`feeDueSoonDays`. Order: unpaid required, unpaid optional, due soon (soonest first); ties by the
+older due date, then the name. `AVerdict` (granted scans only) draws at most two lines under its
+footer, red « Frais « X » impayé » / « Passez à l'accueil pour le régler. » or gold « Frais « X » :
+expire dans N jour(s) » (« expire aujourd'hui » on the due day) / « Passez à l'accueil pour le
+renouveler. », the last line ending « +N autre(s) »; `AMulti` puts one small mark on a granted
+tile's photo (red when a fee is unpaid, else gold). `[TEST: tauri-ui src/lib/feeAlerts.test.ts
+(npm test)]` The layout on a real entry TV with two fee lines and the gold expiry footer together
+is `[UNVERIFIED]`: checked by type-check and by reading the 1280×720 stage sizes only.
 
 ---
 
