@@ -19,6 +19,7 @@ import { getApiBaseUrl, openSSE, get } from "@/api/client";
 import type { PopupEvent } from "@/api/types";
 import { LOCAL_API_PREFIX } from "@/config/appConst";
 import { buildPopupImageCandidates, toPopupCachedImageUrl } from "@/lib/popupImages";
+import { feeDueSoonDays, feeLinesView, parseFees, type FeeLine, type FeeLineKind, type PopupFee } from "@/lib/feeAlerts";
 // Self-hosted Hanken Grotesk (the entry screen's display face) — bundled by Vite so the
 // gym TVs render correctly offline, no Google Fonts request at runtime.
 import "@fontsource/hanken-grotesk/400.css";
@@ -89,6 +90,9 @@ function toPopupEvent(raw: any): PopupEvent {
     repeatLimit: Number(raw?.repeatLimit ?? 0) || 0,
     repeatWindowMin: Number(raw?.repeatWindowMin ?? 0) || 0,
     previousEntryAt: raw?.previousEntryAt ? String(raw.previousEntryAt) : undefined,
+    // Member fees F3c (guide §3.12). Absent from older engines: no fee, no line.
+    fees: parseFees(raw?.fees),
+    feeDueSoonDays: feeDueSoonDays(raw?.feeDueSoonDays),
   };
 }
 
@@ -168,7 +172,7 @@ const A_CATEGORY_LABEL: Record<ScanCategory, string> = {
 };
 
 type ScanMethod = "card" | "qr" | "fingerprint";
-type GlyphName = "check" | "cancel" | "cake" | "sparkle" | "schedule" | "card" | "qr" | "fingerprint" | "history";
+type GlyphName = "check" | "cancel" | "cake" | "sparkle" | "schedule" | "card" | "qr" | "fingerprint" | "history" | "alert";
 
 interface EntryScan {
   laneId: string;
@@ -191,6 +195,9 @@ interface EntryScan {
   repeatLimit: number;
   repeatWindowMin: number;
   previousEntryAt: Date | null;
+  // Member fees F3c: the member's fee lines and the gym's "expires soon" window (1-30 days).
+  fees: PopupFee[];
+  feeDueSoonDays: number;
 }
 
 // ── Formatting ──────────────────────────────────────────────────────────────
@@ -276,6 +283,8 @@ function mapLaneToScan(lane: ActiveLane): EntryScan {
     repeatLimit: Number(e.repeatLimit ?? 0) || 0,
     repeatWindowMin: Number(e.repeatWindowMin ?? 0) || 0,
     previousEntryAt: aParseDateTime(e.previousEntryAt),
+    fees: parseFees(e.fees),
+    feeDueSoonDays: feeDueSoonDays(e.feeDueSoonDays),
   };
 }
 
@@ -377,6 +386,7 @@ const A_PATHS: Partial<Record<GlyphName, string>> = {
   sparkle: "M12 2.2l1.95 6.15 6.15 1.95-6.15 1.95L12 18.4l-1.95-6.15L3.9 10.3l6.15-1.95z",
   history: "M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6a7 7 0 1 1 2.05 4.95l-1.42 1.42A9 9 0 1 0 13 3zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8z",
   schedule: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm-.9 4.4h1.8v5.35l4.15 2.47-.9 1.48-5.05-3.02z",
+  alert: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm-1 5h2v7h-2zm0 9h2v2h-2z",
   card: "M20 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2Zm0 14H4v-6h16zM20 8H4V6h16z",
 };
 
@@ -479,6 +489,38 @@ function APill({ children, bg, color }: { children: ReactNode; bg: string; color
   );
 }
 
+// ── Member fees (F3c, guide §3.12) ──────────────────────────────────────────
+// Granted scans only, under the footer (artboard 11): red = unpaid or overdue, gold = expires
+// soon (the membership-expiry footer's colours). At most two lines, the last one carrying
+// « +N autre(s) ». The lines, their order and their copy come from src/lib/feeAlerts.ts.
+const A_FEE_RED = "#5C0B19";
+
+function AFeeLine({ line, more }: { line: FeeLine; more: string | null }) {
+  const unpaid = line.kind === "unpaid";
+  const accent = unpaid ? A_RED_SUB : A_GOLD;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: "18px", padding: "16px 22px", borderRadius: "18px", background: unpaid ? A_FEE_RED : A_GOLD_INK }}>
+      <AGlyph name={unpaid ? "alert" : "schedule"} size={32} color={accent} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: "23px", fontWeight: 700, color: "#fff", marginBottom: "2px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{line.title}</div>
+        <div style={{ fontSize: "18px", fontWeight: 500, color: accent }}>{line.action}</div>
+      </div>
+      {!!more && <span style={{ flex: "none", fontSize: "18px", fontWeight: 600, color: accent, whiteSpace: "nowrap" }}>{more}</span>}
+    </div>
+  );
+}
+
+// The AMulti tile mark: one small disc on the photo medallion, red when a fee is unpaid,
+// gold when one only expires soon.
+function AFeeMark({ kind, size, left, top }: { kind: FeeLineKind; size: number; left: number; top: number }) {
+  const unpaid = kind === "unpaid";
+  return (
+    <span aria-hidden="true" style={{ position: "absolute", left: left + "px", top: top + "px", width: size + "px", height: size + "px", borderRadius: "50%", background: unpaid ? A_FEE_RED : A_GOLD_INK, color: unpaid ? A_RED_SUB : A_GOLD, display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 0 0 3px #fff" }}>
+      <AGlyph name={unpaid ? "alert" : "schedule"} size={Math.round(size * 0.7)} />
+    </span>
+  );
+}
+
 // ── 01 · The verdict screen (one scan) ──────────────────────────────────────
 function AVerdict({ scan, now, onImageError }: { scan: EntryScan; now: Date; onImageError: (laneId: string) => void }) {
   const f = aFieldFor(scan, now);
@@ -486,6 +528,8 @@ function AVerdict({ scan, now, onImageError }: { scan: EntryScan; now: Date; onI
   const age = birthday ? aAgeToday(scan.birthday, now) : null;
   const daysLeft = scan.granted ? aDaysLeft(scan.validTo, now) : null;
   const expiring = !birthday && daysLeft != null && daysLeft > 0 && daysLeft <= 7;
+  // Member fees F3c: granted scans only; empty for nearly every member.
+  const fee = scan.granted ? feeLinesView(scan.fees, now, scan.feeDueSoonDays) : null;
 
   const firstSize = aFirstSize(scan.firstName, 132);
   const lastSize = aLastSize(firstSize, scan.lastName);
@@ -628,6 +672,15 @@ function AVerdict({ scan, now, onImageError }: { scan: EntryScan; now: Date; onI
             </span>
           </div>
         )}
+
+        {/* member fees (F3c) — under the footer, at most two lines */}
+        {fee && fee.shown.length > 0 && (
+          <div style={{ flex: "none", display: "flex", flexDirection: "column", gap: "10px", marginTop: "12px" }}>
+            {fee.shown.map((line, i) => (
+              <AFeeLine key={line.kind + "|" + line.name + "|" + i} line={line} more={i === fee.shown.length - 1 ? fee.moreText : null} />
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -671,6 +724,7 @@ function AMulti({ scans, now, onImageError }: { scans: EntryScan[]; now: Date; o
           const deny = scan.granted ? null : aDenyCopy(scan.reason);
           const firstSize = aFirstSize(scan.firstName, firstBase);
           const lastSize = aLastSize(firstSize, scan.lastName);
+          const feeMark = scan.granted ? feeLinesView(scan.fees, now, scan.feeDueSoonDays).mark : null;
           return (
             <div
               key={scan.laneId}
@@ -691,6 +745,7 @@ function AMulti({ scans, now, onImageError }: { scans: EntryScan[]; now: Date; o
               <AGlyph name={f.glyph} size={watermark} color={f.ink} opacity={f.glyphOpacity + 0.01} style={{ position: "absolute", right: "-52px", bottom: "-52px" }} />
               <div style={{ position: "relative", marginBottom: dense ? "16px" : "22px" }}>
                 <APhoto scan={scan} field={f} size={photo} ring={photoRing} onImageError={onImageError} />
+                {feeMark && <AFeeMark kind={feeMark} size={dense ? 28 : 34} left={photo - (dense ? 22 : 26)} top={photo - (dense ? 22 : 26)} />}
               </div>
               <div style={{ position: "relative", flex: 1, minHeight: 0 }}>
                 <div style={{ ...A_EYEBROW, fontSize: ebSize + "px", color: f.soft, marginBottom: dense ? "9px" : "12px" }}>

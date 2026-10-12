@@ -1,5 +1,7 @@
 // TypeScript types aligned with real /api/v2/ responses from local_access_api_v2.py
 
+import type { PopupFee } from "@/lib/feeAlerts";
+
 // ─── Common ───
 export interface ApiOk { ok: true }
 
@@ -1245,6 +1247,10 @@ export interface PopupEvent {
   userImageStatus?: string;
   /** User profile image URL (USER_AVATAR), used as fallback when userImage fails or is empty */
   userProfileImage?: string;
+  /** Member fees F3c: the member's fee lines (not settled, not paused); absent or [] when none. */
+  fees?: PopupFee[];
+  /** accessSoftwareSettings.feeDueSoonDays (1-30, default 7), sent with each event. */
+  feeDueSoonDays?: number;
 }
 
 // ─── N) Host Monitor & Binding (A9) ───
