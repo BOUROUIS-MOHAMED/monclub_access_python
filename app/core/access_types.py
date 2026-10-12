@@ -1,8 +1,8 @@
 # app/core/access_types.py
 """Shared dataclasses used by both AGENT and ULTRA realtime engines."""
 
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -66,6 +66,12 @@ class NotificationRequest:
     repeat_limit: int = 0
     repeat_window_min: int = 0
     previous_entry_at: str = ""
+
+    # ── Member fees (F3c, guide §3.12) ──
+    # The scanning member's fee lines as cached in sync_users.fees_json: [{name, dueDate,
+    # required, paid}], only fees not settled and not paused; [] when none. DISPLAY ONLY: the
+    # entry screen judges them against its own today (tauri-ui src/lib/feeAlerts.ts).
+    fees: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

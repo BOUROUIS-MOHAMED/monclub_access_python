@@ -6552,6 +6552,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             image_source=image_source,
             user_image_status=user_image_status,
             user_profile_image=user_profile_image,
+            user_fees=(user.get("fees") if isinstance(user, dict) else None),
             # for the frequent-pass visual alert only
             user_id=_uid_for_alert(user),
             door_id=door_id,
@@ -6798,6 +6799,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             image_source=image_source,
             user_image_status=user_image_status,
             user_profile_image=user_profile_image,
+            user_fees=(user.get("fees") if isinstance(user, dict) else None),
             # for the frequent-pass visual alert only
             user_id=_uid_for_alert(user),
             door_id=door_id,
@@ -6972,6 +6974,8 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         user_membership_plan_id: Optional[int] = None,
         user_id: Optional[int] = None,
         door_id: Optional[int] = None,
+        # Member fees F3c: the member's cached fee lines, for the entry screen only (guide §3.12).
+        user_fees: Optional[List[Dict[str, Any]]] = None,
     ):
         t0 = time.monotonic()
         # The desk alerts (desk_alerts.py: Windows toast, daily pass alert, repeat-block sound),
@@ -7054,6 +7058,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                 image_source=image_source,
                 user_image_status=user_image_status,
                 user_profile_image=user_profile_image,
+                fees=list(user_fees or []),
                 popup_duration_sec=int(self._settings.get("popup_duration_sec", 3)),
                 popup_enabled=True,
                 win_notify_enabled=bool(self._settings.get("win_notify_enabled", False)),

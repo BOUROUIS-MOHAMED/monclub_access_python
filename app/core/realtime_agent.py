@@ -362,6 +362,17 @@ class CommandResult:
     cmd_ms: float
 
 
+def _popup_fee_due_soon_days() -> int:
+    """accessSoftwareSettings.feeDueSoonDays as the PC stores it (1-30, default 7).
+
+    Read only for an event that carries fees, from the settings cache (30 s TTL), on the local
+    API thread that drains the popup queue -- never on the door path. guide §3.12."""
+    try:
+        return int(_get_backend_global_settings().get("fee_due_soon_days") or 7)
+    except Exception:
+        return 7
+
+
 def _popup_payload_from_request(req: NotificationRequest) -> Dict[str, Any]:
     return {
         "eventId": req.event_id,
@@ -394,6 +405,9 @@ def _popup_payload_from_request(req: NotificationRequest) -> Dict[str, Any]:
         "repeatLimit": req.repeat_limit,
         "repeatWindowMin": req.repeat_window_min,
         "previousEntryAt": req.previous_entry_at,
+        # Member fees F3c (guide §3.12): the lines the entry screen judges against its today.
+        "fees": list(req.fees or []),
+        "feeDueSoonDays": _popup_fee_due_soon_days() if req.fees else 7,
     }
 
 
@@ -1525,6 +1539,7 @@ class DecisionService(threading.Thread):
                 popup_enabled=bool(settings.get("popup_enabled", True)),
                 win_notify_enabled=bool(settings.get("win_notify_enabled", True)),
                 user_profile_image=user_profile_image,
+                fees=list(user.get("fees") or []) if isinstance(user, dict) else [],
             )
 
             # Windows notification (per-device winNotifyEnabled)
