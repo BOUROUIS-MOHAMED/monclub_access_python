@@ -1043,6 +1043,7 @@ def _handle_auth_login(ctx: _Ctx) -> None:
 
         from access.store import save_auth_token
         save_auth_token(email=email, token=token)
+        _reset_gym_name_refresh(ctx.app)
         try:
             from tv.auth_bridge import mirror_access_auth_to_tv
 
@@ -1073,6 +1074,14 @@ def _handle_auth_login(ctx: _Ctx) -> None:
     except Exception as e:
         ctx.app.logger.exception("Login failed via API v2")
         ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
+def _reset_gym_name_refresh(app: Any) -> None:
+    """Profil's gym name: the next online sync fetches it again (guide §3.13). Never fatal."""
+    try:
+        app._gym_name_refresher.reset()
+    except Exception:
+        pass
 
 
 def _handle_auth_status(ctx: _Ctx) -> None:
@@ -1345,6 +1354,7 @@ def _handle_auth_logout(ctx: _Ctx) -> None:
         pass
     from access.store import clear_auth_token
     clear_auth_token()
+    _reset_gym_name_refresh(ctx.app)
     try:
         from tv.auth_bridge import clear_tv_auth_bridge_state
 

@@ -4805,7 +4805,11 @@ local_access_api_v2.py::_build_status_payload_uncached; grep finds no other read
   is read **without** a signature check (`::read_jwt_claims`); the backend checks it on every
   call. The token's length is the backend's `app.jwt.access-expiry-ms` (env
   `JWT_ACCESS_EXPIRY_MS`, 30-day fallback), so `exp − iat` is read, never assumed. A missing or
-  non-numeric claim is `null`. `[TEST: tests/test_profile_session_data.py]`
+  non-numeric claim is `null`. `[TEST: tests/test_profile_session_data.py]` Production issued
+  30-day tokens on 2026-08-30: a PC snapshot's `auth_state` has `last_login_at` 2026-08-30 21:05
+  and `next_refresh_at` (= expiresAt − 3 days) 2026-09-26 21:05 UTC. `[FIELD:
+  _wd_pc_snapshot_2026-10-10, _l4_pc_snapshot_2026-10-09 access.db]` (`MonClubApi.login`'s
+  docstring still says "7-day JWT" — stale.)
   This is the token's clock, **not** the local restriction's: `_restriction_reasons` /
   `_compute_expiry_warnings` measure `last_login_at` + `max_login_age_minutes` (default
   43200 = 30 days, naive local time). Both restart on a successful refresh
@@ -4827,10 +4831,11 @@ local_access_api_v2.py::_build_status_payload_uncached; grep finds no other read
 
 **When gym/me is called.** From the sync worker, after a sync that reached the backend
 (`sync_online`), through `app/core/gym_info.py::GymNameRefresher.maybe_refresh`: one daemon
-thread at a time, the sync never waits. Due at the first online sync after start, at once when
-the login e-mail changes (a login triggers a sync; the TV login mirror changes it too), then once
-an hour after any backend answer (an HTTP refusal included) or 5 minutes after a transport
-failure. A failure is logged and changes nothing else — no logout, no token change. No new poll
+thread at a time, the sync never waits. Due at the first online sync after start, at once after
+an Access login or logout (`local_access_api_v2.py::_reset_gym_name_refresh` -> `reset()`; a
+login triggers a sync) or when the login e-mail changes (the TV login mirror), then once an hour
+after any backend answer (an HTTP refusal included) or 5 minutes after a transport failure. A
+fetch still in flight at a reset finishes but does not re-arm the throttle. A failure is logged and changes nothing else — no logout, no token change. No new poll
 loop. `[TEST: tests/test_profile_session_data.py]` Not seen against the live backend or in the
 running app `[UNVERIFIED]`.
 

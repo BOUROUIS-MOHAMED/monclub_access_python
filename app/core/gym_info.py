@@ -7,8 +7,8 @@ anyone out -- a refused call (401 included) is logged and retried later, nothing
 It rides the sync worker: ``maybe_refresh`` is called after a sync that reached the backend
 and starts at most one daemon thread at a time, so the sync never waits on it. No new poll
 loop. Throttle: once per ``SUCCESS_INTERVAL_SEC`` after any backend answer (an HTTP refusal
-included), ``RETRY_INTERVAL_SEC`` after a transport failure, and at once when the login e-mail
-changes (a new login, the TV login mirror).
+included), ``RETRY_INTERVAL_SEC`` after a transport failure, and at once after an Access login
+or logout (``reset``) or when the login e-mail changes (the TV login mirror).
 """
 
 from __future__ import annotations
@@ -51,6 +51,17 @@ class GymNameRefresher:
         self._inflight = False
         self._next_due = 0.0
         self._last_email = ""
+        self._generation = 0
+
+    def reset(self) -> None:
+        """Make the next online sync fetch: called on a successful login and on logout. Logout
+        deletes the cached name with the auth_state row, so logging back in with the SAME
+        e-mail would otherwise wait out the throttle with no name. A fetch still in flight
+        finishes but no longer sets the throttle."""
+        with self._lock:
+            self._generation += 1
+            self._next_due = 0.0
+            self._last_email = ""
 
     @staticmethod
     def _daemon_thread(fn: Callable[[], None]) -> None:
@@ -72,8 +83,9 @@ class GymNameRefresher:
                 return False
             self._inflight = True
             self._last_email = email
+            generation = self._generation
         try:
-            self._start_thread(lambda: self._fetch(email, auth.token))
+            self._start_thread(lambda: self._fetch(email, auth.token, generation))
         except Exception:
             with self._lock:
                 self._inflight = False
@@ -81,7 +93,7 @@ class GymNameRefresher:
             return False
         return True
 
-    def _fetch(self, email: str, token: str) -> None:
+    def _fetch(self, email: str, token: str, generation: int) -> None:
         from app.core.db import save_gym_name
 
         interval = RETRY_INTERVAL_SEC
@@ -98,5 +110,6 @@ class GymNameRefresher:
                 interval = SUCCESS_INTERVAL_SEC
         finally:
             with self._lock:
-                self._next_due = self._clock() + interval
+                if generation == self._generation:
+                    self._next_due = self._clock() + interval
                 self._inflight = False

@@ -248,6 +248,44 @@ def test_one_fetch_at_a_time(db) -> None:
     assert r.maybe_refresh() is True
 
 
+def test_logging_back_in_with_the_same_email_fetches_at_the_next_online_sync(db) -> None:
+    db.save_auth_token(email="gym@club.tn", token=GYM_TOKEN)
+    api, clock = _Api({"name": "Oxyfit Lac"}), _Clock()
+    r = _refresher(api, clock)
+    assert r.maybe_refresh() is True
+    db.clear_auth_token()  # logout drops the cached name with the row
+    r.reset()
+    db.save_auth_token(email="gym@club.tn", token=GYM_TOKEN)
+    r.reset()
+    assert db.load_gym_name("gym@club.tn") is None
+    assert r.maybe_refresh() is True  # not throttled for an hour
+    assert db.load_gym_name("gym@club.tn") == "Oxyfit Lac"
+
+
+def test_a_fetch_in_flight_at_reset_does_not_rearm_the_throttle(db) -> None:
+    db.save_auth_token(email="gym@club.tn", token=GYM_TOKEN)
+    started = []
+    r = gym_info.GymNameRefresher(api_factory=lambda: _Api({"name": "Oxyfit Lac"}), logger=logging.getLogger("t"),
+                                  clock=_Clock(), start_thread=started.append)
+    assert r.maybe_refresh() is True
+    r.reset()
+    started[0]()  # the old fetch finishes after the reset
+    assert r.maybe_refresh() is True
+
+
+def test_the_login_and_logout_handlers_reset_the_refresh_and_never_fail_on_it() -> None:
+    import inspect
+
+    calls = []
+    local_access_api_v2._reset_gym_name_refresh(SimpleNamespace(_gym_name_refresher=SimpleNamespace(
+        reset=lambda: calls.append(1))))
+    local_access_api_v2._reset_gym_name_refresh(SimpleNamespace())  # no refresher: no error
+    assert calls == [1]
+    for handler in (local_access_api_v2._handle_auth_login, local_access_api_v2._handle_auth_logout):
+        src = inspect.getsource(handler)
+        assert "_reset_gym_name_refresh(ctx.app)" in src, handler.__name__
+
+
 # ================================================================ MonClubApi.get_gym_me
 class _Resp:
     def __init__(self, status, body=None, text=""):
