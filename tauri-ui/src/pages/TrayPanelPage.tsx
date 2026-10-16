@@ -133,7 +133,9 @@ function normalizeDevice(raw: unknown): Omit<PanelDevice, "statusTone" | "status
     description: toStringValue(source.description, ""),
     accessDataMode: toStringValue(source.accessDataMode ?? source.access_data_mode, "UNKNOWN").toUpperCase(),
     // Empty string = no address (shown as « Adresse absente »), never a placeholder.
-    ipAddress: toStringValue(source.ipAddress ?? source.ip_address ?? source.ip, "").trim(),
+    ipAddress: [source.ipAddress, source.ip_address, source.ip]
+      .map((value) => toStringValue(value, "").trim())
+      .find(Boolean) ?? "",
     portNumber: toStringValue(source.portNumber ?? source.port_number ?? source.port, "4370"),
     platform: toStringValue(source.platform, ""),
     model: toStringValue(source.model, ""),
@@ -410,7 +412,8 @@ export default function TrayPanelPage() {
         : {
             tone: "success",
             icon: CircleCheck,
-            title: "Porte ouverte",
+            // A 2xx means the controller accepted the command, not that the door was seen opening.
+            title: "Commande d’ouverture acceptée",
             message: `${device.name} · ${preset.doorName} (${preset.pulseSeconds} s)`,
           });
     } catch (openError) {
@@ -481,7 +484,7 @@ export default function TrayPanelPage() {
             </button>
           </div>
 
-          {!showLoginState && (
+          {!showLoginState && !panelBusy && (
             <>
               <div className={cn("mt-3 grid gap-2", showRole ? "grid-cols-3" : "grid-cols-2")}>
                 <PanelStat icon={Router} label="Appareils" value={String(devices.length)} hint={modeHint} />

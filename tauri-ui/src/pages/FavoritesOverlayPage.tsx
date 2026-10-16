@@ -103,7 +103,7 @@ function clamp(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
 }
 
-// Flash tones: success = the controller accepted the open; info = filed for the
+// Flash tones: success = the controller accepted the open command; info = filed for the
 // PC pilote (its result is not visible here); warning = filed but the PC pilote is
 // offline, so it will expire; error = refused or failed.
 type FlashTone = Extract<Tone, "success" | "info" | "warning" | "error">;
@@ -373,7 +373,7 @@ export default function FavoritesOverlayPage() {
           // Keyed on the favourite so its row lights up like a click would.
           const key = String(p.favoriteId);
           if (p.ok) {
-            setFlash({ key, tone: "success", msg: `${p.shortcut} → ${label} : porte ouverte` });
+            setFlash({ key, tone: "success", msg: `${p.shortcut} → ${label} : ouverture acceptée` });
           } else if (p.error === RUST_REQUEST_SENT) {
             setFlash({ key, tone: "info", msg: `${p.shortcut} → ${label} : demande envoyée au PC pilote. Son résultat n'est pas visible ici.` });
           } else if (p.error === RUST_REQUEST_DRIVER_OFFLINE) {
@@ -508,7 +508,8 @@ export default function FavoritesOverlayPage() {
       if (res?.requested) {
         setFlash({ key, tone: res.targetConnected ? "info" : "warning", msg: `${title} : ${lowerFirst(doorRequestedMessage(res))}` });
       } else {
-        setFlash({ key, tone: "success", msg: `${title} : porte ouverte` });
+        // A 2xx means the controller accepted the command, not that the door was seen opening.
+        setFlash({ key, tone: "success", msg: `${title} : ouverture acceptée` });
       }
     } catch (err) {
       setFlash({ key, tone: "error", msg: `${favoriteTitle(fav, index)} : ${String(err)}` });
