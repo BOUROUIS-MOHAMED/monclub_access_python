@@ -17,6 +17,8 @@ One engine, two targets (``access`` / ``tv``). What it does:
 - **Loop guard** in ``{app}\\state\\update_state.json``: a crash / failed-after-copy result bans
   the version from auto-install; a health timeout (or no result at all) gets one retry.
 - **Health marker** ``boot_ok.json`` once the local API listens (``on_local_api_ready``).
+- **Manual rollback** (``launch_rollback``, Access only): put ``previous\\`` back through the existing
+  restore helper after the app exits, and ban the version left from automatic install.
 - **Telemetry** (D19): every result goes to an outbox in update_state.json and is POSTed to
   ``softwareUpdateEvent`` with an idempotent ``eventId``.
 """
@@ -42,10 +44,12 @@ from shared.release_keys import trusted_keys
 from shared.release_manifest import OfferRefused, VerifiedOffer, verify_offer
 from shared.runtime_support import is_frozen, runtime_base_dir
 from shared.update_files import (
+    CLAIM_GLOB,
     UpdatePaths,
     consume_marker,
     last_boot_epoch,
     parse_utc_iso,
+    previous_is_complete,
     read_json,
     setup_is_running,
     utc_now_iso,
@@ -56,6 +60,7 @@ from shared.update_versions import compare_versions, installed_version_text, par
 from shared.update_wrapper import (
     HelperLaunchError,
     build_install_script,
+    build_restore_script,
     launch_hidden_powershell,
     setup_image_ps_re,
     setup_log_path,
@@ -76,7 +81,18 @@ _TELEMETRY_RETRY_CODES = (401, 403, 408, 428, 429)
 # Anything else (health_timeout, interrupted, no result, Setup exit) gets one retry.
 # restore_failed is NOT here (L4 review M2): a restore can fail on a version that never ran (a backup or a
 # power cut interrupted before the copy, then an antivirus lock) -- it is a strike.
-_BAN_REASONS = {"crash", "after_copy_failed", "setup_failed", "copy_failed", "post_install_failed"}
+# A version the user rolled back from by hand (« Revenir à la version précédente »): launch_rollback bans
+# it itself before the app exits -- the build that consumes the result is the OLDER one, which has its
+# own copy of this set -- and update_helper.ps1 writes it as the ROLLED_BACK reason.
+USER_ROLLBACK_REASON = "user_rollback"
+_BAN_REASONS = {"crash", "after_copy_failed", "setup_failed", "copy_failed", "post_install_failed", USER_ROLLBACK_REASON}
+# Oldest version a manual rollback may return to: the first updater v2 release (design.md section 2,
+# "Remote rollback / downgrade works only for PCs already on >= 1.5.0"). An older client does not read
+# update_state.json, so it would not honour the ban and would update straight back.
+ROLLBACK_MIN_VERSION = "1.5.0"
+# Setup's pause sentinel {app}\.update-in-progress counts as a running update for this long (the rule of
+# access/watchdog_control.py).
+_SENTINEL_MAX_AGE_SEC = 30 * 60
 TELEMETRY_RESULTS = {"PENDING", "INSTALLED", "ROLLED_BACK", "ABORTED", "VERIFY_FAILED", "DOWNLOAD_FAILED"}
 # GetTickCount64-derived boot times drift by a second or two between reads.
 _BOOT_EPOCH_SLACK_SEC = 120
@@ -213,6 +229,26 @@ class UpdateStatus:
     latest_release: Optional[Dict[str, Any]] = None
     download_progress: Optional[int] = None
     progress: Optional[int] = None
+
+
+class RollbackRefused(RuntimeError):
+    """The manual rollback did not start; the app keeps running. ``code`` is for the UI."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+_ROLLBACK_REFUSALS = {
+    "not_supported": "Rollback is only available for MonClub Access.",
+    "not_installed_build": "Rollback works only in an installed build running from {app}\\current.",
+    "no_previous": "No complete previous version is kept on this PC.",
+    "previous_unreadable": "The previous version's version.json cannot be read.",
+    "previous_other_component": "The previous folder holds another product.",
+    "previous_not_older": "The previous version is not older than the running one.",
+    "previous_too_old": f"The previous version is older than {ROLLBACK_MIN_VERSION}: it would update itself straight back.",
+    "helper_missing": "The installed restore helper (watchdog\\update_helper.ps1) is missing.",
+}
 
 
 class UpdateStateStore:
@@ -941,6 +977,159 @@ class ComponentUpdateManager:
         if entry.get("banned"):
             self._log("warning", "version %s will not be installed automatically again: %s", version, entry["banReason"])
 
+    # ------------------------------------------------------------------ manual rollback
+
+    def local_rollback_info(self) -> Dict[str, Any]:
+        """Whether « Revenir à la version précédente » can run, from files only (the Update page reads
+        it every 3 s): Access, a frozen build in ``{app}\\current``, a complete ``previous\\`` holding
+        an older Access version >= ROLLBACK_MIN_VERSION, and the installed restore helper. The
+        process checks (Setup running, a journal or claim) are made by ``launch_rollback``."""
+        current = self.get_current_version()
+        info: Dict[str, Any] = {"available": False, "currentVersion": current, "previousVersion": None, "reason": None}
+
+        def refuse(code: str) -> Dict[str, Any]:
+            info["reason"] = code
+            return info
+
+        if self.target != "access":
+            return refuse("not_supported")
+        if not self._auto_install_allowed:
+            return refuse("not_installed_build")
+        if not previous_is_complete(self.paths, self.component.main_exe_name):
+            return refuse("no_previous")
+        payload = read_json(self.paths.previous_dir / "version.json") or {}
+        previous = installed_version_text(payload.get("version") or "")
+        if not parse_version(previous):
+            return refuse("previous_unreadable")
+        info["previousVersion"] = previous
+        component = _lower(payload.get("component"))
+        if component and component != self.target:
+            return refuse("previous_other_component")
+        order = compare_versions(previous, current)
+        if order is None or order >= 0:
+            return refuse("previous_not_older")
+        floor = compare_versions(previous, ROLLBACK_MIN_VERSION)
+        if floor is None or floor < 0:
+            return refuse("previous_too_old")
+        if not (self.install_root / "watchdog" / "update_helper.ps1").is_file():
+            return refuse("helper_missing")
+        info["available"] = True
+        return info
+
+    def launch_rollback(
+        self,
+        *,
+        expected_previous: Optional[str] = None,
+        expected_current: Optional[str] = None,
+        app_pid: Optional[int] = None,
+    ) -> int:
+        """Start the restore of ``previous\\`` into ``current\\``; returns the helper's pid.
+
+        No copy code of its own: it writes the install journal phase ``restoring`` (from = the
+        previous version, to = the running one, setupPid = this process, reason user_rollback) and
+        starts the start-up check's restore helper (shared/update_wrapper.py::build_restore_script).
+        That helper waits for this process to exit, then runs the INSTALLED update_helper.ps1
+        ``-Action recover`` -- the code Setup and the watchdog run -- which claims the journal,
+        mirrors previous -> current, writes ``ROLLED_BACK`` (from = running, to = previous, reason
+        user_rollback) and the helper restarts the app. While this process lives the journal is not
+        stale, so the watchdog and a new start-up stand down; once it exits, any of them finishes it.
+
+        Before that it bans the running version from automatic install (the loop guard's
+        ``versions`` ban, read by every v2 engine: the start-up gate and the 24 h fallback skip it;
+        the Update page button still installs it) and, once the helper runs, drops the pending
+        download, so the restored version does not update itself at its first start.
+
+        Raises RollbackRefused (nothing changed, the app keeps running). The caller quits the app
+        ONLY after this returns."""
+        if not self._install_lock.acquire(blocking=False):
+            raise RollbackRefused("busy", "An install or a rollback is already starting.")
+        try:
+            info = self.local_rollback_info()
+            if not info["available"]:
+                code = str(info["reason"])
+                raise RollbackRefused(code, _ROLLBACK_REFUSALS.get(code, code))
+            previous, current = str(info["previousVersion"]), str(info["currentVersion"])
+            if (expected_previous is not None and expected_previous != previous) or (
+                expected_current is not None and expected_current != current
+            ):
+                raise RollbackRefused(
+                    "changed", f"The versions changed: running {current}, previous {previous}. Reload the page."
+                )
+            if self.status.installing:
+                raise RollbackRefused("busy", "An install is already starting.")
+            if self._setup_running():
+                raise RollbackRefused("setup_running", "An installer of MonClub Access is running.")
+            if self.paths.journal.exists() or any(self.paths.state_dir.glob(CLAIM_GLOB)):
+                raise RollbackRefused("journal_present", "An install or a restore is in progress (install journal present).")
+            sentinel = self.install_root / ".update-in-progress"
+            try:
+                if self._clock() - sentinel.stat().st_mtime <= _SENTINEL_MAX_AGE_SEC:
+                    raise RollbackRefused("update_in_progress", "An update is in progress (pause sentinel present).")
+            except OSError:
+                pass  # no sentinel
+            pid = os.getpid() if app_pid is None else int(app_pid)
+            now = self._clock()
+            saved: Dict[str, Any] = {}
+
+            def ban(d: Dict[str, Any]) -> None:
+                versions = d.setdefault("versions", {})
+                saved["entry"] = dict(versions[current]) if isinstance(versions.get(current), dict) else None
+                entry = versions.setdefault(current, {})
+                entry["banned"] = True
+                entry["banReason"] = USER_ROLLBACK_REASON
+
+            def unban(d: Dict[str, Any]) -> None:
+                versions = d.setdefault("versions", {})
+                if saved.get("entry") is None:
+                    versions.pop(current, None)
+                else:
+                    versions[current] = saved["entry"]
+
+            # Ban first: a process that dies after the journal is written still gets rolled back (the
+            # journal goes stale with its pid), and must not be re-updated then.
+            self.state.update(ban)
+            journal = {
+                "phase": "restoring",
+                "from": previous,
+                "to": current,
+                "at": utc_now_iso(now),
+                "setupPid": pid,
+                "reason": USER_ROLLBACK_REASON,
+            }
+            try:
+                write_json_atomic(self.paths.journal, journal)
+                script = build_restore_script(
+                    setup_image_re=setup_image_ps_re(self.target),
+                    app_pid=pid,
+                    install_root=self.install_root,
+                    exe_name=self.component.main_exe_name,
+                    restore_log=self.paths.logs_dir / "update-restore.log",
+                )
+                helper_pid = self._launcher(script, cwd=self.paths.state_dir)
+            except Exception as exc:
+                # A journal left behind would roll the PC back at its next start: remove it.
+                try:
+                    self.paths.journal.unlink()
+                except OSError:
+                    pass
+                self.state.update(unban)
+                self._log("error", "could not start the rollback restore helper: %s", exc)
+                raise RollbackRefused("launch_failed", f"Could not start the restore helper: {exc}")
+            self.status.installing = True
+            self._discard_pending(f"rolled back by hand from {current} to {previous}")
+            self._log(
+                "warning",
+                "manual rollback %s -> %s: restore helper started (pid=%s, log %s); %s banned from automatic install; the app now exits",
+                current,
+                previous,
+                helper_pid,
+                self.paths.logs_dir / "update-restore.log",
+                current,
+            )
+            return helper_pid
+        finally:
+            self._install_lock.release()
+
     # ------------------------------------------------------------------ results
 
     def consume_results(self, *, at_boot: bool = False) -> Optional[Dict[str, Any]]:
@@ -1494,6 +1683,9 @@ __all__ = [
     "DownloadCancelled",
     "DownloadRefused",
     "InstallRefused",
+    "ROLLBACK_MIN_VERSION",
+    "RollbackRefused",
+    "USER_ROLLBACK_REASON",
     "UpdateInstallStarted",
     "UpdateStateStore",
     "UpdateStatus",
