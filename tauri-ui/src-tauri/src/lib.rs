@@ -180,7 +180,9 @@ fn local_api_token() -> String {
     env::var("MONCLUB_LOCAL_API_TOKEN").unwrap_or_default()
 }
 
-fn fetch_devices(port: u16) -> Vec<DeviceInfo> {
+/// `None` when the list could not be read (local API not up yet, error answer), so the
+/// tray menu does not claim « Aucun appareil » for a failed read.
+fn fetch_devices(port: u16) -> Option<Vec<DeviceInfo>> {
     let url = format!("{}/sync/cache/devices", api_base(port));
     reqwest::blocking::Client::new()
         .get(&url)
@@ -189,7 +191,6 @@ fn fetch_devices(port: u16) -> Vec<DeviceInfo> {
         .ok()
         .and_then(|r| r.json::<DevicesResponse>().ok())
         .map(|r| r.devices)
-        .unwrap_or_default()
 }
 
 fn fetch_presets(port: u16, device_id: i64) -> Vec<DoorPreset> {
@@ -427,16 +428,42 @@ fn refresh_tray_menu(app: AppHandle, state: tauri::State<'_, ApiPort>) -> Result
     // Fetch data on a thread to not block the main thread
     std::thread::spawn(move || {
         let devices = fetch_devices(port);
-        let _ = rebuild_tray_menu(&app_clone, port, &devices);
+        let _ = rebuild_tray_menu(&app_clone, port, devices.as_deref());
     });
 
     Ok(())
 }
 
+/// Tray label of a device: its name (« Appareil #id » when it has none), then its address.
+fn tray_device_label(dev: &DeviceInfo) -> String {
+    let name = dev
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Appareil #{}", dev.id));
+    match dev.ip_address.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(ip) => format!("{} · {}", name, ip),
+        None => name,
+    }
+}
+
+/// Tray label of a door preset, as the design writes it: « Entrée · porte 1 · 3 s »
+/// (« Porte 1 · 3 s » when the preset has no door name, like `TrayPanelPage.tsx`).
+fn tray_preset_label(preset: &DoorPreset) -> String {
+    let door = preset.door_name.trim();
+    if door.is_empty() {
+        format!("Porte {} · {} s", preset.door_number, preset.pulse_seconds)
+    } else {
+        format!("{} · porte {} · {} s", door, preset.door_number, preset.pulse_seconds)
+    }
+}
+
 fn rebuild_tray_menu(
     app: &AppHandle,
     port: u16,
-    devices: &[DeviceInfo],
+    devices: Option<&[DeviceInfo]>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // ── Open submenu (devices → presets) ──
     let mut open_sub = SubmenuBuilder::with_id(app, "tray_open", "Ouvrir une porte");
@@ -444,53 +471,52 @@ fn rebuild_tray_menu(
         open_sub = open_sub.submenu_icon(icon);
     }
 
-    if devices.is_empty() {
-        let no_dev = MenuItemBuilder::with_id("tray_no_devices", "Aucun appareil")
-            .enabled(false)
-            .build(app)?;
-        open_sub = open_sub.item(&no_dev);
-    } else {
-        for dev in devices {
-            let dev_name = dev.name.as_deref().unwrap_or("Appareil");
-            let dev_label = format!(
-                "[{}] {}{}",
-                dev.id,
-                dev_name,
-                dev.ip_address
-                    .as_deref()
-                    .map(|ip| format!(" ({})", ip))
-                    .unwrap_or_default()
-            );
+    match devices {
+        Some(list) if !list.is_empty() => {
+            for dev in list {
+                let dev_label = tray_device_label(dev);
+                let presets = fetch_presets(port, dev.id);
 
-            let presets = fetch_presets(port, dev.id);
-
-            if presets.is_empty() {
-                // No presets → single disabled item
-                let item_id = format!("tray_dev_{}_nopreset", dev.id);
-                let item =
-                    MenuItemBuilder::with_id(item_id, format!("{} — aucun preset", dev_label))
-                        .enabled(false)
-                        .build(app)?;
-                open_sub = open_sub.item(&item);
-            } else {
-                // Device submenu with presets
-                let mut dev_sub =
-                    SubmenuBuilder::with_id(app, format!("tray_dev_{}", dev.id), &dev_label);
-                for preset in &presets {
-                    let preset_label = format!(
-                        "{} (porte #{}, {}s)",
-                        preset.door_name, preset.door_number, preset.pulse_seconds
-                    );
-                    let item_id = format!(
-                        "tray_open_{}_{}_{}",
-                        dev.id, preset.door_number, preset.pulse_seconds
-                    );
-                    let item = MenuItemBuilder::with_id(item_id, preset_label).build(app)?;
-                    dev_sub = dev_sub.item(&item);
+                if presets.is_empty() {
+                    // No presets → single disabled item
+                    let item_id = format!("tray_dev_{}_nopreset", dev.id);
+                    let item = MenuItemBuilder::with_id(
+                        item_id,
+                        format!("{} · aucun preset de porte", dev_label),
+                    )
+                    .enabled(false)
+                    .build(app)?;
+                    open_sub = open_sub.item(&item);
+                } else {
+                    // Device submenu with presets
+                    let mut dev_sub =
+                        SubmenuBuilder::with_id(app, format!("tray_dev_{}", dev.id), &dev_label);
+                    for preset in &presets {
+                        let item_id = format!(
+                            "tray_open_{}_{}_{}",
+                            dev.id, preset.door_number, preset.pulse_seconds
+                        );
+                        let item = MenuItemBuilder::with_id(item_id, tray_preset_label(preset))
+                            .build(app)?;
+                        dev_sub = dev_sub.item(&item);
+                    }
+                    let dev_menu = dev_sub.build()?;
+                    open_sub = open_sub.item(&dev_menu);
                 }
-                let dev_menu = dev_sub.build()?;
-                open_sub = open_sub.item(&dev_menu);
             }
+        }
+        other => {
+            // A list that could not be read (local API not up yet, error answer) is not
+            // "no device": say so; the next refresh (5 min, or a sync) retries.
+            let label = if other.is_none() {
+                "Liste des appareils non chargée"
+            } else {
+                "Aucun appareil"
+            };
+            let no_dev = MenuItemBuilder::with_id("tray_no_devices", label)
+                .enabled(false)
+                .build(app)?;
+            open_sub = open_sub.item(&no_dev);
         }
     }
 
@@ -621,7 +647,7 @@ fn show_popup_window(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> 
         POPUP_LABEL,
         tauri::WebviewUrl::App("/popup".into()),
     )
-    .title("MonClub Access — Écran Notification")
+    .title("MonClub Access — Écran d’entrée")
     .inner_size(1024.0, 600.0)
     .resizable(true)
     .decorations(true)
@@ -1512,7 +1538,7 @@ fn setup_access_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::
     }
     let open_sub = open_sub
         .item(
-            &MenuItemBuilder::with_id("tray_no_devices", "Chargement…")
+            &MenuItemBuilder::with_id("tray_no_devices", "Chargement des appareils…")
                 .enabled(false)
                 .build(app)?,
         )
