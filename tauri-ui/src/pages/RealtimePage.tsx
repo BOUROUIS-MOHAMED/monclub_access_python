@@ -37,6 +37,9 @@ function formatDate(value: string | null | undefined): string {
 export default function RealtimePage() {
   const [status, setStatus] = useState<RealtimeStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Own error for the door history: the 10 s status poll clears `error` on success, which used to
+  // wipe a failed history load before anyone could read it.
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const [history, setHistory] = useState<ReaderDoorEvent[]>([]);
   const [nextBefore, setNextBefore] = useState<number | null>(null);
   const [loadingHistory, setLoadingHistory] = useState(false);
@@ -52,7 +55,8 @@ export default function RealtimePage() {
       const page = await realtime.readerHistory(before ?? null, 50);
       setHistory((h) => (before ? [...h, ...page.items] : page.items));
       setNextBefore(page.nextBeforeId);
-    } catch (e) { setError(String(e)); }
+      setHistoryError(null);
+    } catch (e) { setHistoryError(String(e)); }
     finally { setLoadingHistory(false); }
   }, []);
 
@@ -144,6 +148,7 @@ export default function RealtimePage() {
       {(isReader || status.readerOf.length > 0) && (
         <Panel>
           <PanelHeader title="Historique des portes" sub="Depuis le serveur · tourniquets des PC pilotes suivis" />
+          {historyError && <Note tone="error" className="mx-[18px] mt-3">Historique non chargé : {historyError}</Note>}
           <FlexTable
             label="Historique des portes"
             columns={[
@@ -188,9 +193,8 @@ export default function RealtimePage() {
         </Panel>
       )}
 
-      {(status.lastError || error) && (
-        <Note tone="warning">{status.lastError || error}</Note>
-      )}
+      {status.lastError && <Note tone="warning">{status.lastError}</Note>}
+      {error && <Note tone="warning">Statut non actualisé : {error}</Note>}
     </div>
   );
 }
