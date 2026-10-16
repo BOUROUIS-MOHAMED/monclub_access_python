@@ -5066,8 +5066,9 @@ def _handle_device_users_push(ctx: _Ctx) -> None:
         ctx.send_json(500, {"ok": False, "error": f"the push could not be recorded first: {e}"})
         return
 
-    # Everything that reads the database or the request is prepared here, on the request
-    # thread; only the device writes run in _push (on the worker thread under ULTRA).
+    # The request and the device/profile/scheme reads are prepared here, on the request
+    # thread. _push (on the worker thread under ULTRA) runs the device writes, and
+    # _push_templates' own firmware-profile / finger-status records, as in the worker's syncs.
     #
     # Templates -- DELEGATED to the same DeviceSyncEngine._push_templates the
     # full and ULTRA sync paths use.

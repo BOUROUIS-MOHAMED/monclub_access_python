@@ -1043,7 +1043,10 @@ All of these go through `_run_on_device_sdk`, which keeps its statuses: 503 when
 sent (`timeout`, `device not connected`, `expired (not executed)`, `device unreachable`), 500
 otherwise. A budget is how long the caller waits for the worker to take the call, then as long
 again for its answer (§3.1a). Without a worker — DEVICE mode, an unmanaged device, the engine
-not running — every route keeps its one-shot session. One difference there: a failed connect now
+not running — every route keeps its one-shot session. A turnstile another PC drives has no worker
+here either, but these routes never reach it: `LEASE_GATED_HANDLERS` answers 409 `notDriver`
+first, from the same `lease_gate` test that keeps it out of `UltraEngine`'s workers.
+`[CODE: access/local_api_routes.py::gated_handler; lease_gate.py::device_allowed, ::filter_devices]` One difference there: a failed connect now
 answers 503, where these handlers answered 500. The response bodies are unchanged.
 
 **Which handle.** For a PullSDK panel the worker's driver is a `PullSDKDevice`
@@ -1087,12 +1090,14 @@ are affected is `[UNVERIFIED]` (pullsdk_guide, Contenu counts).
 
 The reset runs on the request thread before the call is queued. If the worker then skips the
 call (503), the result stays "unknown", which is the safe state. If the reset fails, the answer
-is 500 and nothing is queued or connected (before, a session was already open). The database
-reads (device payload, firmware profile, pin scheme) and the template normalisation also stay on
-the request thread. Only the device writes run on the worker: the user row, `userauthorize`, the
-optional pre-delete and `_push_templates`, in the same order as before. `_push_templates` has no
-door yield (`_maybe_yield_doors` runs only in the batch paths), so doors and rtlog wait for the
-whole push. `/users/delete` runs its four `DeleteDeviceData` calls the same way. `[CODE]`
+is 500 and nothing is queued or connected (before, a session was already open). The reads of
+the device payload, firmware profile and pin scheme, and the template normalisation, stay on the
+request thread. The device writes run on the worker: the user row, `userauthorize`, the optional
+pre-delete and `_push_templates`, in the same order as before. `_push_templates` also writes the
+database on that thread (`save_firmware_profile`, `reset_firmware_template_combo`,
+`clear_firmware_profile`, `_record_finger_push_status`), as it does inside the worker's own
+syncs. It has no door yield (`_maybe_yield_doors` runs only in the batch paths), so doors and
+rtlog wait for the whole push. `/users/delete` runs its four `DeleteDeviceData` calls the same way. `[CODE]`
 
 `sent, no answer` means the worker had started the write when both waits ran out. It answers
 **500 with `outcome: "unknown"`** and `detail: "sent, no answer"`, plus a French `error`: the
@@ -1109,7 +1114,8 @@ Before, it answered 200, and the page toasted « Appareil N déconnecté » whil
 held the turnstile.
 
 On DevicesPage, the row's connect toggle shows on a worker-held device only while a manual
-session is open (`connectedIds`). The row tooltip says the service holds the connection. A 409
+session is open (`manualOpen`: one this page opened, `connectedIds`, or the one the
+server reports, `status.pullsdk`). The row tooltip says the service holds the connection. A 409
 reaches the toast as « Connexion échouée: ApiError: La connexion à ce tourniquet… ».
 `[CODE: DevicesPage.tsx]`
 
@@ -1128,11 +1134,22 @@ opening, as card U built it. The erase-hold, wizard-open and user-push blocks st
 - The direct-connect fallback in `_handle_device_door_open`. It is reached only when there is no
   worker for the device, or after a failed AGENT open (§3.1a).
 - `card_scanner.py`: `ZkemkeeperScanner.connect` to the configured scanner IP (`/scanner/*`,
-  `/scan/*`). `_handle_scan_quick` has no turnstile-IP check. Only the remote `CARD_SCAN`
-  command (`v2/handlers.py`, `SCANNER_IS_A_TURNSTILE`) refuses an IP that belongs to a
-  turnstile.
+  `/scan/*`). The local routes (`local_api_routes.py::scanner_gated_handler`) and the remote
+  `CARD_SCAN` command (`v2/handlers.py`, `SCANNER_IS_A_TURNSTILE`) refuse only the IP of a
+  turnstile ANOTHER PC drives (`device_ips.py::ip_is_undriven_turnstile`). A scanner set on the
+  IP of a turnstile this PC's worker holds is not refused.
+- `UltraEngine.start` marks the engine running before its workers exist, and `stop` clears
+  `_workers` even for a worker that "did not stop in time". In those windows `_run_on_device_sdk`
+  sees no worker and opens a one-shot session.
 - `device_attendance.py` (`get_driver`, its own connection) runs only for
   `access_data_mode == "DEVICE"` devices. `realtime_agent.py` is AGENT mode's own driver.
+
+**Found while moving `/users/push`, not changed (owner decision)** `[CODE]`: the push writes
+`userauthorize`, THEN runs the firmware-profile pre-delete
+(`device_sync.py::_delete_auth_and_templates_best_effort`), which deletes that pin's
+`userauthorize`. On a panel whose profile is `delete_then_insert` or `one_by_one` the door
+rights just written are removed, yet the answer says `authResult: "OK"`. Same order on 941fffa
+and in 1.4.35.
 
 ### 3.2 The roster rule — the most operationally important fact in this file
 

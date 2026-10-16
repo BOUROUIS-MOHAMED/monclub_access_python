@@ -685,6 +685,8 @@ export default function DevicesPage() {
               const faulty = state === "noaddress" || state === "inactive";
               // « Non connecté » is a fault only where this PC runs a worker for the device.
               const hasWorker = status?.ultra?.devices?.[String(did)] != null;
+              // A manual PullSDK session this page opened, or the one the server reports open.
+              const manualOpen = connectedIds.has(did) || (!!status?.pullsdk?.connected && status.pullsdk.deviceId === did);
               const tone: Tone = state === "idle" && !hasWorker ? "grey" : STATE_TONE[state];
               const sub = [PROTOCOL_LABEL[protocol], d.model, d.zone].filter(Boolean).join(" · ");
               return (
@@ -766,7 +768,7 @@ export default function DevicesPage() {
                         turnstile, so the server refuses a manual session (409
                         HELD_BY_ULTRA_WORKER) -- offered only to close one already open. */}
                     {!faulty && protocol === "ZK_PULLSDK"
-                      && !(hasWorker && !connectedIds.has(did)) && (
+                      && !(hasWorker && !manualOpen) && (
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <ActionButton
