@@ -492,6 +492,8 @@ export interface MemberCardResponse {
   held: boolean;
   fingerprintCount: number;
   fingerprints: MemberCardFingerprint[];
+  /** QR (TOTP) credentials granting this membership — state only, never the secret. */
+  qrCredentials: { enabled: boolean; rotatedAt: string | null; updatedAt: string | null }[];
 }
 
 // ─── E) Local fingerprints (GET /api/v2/fingerprints) ───

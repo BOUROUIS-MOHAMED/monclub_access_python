@@ -5,6 +5,8 @@ GET /api/v2/members/{activeMembershipId}/card reads ONE membership when the card
 * 7a -- the fingerprint count, from that one row's ``fingerprints_json``. The roster itself
   stays template-free (tests/test_local_state_template_free.py); the card never returns a
   template.
+* 7b -- the QR (TOTP) credentials whose granted ids contain the membership: state only, the
+  secret never leaves the database.
 
 Every test patches ``app.core.db._DB_PATH`` to a temp file.
 """
@@ -154,6 +156,61 @@ class TestFingerprintCount:
         monkeypatch.setattr(db, "list_sync_users_page", _recording)
         db.list_members_roster()
         assert seen.get("include_templates") is False
+
+
+# --------------------------------------------------------------------------- 7b
+
+_SECRET = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+
+
+def _cred(db, *, account_id, granted, enabled=1, secret=_SECRET):
+    with db.get_conn() as conn:
+        conn.execute(
+            "INSERT INTO sync_gym_access_credentials (id, gym_id, account_id, secret_hex, enabled, "
+            "rotated_at, created_at, updated_at, granted_active_membership_ids_json) "
+            "VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)",
+            (account_id, account_id, secret, enabled, "2026-09-01T10:00:00", "2026-01-01T00:00:00",
+             "2026-09-01T10:00:00", json.dumps(granted)),
+        )
+        conn.commit()
+
+
+class TestQrCredential:
+    def test_a_granting_credential_is_reported_without_its_secret(self, db):
+        db.upsert_delta_users([_user(12, 100, card="1012")])
+        _cred(db, account_id=900, granted=[12, 40])
+
+        d = db.get_member_card_details(12)
+
+        assert d["qrCredentials"] == [
+            {"enabled": True, "rotatedAt": "2026-09-01T10:00:00", "updatedAt": "2026-09-01T10:00:00"},
+        ]
+        assert _SECRET not in json.dumps(d)
+        assert "secret" not in json.dumps(d).lower()
+
+    def test_ids_are_compared_parsed_not_as_text(self, db):
+        """12 must not match a credential granting 123 (a LIKE on the JSON text would)."""
+        db.upsert_delta_users([_user(12, 100, card="1012")])
+        _cred(db, account_id=901, granted=[123, 112])
+
+        assert db.get_member_card_details(12)["qrCredentials"] == []
+
+    def test_a_disabled_credential_is_reported_disabled(self, db):
+        db.upsert_delta_users([_user(12, 100, card="1012")])
+        _cred(db, account_id=902, granted=[12], enabled=0)
+
+        assert [c["enabled"] for c in db.get_member_card_details(12)["qrCredentials"]] == [False]
+
+    def test_the_endpoint_never_carries_the_secret(self, db):
+        from app.api.local_access_api_v2 import _handle_member_card
+
+        db.upsert_delta_users([_user(12, 100, card="1012")])
+        _cred(db, account_id=903, granted=[12])
+
+        ctx = _Ctx(params={"activeMembershipId": "12"})
+        _handle_member_card(ctx)
+        assert ctx.sent[0] == 200
+        assert _SECRET not in json.dumps(ctx.sent[1])
 
 
 class TestCardEndpoint:

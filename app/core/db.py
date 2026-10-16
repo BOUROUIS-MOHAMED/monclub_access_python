@@ -8207,6 +8207,9 @@ def get_member_card_details(active_membership_id: int) -> Dict[str, Any] | None:
 
     * ``fingerprints`` -- the prints of the local copy of the server's member row: finger id,
       label, enabled. Never the template itself. ``fingerprintCount`` = number of entries.
+    * ``qrCredentials`` -- the rows of sync_gym_access_credentials (today's list, as the server
+      sent it) whose granted ids contain this membership: enabled flag and rotation date only.
+      ``secret_hex`` is never selected.
     """
     try:
         amid = int(active_membership_id)
@@ -8216,8 +8219,24 @@ def get_member_card_details(active_membership_id: int) -> Dict[str, Any] | None:
         return None
     with get_conn() as conn:
         row, hold = _member_row_for_card(conn, amid)
-    if row is None:
-        return None
+        if row is None:
+            return None
+        cred_rows = [dict(r) for r in conn.execute(
+            "SELECT enabled, rotated_at, updated_at, granted_active_membership_ids_json "
+            "FROM sync_gym_access_credentials"
+        ).fetchall()]
+
+    qr: List[Dict[str, Any]] = []
+    for c in cred_rows:
+        granted = _expand_gym_access_credential_json_fields(c).get("granted_active_membership_ids") or []
+        # Parsed ids, never a substring match on the JSON text (12 would match 123).
+        if amid not in {i for i in (_to_int_or_none(g) for g in granted) if i is not None}:
+            continue
+        qr.append({
+            "enabled": bool(_to_int_or_none(c.get("enabled")) or 0),
+            "rotatedAt": c.get("rotated_at"),
+            "updatedAt": c.get("updated_at"),
+        })
 
     fps: List[Dict[str, Any]] = []
     try:
@@ -8239,6 +8258,7 @@ def get_member_card_details(active_membership_id: int) -> Dict[str, Any] | None:
         "held": hold is not None,
         "fingerprintCount": len(fps),
         "fingerprints": fps,
+        "qrCredentials": qr,
     }
 
 

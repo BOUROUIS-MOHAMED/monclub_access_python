@@ -43,6 +43,7 @@ import {
   ImagePlus,
   Loader2,
   Pencil,
+  QrCode,
   RefreshCw,
   Repeat,
   ScanLine,
@@ -1266,6 +1267,13 @@ export default function UsersPage() {
             if (d.fingerprintCount === 0) return { v: "aucune", muted: true };
             const ids = d.fingerprints.map((f) => (f.fingerId != null ? `#${f.fingerId}${f.enabled ? "" : " (désactivée)"}` : "?"));
             return { v: `${d.fingerprintCount} · ${ids.join(", ")}`, title: "Copie locale du serveur" };
+          })}
+          {cardDetailLine(QrCode, "QR code (application)", m, (d) => {
+            const on = d.qrCredentials.filter((c) => c.enabled);
+            const why = "Accordé à cet abonnement par le serveur (copie locale). Le contrôle QR peut encore refuser un passage (jours d'accès, liste des membres).";
+            if (on.length > 0) return { v: "activé sur le compte", tone: "success", title: why };
+            if (d.qrCredentials.length > 0) return { v: "désactivé", muted: true, title: why };
+            return { v: "aucun", muted: true };
           })}
         </div>
         <div className="flex flex-wrap gap-2 px-[18px] pb-4 pt-3">

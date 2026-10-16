@@ -4809,6 +4809,14 @@ the membership in `sync_users` nor `sync_users_held`. `[CODE]`
   `list_sync_users_page`). The count is the local copy of the server's member row, like Enrôlement's
   « Déjà enregistrées ». `[TEST: tests/test_member_card_details.py::TestFingerprintCount,
   ::TestCardEndpoint]`
+- **QR (« QR code (application) »).** The rows of `sync_gym_access_credentials` — today's list as
+  the server sent it — whose `granted_active_membership_ids_json`, parsed as JSON (never a text
+  match: 12 must not match 123), contains the membership. The answer carries `enabled`,
+  `rotatedAt`, `updatedAt`; `secret_hex` is not even selected. `sync_users.qr_code_payload` is not
+  used: nothing fills it (the backend sends no such field). The card says « activé sur le compte »,
+  not "valid": the QR check (§3.1b roster check, allowed days) can still refuse a scan, and the
+  upcoming credentials of §3.8 (a renewal starting today) are not read here. `[TEST:
+  tests/test_member_card_details.py::TestQrCredential]`
 
 ---
 
