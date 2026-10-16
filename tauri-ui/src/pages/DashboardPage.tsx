@@ -1,84 +1,46 @@
-// Dashboard — "Fil + rail double", from the Claude Design Access v3 refonte
-// (`Access v3 - Partie 1 Pilotage.dc.html`, screen 01).
+// Dashboard — Access v5 redesign (docs/access-redesign-v5: the `tp === 'home'`
+// branch and the `reset` modal of main.logic.js; boards S01, S02, S03).
 //
-// The grammar the whole refonte inherits: one subject at full height on the
-// left (here the day's timeline of entries), and a 330px rail on the right cut
-// in two — "Maintenant" (what needs an action now) on top, "Aujourd'hui" (the
-// summary, machine included) below, with action tiles at the foot of the rail.
+// 12-column grid: "Maintenant" (who just came in + the two live status lines)
+// and "Aujourd'hui" (day totals + 24 h curve) on top; "Passages" (the 40 latest
+// rows) and "État du poste" (machine, session, update, entry screen, full
+// reset) below.
 //
-// Where the data comes from:
-//   · the timeline and the day's totals/curve → GET /api/v2/dashboard/overview,
-//     which resolves access_history rows to members (that table stores only a
-//     card number, so unresolved rows fall back to "Carte ####" by design);
-//   · the sync/agent/reader/session/update lines → the existing /status poll;
-//   · the popup tile → usePopupStream, unchanged.
+// Where the data comes from (unchanged):
+//   · feed + day totals/curve → GET /api/v2/dashboard/overview, polled every 5 s
+//     (access_history stores only a card number, so unresolved rows fall back to
+//     "Carte ####" / "PIN #### — membre inconnu" by design);
+//   · sync / agent / reader / session / update → the existing /status poll;
+//   · entry screen → usePopupStream, unchanged.
+// Refusal texts use the entry screen's French copy (lib/denyCopy.ts); an ULTRA
+// device refusal (`DEVICE_DENIED`, no "why") reads "Accès refusé".
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useApp } from "@/context/AppContext";
 import { usePopupStream } from "@/api/hooks";
 import { get, post } from "@/api/client";
 import { usePageChrome } from "@/context/PageChromeContext";
-import { Button } from "@/components/ui/button";
 import ScanCardModal from "@/components/ScanCardModal";
-import { LiveDot } from "@/layouts/MainLayout";
+import { ActionButton } from "@/components/ui/action-button";
+import { Avatar, Chip } from "@/components/ui/chip";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { FlexCell, FlexRow, FlexTable, IconCell, PersonCell } from "@/components/ui/flex-table";
+import { ListRow, Note, PageGrid, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
+import { INK, initialsOf, type Tone } from "@/components/ui/tone";
 import { hasAgentDevices } from "@/lib/agentMode";
+import { denyShort } from "@/lib/denyCopy";
 import { cn } from "@/lib/utils";
 import type { DashboardFeedItem, DashboardOverview, DashboardToday } from "@/api/types";
 import {
-  RefreshCw, RotateCcw, Users, Monitor, Bug, Upload, CreditCard, Fingerprint,
-  QrCode, Play, Square, WifiOff, History, Clock, DownloadCloud, AlertTriangle,
+  RefreshCw, RotateCcw, Users, MonitorPlay, Play, Upload, CreditCard, Fingerprint,
+  QrCode, WifiOff, Clock, Download, AlertTriangle, CircleCheck, Router, Bot,
+  ScanLine, ExternalLink, type LucideIcon,
 } from "lucide-react";
 
 const OVERVIEW_POLL_MS = 5000;
 
-// ── small design primitives ───────────────────────────────────────────────
-/** Section marker above a column ("Passages", "Maintenant", "Aujourd'hui"). */
-function ZoneTitle({ children }: { children: React.ReactNode }) {
-  return <div className="flex flex-none items-center gap-[9px]">{children}</div>;
-}
-
-/** Uppercase micro-label used on card headers. */
-function Lb({ children, className }: { children: React.ReactNode; className?: string }) {
-  return (
-    <span className={cn("text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground", className)}>
-      {children}
-    </span>
-  );
-}
-
-function Card({ children, className }: { children: React.ReactNode; className?: string }) {
-  return <div className={cn("rounded-3xl bg-card shadow-[0_8px_20px_rgba(0,0,0,0.08)]", className)}>{children}</div>;
-}
-
-function Tile({ children, className }: { children: React.ReactNode; className?: string }) {
-  return <div className={cn("rounded-[18px] bg-card shadow-[0_8px_20px_rgba(0,0,0,0.08)]", className)}>{children}</div>;
-}
-
-function Chip({ tone, children }: { tone: "ok" | "no" | "wn" | "flat"; children: React.ReactNode }) {
-  const tones = {
-    ok: "bg-emerald-500/[0.055] text-emerald-700 dark:text-emerald-400",
-    no: "bg-primary/[0.09] text-primary",
-    wn: "bg-amber-500/[0.14] text-amber-700 dark:text-amber-400",
-    flat: "bg-muted text-muted-foreground",
-  } as const;
-  return (
-    <span className={cn("inline-flex h-[22px] shrink-0 items-center whitespace-nowrap rounded-lg px-2 text-[11px] font-bold", tones[tone])}>
-      {children}
-    </span>
-  );
-}
-
-function Sep({ className }: { className?: string }) {
-  return <div className={cn("h-px bg-border", className)} />;
-}
-
-function initialsOf(name: string): string {
-  const p = name.trim().split(/\s+/).filter(Boolean);
-  if (!p.length) return "—";
-  return ((p[0][0] || "") + (p.length > 1 ? p[p.length - 1][0] : "")).toUpperCase();
-}
-
-function methodIcon(method: string) {
+function methodIcon(method: string): LucideIcon {
   const m = (method || "").toUpperCase();
   if (m.includes("QR") || m.includes("TOTP")) return QrCode;
   if (m.includes("FINGER") || m.includes("FP") || m.includes("BIO")) return Fingerprint;
@@ -104,6 +66,20 @@ function clockOf(d: Date): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
+const MONTHS_FR = [
+  "janv.", "févr.", "mars", "avr.", "mai", "juin",
+  "juil.", "août", "sept.", "oct.", "nov.", "déc.",
+];
+
+/** "18:40" today, "12 oct. · 18:40" another day, "" when unknown. */
+function whenLabel(iso: string | null | undefined, now: Date): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const sameDay = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  return sameDay ? clockOf(d) : `${d.getDate()} ${MONTHS_FR[d.getMonth()]} · ${clockOf(d)}`;
+}
+
 /** "ZKPIN:<pin>" is NOT a card.
  *
  * A standalone terminal (MB2000) reports a fingerprint punch with no card number
@@ -126,20 +102,45 @@ function rowTitle(it: DashboardFeedItem): string {
     : `Carte ${it.cardNo}`;
 }
 
-/** Secondary label — plan and credential, mirroring "Annuel salle · carte 0042 8871". */
+/** "carte 0042 8871" for a resolved member, just the method otherwise. */
+function credentialBit(it: DashboardFeedItem): string {
+  if (it.userFullName.trim() && it.cardNo) {
+    return `${methodLabel(it.method)} ${isDevicePin(it.cardNo) ? it.cardNo.slice(ZKPIN_PREFIX.length) : it.cardNo}`;
+  }
+  return methodLabel(it.method);
+}
+
+/** Secondary label — plan and credential, mirroring "Annuel standard · empreinte · Tourniquet principal". */
 function rowDetail(it: DashboardFeedItem): string {
   const bits: string[] = [];
   if (it.membershipTitle.trim()) bits.push(it.membershipTitle);
-  if (it.userFullName.trim() && it.cardNo) bits.push(`${methodLabel(it.method)} ${isDevicePin(it.cardNo) ? it.cardNo.slice(ZKPIN_PREFIX.length) : it.cardNo}`);
-  else bits.push(methodLabel(it.method));
+  bits.push(credentialBit(it));
   if (it.deviceName) bits.push(it.deviceName);
   return bits.join(" · ");
+}
+
+/** Refused row — the short French reason first ("Carte non reconnue · carte · Tourniquet principal"). */
+function refusedDetail(it: DashboardFeedItem): string {
+  const bits: string[] = [denyShort(it.reason), credentialBit(it)];
+  if (it.deviceName) bits.push(it.deviceName);
+  return bits.join(" · ");
+}
+
+interface HeroLine {
+  key: string;
+  icon: LucideIcon;
+  tone: Tone;
+  title: string;
+  sub?: string;
+  action?: { label: string; kind: "danger" | "outline"; run: () => void | Promise<unknown> };
 }
 
 export default function DashboardPage() {
   const { status, syncNow, hardSyncNow } = useApp();
   const { openPopupWindow, sendTestNotification } = usePopupStream();
+  const navigate = useNavigate();
   const [scanOpen, setScanOpen] = useState(false);
+  const [resetOpen, setResetOpen] = useState(false);
   const [overview, setOverview] = useState<DashboardOverview | null>(null);
   const [now, setNow] = useState<Date>(() => new Date());
 
@@ -183,26 +184,15 @@ export default function DashboardPage() {
 
   // Publish the header's subtitle + actions into the shell.
   usePageChrome(() => ({
-    fill: true,
     subtitle: `${headDevice ? `${headDevice} · ` : ""}${clockOf(now)}`,
     actions: (
       <>
-        <Button
-          variant="outline"
-          className="h-[34px] gap-[7px] rounded-[14px] border-[1.5px] border-primary/45 bg-card px-[14px] text-[12.5px] font-semibold text-primary hover:bg-primary/5"
-          onClick={() => setScanOpen(true)}
-        >
-          <CreditCard className="h-4 w-4" />
+        <ActionButton kind="outline" icon={ScanLine} onClick={() => setScanOpen(true)}>
           Scanner une carte
-        </Button>
-        <Button
-          className="h-[34px] gap-[7px] rounded-full px-[18px] text-[12.5px] font-bold shadow-[0_8px_20px_rgba(226,32,63,0.22)]"
-          onClick={handleSync}
-          disabled={syncRunning}
-        >
-          <RefreshCw className={cn("h-4 w-4", syncRunning && "animate-spin")} />
+        </ActionButton>
+        <ActionButton kind="primary" icon={RefreshCw} spin={syncRunning} onClick={handleSync} disabled={syncRunning}>
           {syncRunning ? "En cours…" : "Synchroniser"}
-        </Button>
+        </ActionButton>
       </>
     ),
   }), [headDevice, now.getMinutes(), syncRunning, handleSync]);
@@ -218,6 +208,7 @@ export default function DashboardPage() {
   const dspActive = !!dsp?.running;
   const dspPct = dspActive && dsp!.total > 0 ? Math.round((dsp!.current / dsp!.total) * 100) : 0;
   const devicesTotal = mode.DEVICE + mode.AGENT + (mode.ULTRA ?? 0) + mode.UNKNOWN;
+  const devicesDeclared = `${devicesTotal} appareil${devicesTotal > 1 ? "s" : ""} déclaré${devicesTotal > 1 ? "s" : ""}`;
 
   // "Lecteur" = is ANY reader actually attached right now?
   //
@@ -230,6 +221,7 @@ export default function DashboardPage() {
   // reports actual state, it does not assume success.
   const ultraDevices = Object.values(status.ultra?.devices ?? {});
   const ultraConnected = ultraDevices.filter((d) => d?.connected);
+  const ultraOff = ultraDevices.filter((d) => !d?.connected);
   const readerConnected = status.pullsdk.connected || ultraConnected.length > 0;
   // A READER PC never connects to a turnstile, so "not connected" is its normal state.
   const expectsReader = mode.DEVICE > 0 || mode.AGENT > 0 || (status.ultra?.drivesTurnstiles ?? true);
@@ -238,333 +230,262 @@ export default function DashboardPage() {
     ?? (ultraConnected.length === 1 ? ultraConnected[0].device_name : null)
     ?? (ultraConnected.length > 1 ? `${ultraConnected.length} appareils` : null)
     ?? (readerConnected ? "connecté" : "hors ligne");
+  const offNames = ultraOff.map((d) => d.device_name).filter(Boolean).join(", ");
 
-  // The design's third "Maintenant" line is an alert. Only real, currently
-  // observable faults are surfaced — /status carries no per-device reachability,
-  // so "device offline" is deliberately not synthesised here.
-  const alert =
-    showAgent && !agent.running ? { icon: Square, text: "Agent temps réel arrêté", action: "Démarrer", run: () => post("/agent/start") }
-    : expectsReader && !readerConnected ? { icon: WifiOff, text: "Lecteur non connecté", action: "Recharger", run: () => window.location.reload() }
-    : !sync.lastOk ? { icon: AlertTriangle, text: "Dernière synchronisation en échec", action: "Relancer", run: handleSync }
-    : null;
+  // ── "Maintenant" lines: the sync line, then the machine line. Only real,
+  // currently observable faults are surfaced.
+  const lastSyncWhen = whenLabel(sync.lastSyncAt, now);
+  const syncLine: HeroLine = dspActive
+    ? { key: "sync", icon: Upload, tone: "primary", title: "Envoi des membres", sub: dsp!.total > 0 ? `${dspPct} %` : "Connexion à l'appareil…" }
+    : sync.lastOk
+      ? { key: "sync", icon: RefreshCw, tone: "success", title: "Synchronisation à jour", sub: lastSyncWhen ? `dernière ${lastSyncWhen}` : undefined }
+      : { key: "sync", icon: AlertTriangle, tone: "warning", title: "Dernière synchronisation en échec", sub: lastSyncWhen || undefined, action: { label: "Relancer", kind: "outline", run: handleSync } };
 
-  const maxBar = Math.max(1, ...today.hourly);
+  const machineLine: HeroLine =
+    showAgent && !agent.running
+      ? { key: "machine", icon: Bot, tone: "error", title: "Agent temps réel arrêté", action: { label: "Démarrer", kind: "danger", run: () => post("/agent/start") } }
+      : expectsReader && !readerConnected
+        ? { key: "machine", icon: WifiOff, tone: "error", title: "Lecteur non connecté", sub: offNames || undefined, action: { label: "Recharger", kind: "danger", run: () => window.location.reload() } }
+        : expectsReader && ultraOff.length > 0
+          ? { key: "machine", icon: WifiOff, tone: "error", title: ultraOff.length > 1 ? `${ultraOff.length} lecteurs non connectés` : "Lecteur non connecté", sub: offNames || undefined }
+          : { key: "machine", icon: CircleCheck, tone: "success", title: "Tout fonctionne", sub: expectsReader && ultraDevices.length > 0 ? `${ultraConnected.length} / ${ultraDevices.length} lecteurs connectés` : undefined };
+
+  // ── "État du poste" › Lecteurs
+  const readerTone: Tone = !expectsReader ? "grey" : (ultraOff.length > 0 || !readerConnected) ? "error" : "success";
+  const readerValue = ultraDevices.length > 0 ? `${ultraConnected.length} / ${ultraDevices.length}` : readerLabel;
+  const readerSub = expectsReader && ultraOff.length > 0 && offNames
+    ? `${offNames} non connecté${ultraOff.length > 1 ? "s" : ""}`
+    : devicesDeclared;
+
+  const updates = status.updates;
+  const updateSub = updates.updateAvailable
+    ? `${updates.latestVersion ?? ""} ${updates.downloaded ? "prête · à installer à la fermeture" : "disponible"}`.trim()
+    : "à jour";
+
+  const hourly = today.hourly.length === 24 ? today.hourly : new Array<number>(24).fill(0);
+  const maxBar = Math.max(1, ...hourly);
 
   return (
-    <div className="flex h-full min-h-0 gap-4">
-      {/* ── Le sujet : le fil de la journée ─────────────────────────────── */}
-      <div className="flex min-w-0 flex-1 flex-col gap-[11px]">
-        <ZoneTitle>
-          <Users className="h-[17px] w-[17px] text-primary" />
-          <span className="font-display text-[13px] font-extrabold tracking-[-0.01em] text-foreground">Passages</span>
-          <span className="ml-1 text-[12px] text-muted-foreground">
-            {today.total} aujourd'hui{today.denied > 0 ? ` · ${today.denied} refusé${today.denied > 1 ? "s" : ""}` : ""}
-          </span>
-        </ZoneTitle>
-
-        <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          <div className="flex flex-none items-center justify-between gap-3.5 border-b border-border px-6 pb-3 pt-3.5">
-            <Lb>Fil de la journée</Lb>
-            <div className="flex items-center gap-2.5">
-              <span className="inline-flex items-center gap-[5px] text-[11px] text-muted-foreground">
-                <span className="h-[7px] w-[7px] rounded-full bg-emerald-500" />passages
-              </span>
-              <span className="inline-flex items-center gap-[5px] text-[11px] text-muted-foreground">
-                <span className="h-[7px] w-[7px] rounded-sm bg-muted-foreground" />système
-              </span>
-            </div>
-          </div>
-
-          <div className="relative min-h-0 flex-1 overflow-y-auto px-6 pt-2.5">
-            {/* the rule the timeline hangs from */}
-            <div className="pointer-events-none absolute bottom-2 left-[60px] top-3 w-px bg-border" />
-
-            {/* Live system row — real, from /status */}
-            {dspActive && (
-              <div className="relative flex items-center gap-3.5 py-[7px]">
-                <span className="w-9 shrink-0 font-mono text-[12px] text-muted-foreground">{clockOf(now)}</span>
-                <span className="h-[11px] w-[11px] shrink-0 animate-pulse rounded-[3px] bg-primary shadow-[0_0_0_3px_hsl(var(--card))]" />
-                <span className="flex w-8 shrink-0 justify-center"><Upload className="h-[18px] w-[18px] text-primary" /></span>
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-[13.5px] text-foreground">
-                    Envoi des membres vers l'appareil{dsp!.deviceName ? ` « ${dsp!.deviceName} »` : ""}
-                  </div>
-                  <div className="truncate text-[11px] text-muted-foreground">
-                    {dsp!.total > 0 ? `${dsp!.current} / ${dsp!.total} — ne fermez pas l'application` : "Connexion à l'appareil…"}
-                  </div>
-                </div>
-                {dsp!.total > 0 && <Chip tone="no">{dspPct} %</Chip>}
-              </div>
-            )}
-
-            {feed.length === 0 && !dspActive && (
-              <div className="flex h-full min-h-[220px] flex-col items-center justify-center gap-2 text-center">
-                <History className="h-7 w-7 text-muted-foreground/50" />
-                <p className="text-[13px] font-semibold text-foreground">Aucun passage enregistré</p>
-                <p className="max-w-[320px] text-[11.5px] text-muted-foreground">
-                  Le fil se remplit dès qu'un membre se présente à un lecteur.
-                </p>
-              </div>
-            )}
-
-            {feed.map((it) => {
-              const MIcon = methodIcon(it.method);
-              const resolved = !!it.userFullName.trim();
-              return (
-                <div key={it.eventId || `${it.at}-${it.cardNo}`} className="relative flex items-center gap-3.5 py-[7px]">
-                  <span className="w-9 shrink-0 font-mono text-[12px] text-muted-foreground">{hhmm(it.at)}</span>
-                  <span
-                    className={cn(
-                      "h-[11px] w-[11px] shrink-0 rounded-full shadow-[0_0_0_3px_hsl(var(--card))]",
-                      it.allowed ? "bg-emerald-500" : "bg-primary",
-                    )}
-                  />
-                  <span
-                    className={cn(
-                      "flex h-8 w-8 shrink-0 items-center justify-center rounded-[18px] text-[12px] font-bold",
-                      resolved
-                        ? it.allowed ? "bg-muted text-muted-foreground" : "bg-primary/[0.09] text-primary"
-                        : "bg-muted text-muted-foreground",
-                    )}
-                  >
-                    {resolved ? initialsOf(it.userFullName) : <MIcon className="h-[18px] w-[18px]" />}
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-[13.5px] font-semibold text-foreground">{rowTitle(it)}</div>
-                    <div className={cn("truncate text-[11px]", it.allowed ? "text-muted-foreground" : "text-primary")}>
-                      {it.allowed ? rowDetail(it) : (it.reason || "Accès refusé")}
-                    </div>
-                  </div>
-                  <Chip tone={it.allowed ? "ok" : "no"}>{it.allowed ? "Autorisé" : "Refusé"}</Chip>
-                </div>
-              );
-            })}
-          </div>
-        </Card>
-      </div>
-
-      {/* ── Le rail ─────────────────────────────────────────────────────── */}
-      <div className="flex w-[330px] flex-none flex-col gap-[11px]">
-        {/* Maintenant */}
-        <ZoneTitle>
-          <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-primary/[0.08] px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em] text-primary">
-            <LiveDot className="h-[6px] w-[6px]" />
-            Maintenant
-          </span>
-        </ZoneTitle>
-
-        <Card className="flex-none px-[22px] py-[18px]">
+    <PageGrid>
+      {/* ── Maintenant ─────────────────────────────────────────────────── */}
+      <Panel className="col-span-8" aria-label="Maintenant">
+        <PanelHeader title="Maintenant" />
+        <div className="mt-3">
           {lastEntry ? (
-            <div className="mb-[15px] flex items-center gap-3.5">
-              <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-3xl bg-emerald-500/[0.055] text-[17px] font-bold text-emerald-700 dark:text-emerald-400">
-                {initialsOf(lastEntry.userFullName)}
-              </span>
+            <div className="flex items-center gap-[18px] bg-[linear-gradient(135deg,hsl(var(--success)/0.10),hsl(var(--success)/0.02))] px-5 pb-[18px] pt-5">
+              <Avatar
+                initials={initialsOf(lastEntry.userFullName)}
+                tone="success"
+                size={76}
+                className="shadow-[0_0_0_4px_hsl(var(--card)),0_0_0_6px_hsl(var(--success))]"
+              />
               <div className="min-w-0 flex-1">
-                <Lb className="mb-1 block text-emerald-700 dark:text-emerald-400">
-                  Vient d'entrer · {hhmm(lastEntry.at)}
-                </Lb>
-                <div className="truncate font-display text-[17px] font-extrabold leading-[1.15] tracking-[-0.02em] text-foreground">
+                <div className="text-[13px] font-bold text-success-ink">Vient d'entrer · {hhmm(lastEntry.at)}</div>
+                <div className="truncate font-num text-[30px] font-extrabold leading-[1.15] text-foreground">
                   {lastEntry.userFullName}
                 </div>
+                <div className="mt-1 truncate text-[13.5px] text-muted-foreground">{rowDetail(lastEntry)}</div>
               </div>
+              <span className="inline-flex h-10 shrink-0 items-center gap-2 rounded-[10px] bg-success px-4 text-[15px] font-extrabold text-white">
+                <CircleCheck className="h-5 w-5" strokeWidth={2.2} />Autorisé
+              </span>
             </div>
           ) : (
-            <div className="mb-[15px] flex items-center gap-3.5">
-              <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-3xl bg-muted text-muted-foreground">
-                <Users className="h-5 w-5" />
+            <div className="flex items-center gap-[18px] px-5 pb-[18px] pt-5">
+              <span className="grid h-[76px] w-[76px] shrink-0 place-items-center rounded-full bg-muted text-muted-foreground">
+                <Users className="h-7 w-7" />
               </span>
               <div className="min-w-0 flex-1">
-                <Lb className="mb-1 block">En attente</Lb>
-                <div className="truncate text-[13px] text-muted-foreground">Aucun passage pour l'instant</div>
+                <div className="text-[13px] font-bold text-muted-foreground">En attente</div>
+                <div className="truncate text-[17px] font-semibold text-foreground">Aucun passage pour l'instant</div>
               </div>
             </div>
           )}
-
-          <Sep className="mb-[13px]" />
-
-          <div className="mb-[9px] flex items-center justify-between gap-2.5">
-            <span className="text-[12px] font-semibold text-foreground">
-              {dspActive ? "Envoi des membres" : "Synchronisation"}
-            </span>
-            <span className="text-[12.5px] font-bold text-primary">
-              {dspActive ? `${dspPct} %` : sync.lastOk ? "à jour" : "à relancer"}
-            </span>
-          </div>
-          <div className="mb-[13px] h-1.5 overflow-hidden rounded-full bg-muted">
+          {[syncLine, machineLine].map((l) => (
             <div
-              className="h-full rounded-full bg-primary transition-[width] duration-300"
-              style={{ width: `${dspActive ? dspPct : sync.lastOk ? 100 : 8}%` }}
-            />
+              key={l.key}
+              className={cn("flex items-center gap-2.5 border-t border-dashed border-grey/20 px-5 py-2.5 text-[13.5px]", INK[l.tone])}
+            >
+              <l.icon className="h-[18px] w-[18px] shrink-0" />
+              <span className="min-w-0 flex-1 truncate font-semibold">{l.title}</span>
+              {l.sub && <span className="truncate text-muted-foreground">{l.sub}</span>}
+              {l.action && (
+                <ActionButton kind={l.action.kind} size="xs" onClick={() => { void l.action!.run(); }}>
+                  {l.action.label}
+                </ActionButton>
+              )}
+            </div>
+          ))}
+        </div>
+      </Panel>
+
+      {/* ── Aujourd'hui ────────────────────────────────────────────────── */}
+      <Panel className="col-span-4" aria-label="Aujourd'hui">
+        <PanelHeader title="Aujourd'hui" />
+        <div className="px-[18px] pb-[18px] pt-3">
+          <div className="flex items-baseline gap-2">
+            <span className="font-num text-[38px] font-extrabold leading-none text-foreground">{today.total}</span>
+            <span className="text-[14px] text-muted-foreground">passages</span>
           </div>
-
-          {alert ? (
-            <div className="flex items-center gap-2.5">
-              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-primary/[0.09] text-primary">
-                <alert.icon className="h-4 w-4" />
-              </span>
-              <span className="min-w-0 flex-1 truncate text-[11.5px] text-foreground">{alert.text}</span>
-              <Button
-                variant="outline"
-                className="h-[26px] shrink-0 rounded-[14px] px-3 text-[11.5px] font-semibold"
-                onClick={() => { void alert.run(); }}
-              >
-                {alert.action}
-              </Button>
-            </div>
-          ) : (
-            <div className="flex items-center gap-2.5">
-              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-emerald-500/[0.055] text-emerald-700 dark:text-emerald-400">
-                <Play className="h-3.5 w-3.5" />
-              </span>
-              <span className="min-w-0 flex-1 truncate text-[11.5px] text-foreground">Tout fonctionne</span>
-            </div>
-          )}
-        </Card>
-
-        {/* Aujourd'hui */}
-        <ZoneTitle>
-          <span className="mt-[3px] inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-muted px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em] text-muted-foreground">
-            <History className="h-3 w-3" />
-            Aujourd'hui
-          </span>
-        </ZoneTitle>
-
-        <Tile className="flex min-h-0 flex-1 flex-col px-5 py-4">
-          <div className="mb-3.5 flex items-end gap-5">
-            <div>
-              <div className="num text-[30px] leading-none">{today.total}</div>
-              <div className="mt-1 whitespace-nowrap text-[10.5px] text-muted-foreground">passages</div>
-            </div>
-            <div>
-              <div className="text-[15px] font-bold text-emerald-700 dark:text-emerald-400">{today.granted}</div>
-              <div className="mt-[3px] text-[10.5px] text-muted-foreground">ok</div>
-            </div>
-            <div>
-              <div className="text-[15px] font-bold text-primary">{today.denied}</div>
-              <div className="mt-[3px] text-[10.5px] text-muted-foreground">refusés</div>
-            </div>
+          <div className="mt-1.5 flex flex-wrap gap-3.5 text-[13px]">
+            <span><strong className="text-success-ink">{today.granted}</strong> <span className="text-muted-foreground">ok</span></span>
+            <span><strong className="text-error-ink">{today.denied}</strong> <span className="text-muted-foreground">refusés</span></span>
             {today.peakHour != null && (
-              <div className="ml-auto text-right">
-                <div className="text-[13px] font-bold text-foreground">{today.peakHour} h</div>
-                <div className="mt-[3px] whitespace-nowrap text-[10.5px] text-muted-foreground">pointe</div>
-              </div>
+              <span><strong className="text-foreground">{today.peakHour} h</strong> <span className="text-muted-foreground">pointe</span></span>
             )}
           </div>
-
           {/* Hourly curve — 24 slots, the peak in the accent colour */}
-          <div className="mb-3.5 flex h-[34px] items-end gap-[2px]">
-            {(today.hourly.length === 24 ? today.hourly : new Array(24).fill(0)).map((v, h) => (
+          <div aria-hidden="true" className="mt-3.5 flex h-16 items-end gap-[3px]">
+            {hourly.map((v, h) => (
               <span
                 key={h}
                 title={`${h} h — ${v}`}
-                className={cn("flex-1 rounded-sm", h === today.peakHour && v > 0 ? "bg-primary" : "bg-muted")}
-                style={{ height: `${Math.max(6, Math.round((v / maxBar) * 100))}%` }}
+                className={cn(
+                  "flex-1 rounded-[3px]",
+                  h === today.peakHour && v > 0 ? "bg-primary" : v > 0 ? "bg-primary/32" : "bg-muted",
+                )}
+                style={{ height: `${Math.max(4, Math.round((v / maxBar) * 100))}%` }}
               />
             ))}
           </div>
-
-          <Sep className="mb-3" />
-
-          <div className="flex flex-col gap-2.5">
-            {showAgent && (
-              <div className="flex items-center gap-2.5">
-                <LiveDot className="h-2 w-2" tone={agent.running ? "ok" : "off"} />
-                <span className="flex-1 text-[12px] text-foreground">Agent</span>
-                <span className="font-mono text-[12px] text-muted-foreground">
-                  {agent.eventQueueDepth} · {agent.avgDecisionMs.toFixed(1)} ms
-                </span>
-              </div>
-            )}
-            <div className="flex items-center gap-2.5">
-              <span className={cn("h-2 w-2 shrink-0 rounded-full", readerConnected ? "bg-emerald-500" : "bg-primary")} />
-              <span className="flex-1 text-[12px] text-foreground">Lecteur</span>
-              <span className="truncate font-mono text-[12px] text-muted-foreground">
-                {readerLabel}
-              </span>
-            </div>
-            <div className="flex items-center gap-2.5">
-              <span className={cn("h-2 w-2 shrink-0 rounded-full", devicesTotal > 0 ? "bg-emerald-500" : "bg-muted-foreground")} />
-              <span className="flex-1 text-[12px] text-foreground">Appareils</span>
-              <span className="text-[12px] font-semibold text-muted-foreground">
-                {devicesTotal} déclaré{devicesTotal > 1 ? "s" : ""}
-              </span>
-            </div>
+          <div className="mt-1.5 flex justify-between text-[11.5px] text-muted-foreground">
+            <span>0 h</span><span>6 h</span><span>12 h</span><span>18 h</span><span>23 h</span>
           </div>
+        </div>
+      </Panel>
 
-          <div className="mt-auto flex flex-col gap-2.5 border-t border-border pt-3">
-            {s.loginDaysRemaining != null && (
-              <div className="flex items-center gap-2.5">
-                <span className={cn(
-                  "flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-[7px]",
-                  s.loginWarning ? "bg-amber-500/[0.14] text-amber-700 dark:text-amber-400" : "bg-muted text-muted-foreground",
-                )}>
-                  <Clock className="h-[15px] w-[15px]" />
-                </span>
-                <span className="flex-1 text-[12px] text-foreground">Session</span>
-                <span className={cn(
-                  "whitespace-nowrap text-[12.5px] font-bold",
-                  s.loginWarning ? "text-amber-700 dark:text-amber-400" : "text-muted-foreground",
-                )}>
-                  {s.loginDaysRemaining} jour{s.loginDaysRemaining > 1 ? "s" : ""} restant{s.loginDaysRemaining > 1 ? "s" : ""}
-                </span>
-              </div>
-            )}
-            <div className="flex items-center gap-2.5">
-              <span className="flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-[7px] bg-muted text-muted-foreground">
-                <DownloadCloud className="h-[15px] w-[15px]" />
-              </span>
-              <span className="flex-1 text-[12px] text-foreground">Mise à jour</span>
-              <span className="whitespace-nowrap text-[12px] text-muted-foreground">
-                {status.updates.updateAvailable
-                  ? `${status.updates.latestVersion ?? ""} ${status.updates.downloaded ? "prête" : "disponible"}`.trim()
-                  : "à jour"}
-              </span>
-            </div>
-          </div>
-        </Tile>
-
-        {/* Action tile */}
-        <Tile className="flex-none px-5 py-[15px]">
-          <div className="mb-3 flex items-center gap-2.5">
-            <Monitor className="h-[18px] w-[18px] shrink-0 text-primary" />
-            <div className="min-w-0 flex-1">
-              <div className="text-[12.5px] font-bold text-foreground">Écran d'entrée</div>
-              <div className="truncate text-[10.5px] text-muted-foreground">Affiche les accès en temps réel</div>
-            </div>
-          </div>
-          <div className="flex gap-2">
-            <Button
-              variant="outline"
-              className="h-8 flex-1 gap-1.5 rounded-[14px] text-[12px] font-semibold"
-              onClick={openPopupWindow}
-            >
-              <Monitor className="h-[15px] w-[15px]" />Ouvrir
-            </Button>
-            <Button
-              variant="outline"
-              className="h-8 flex-1 gap-1.5 rounded-[14px] text-[12px] font-semibold"
-              onClick={sendTestNotification}
-            >
-              <Bug className="h-[15px] w-[15px]" />Tester
-            </Button>
-          </div>
-        </Tile>
-
-        {/* Hard reset stays reachable — it is a destructive action the old
-            dashboard exposed, and the design has no other home for it. */}
-        <Button
-          variant="ghost"
-          className="h-8 shrink-0 gap-1.5 self-start px-2 text-[11.5px] text-muted-foreground hover:text-primary"
-          onClick={() => { void hardSyncNow(); }}
-          disabled={syncRunning}
-          title="Réinitialisation complète — recharge tous les membres sur les appareils"
+      {/* ── Passages ───────────────────────────────────────────────────── */}
+      <Panel className="col-span-8" aria-label="Passages">
+        <PanelHeader
+          title="Passages"
+          sub={`${today.total} aujourd'hui · ${today.denied} refusé${today.denied > 1 ? "s" : ""}${feed.length >= 40 ? " · les 40 derniers" : ""}`}
+        />
+        <FlexTable
+          label="Passages"
+          columns={[{ label: "Heure", flex: 0.5 }, { label: "Membre", flex: 3.4 }, { label: "", flex: 0.8, align: "right" }]}
+          empty={
+            <>
+              <div className="font-semibold text-foreground">Aucun passage enregistré</div>
+              <div className="mt-1 text-[12.5px]">Le fil se remplit dès qu'un membre se présente à un lecteur.</div>
+            </>
+          }
         >
-          <RotateCcw className={cn("h-3.5 w-3.5", syncRunning && "animate-spin")} />
-          Réinitialisation complète
-        </Button>
-      </div>
+          {/* Live system row — real, from /status */}
+          {dspActive && (
+            <FlexRow key="live-sync" minHeight={54}>
+              <FlexCell flex={0.5}><span className="font-mono text-[13px] text-muted-foreground">{clockOf(now)}</span></FlexCell>
+              <FlexCell flex={3.4}>
+                <IconCell
+                  icon={Upload}
+                  tone="primary"
+                  title={`Envoi des membres vers l'appareil${dsp!.deviceName ? ` « ${dsp!.deviceName} »` : ""}`}
+                  sub={dsp!.total > 0 ? `${dsp!.current} / ${dsp!.total} — ne fermez pas l'application` : "Connexion à l'appareil…"}
+                />
+              </FlexCell>
+              <FlexCell flex={0.8} align="right">{dsp!.total > 0 && <Chip tone="primary">{dspPct} %</Chip>}</FlexCell>
+            </FlexRow>
+          )}
+          {feed.map((it) => {
+            const resolved = !!it.userFullName.trim();
+            const tone: Tone = it.allowed ? "success" : "error";
+            const detail = it.allowed ? rowDetail(it) : refusedDetail(it);
+            return (
+              <FlexRow key={it.eventId || `${it.at}-${it.cardNo}`} minHeight={54}>
+                <FlexCell flex={0.5}><span className="font-mono text-[13px] text-muted-foreground">{hhmm(it.at)}</span></FlexCell>
+                <FlexCell flex={3.4}>
+                  {resolved
+                    ? <PersonCell name={rowTitle(it)} initials={initialsOf(it.userFullName)} tone={tone} sub={detail} />
+                    : <IconCell icon={methodIcon(it.method)} tone="grey" title={rowTitle(it)} sub={detail} />}
+                </FlexCell>
+                <FlexCell flex={0.8} align="right"><Chip tone={tone}>{it.allowed ? "Autorisé" : "Refusé"}</Chip></FlexCell>
+              </FlexRow>
+            );
+          })}
+        </FlexTable>
+      </Panel>
+
+      {/* ── État du poste ──────────────────────────────────────────────── */}
+      <Panel className="col-span-4" aria-label="État du poste">
+        <PanelHeader title="État du poste" />
+        <PanelList>
+          <ListRow
+            icon={Router}
+            tone={readerTone}
+            title="Lecteurs"
+            sub={readerSub}
+            subTone={readerTone === "error" && ultraOff.length > 0 ? "error" : undefined}
+            value={readerValue}
+            valueTone={readerTone === "grey" ? undefined : readerTone}
+          />
+          {showAgent && (
+            <ListRow
+              icon={Bot}
+              tone={agent.running ? "success" : "grey"}
+              title="Agent"
+              sub={`${agent.eventQueueDepth} · ${agent.avgDecisionMs.toFixed(1)} ms`}
+              value={agent.running ? "actif" : "arrêté"}
+              valueTone={agent.running ? "success" : undefined}
+            />
+          )}
+          {s.loginDaysRemaining != null && (
+            <ListRow
+              icon={Clock}
+              tone={s.loginWarning ? "warning" : "grey"}
+              title="Session"
+              sub={s.loginWarning ? "Reconnexion bientôt nécessaire" : "Connexion de ce poste"}
+              value={`${s.loginDaysRemaining} jour${s.loginDaysRemaining > 1 ? "s" : ""}`}
+              valueTone={s.loginWarning ? "warning" : undefined}
+            />
+          )}
+          <ListRow
+            icon={Download}
+            tone={updates.updateAvailable ? "primary" : "grey"}
+            title="Mise à jour"
+            sub={updateSub}
+            actions={updates.updateAvailable
+              ? <ActionButton kind="outline" size="sm" onClick={() => navigate("/update")}>Voir</ActionButton>
+              : undefined}
+          />
+          <ListRow
+            icon={MonitorPlay}
+            tone="info"
+            title="Écran d'entrée"
+            sub="Affiche les accès en temps réel"
+            actions={
+              <>
+                <ActionButton kind="outline" size="sm" icon={ExternalLink} onClick={openPopupWindow}>Ouvrir</ActionButton>
+                <ActionButton kind="outline" size="sm" icon={Play} onClick={sendTestNotification}>Tester</ActionButton>
+              </>
+            }
+          />
+          {/* Destructive: confirmed in a dialog first (owner-approved addition). */}
+          <ListRow
+            icon={RotateCcw}
+            tone="error"
+            title="Réinitialisation complète"
+            sub="Recharge tous les membres sur les appareils"
+            actions={
+              <ActionButton kind="danger" size="sm" onClick={() => setResetOpen(true)} disabled={syncRunning}>
+                Lancer…
+              </ActionButton>
+            }
+          />
+        </PanelList>
+      </Panel>
+
+      <ConfirmDialog
+        open={resetOpen}
+        onOpenChange={setResetOpen}
+        title="Réinitialisation complète ?"
+        description="Recharge tous les membres sur tous les appareils"
+        confirmLabel="Réinitialiser"
+        confirmDisabled={syncRunning}
+        onConfirm={() => { setResetOpen(false); void hardSyncNow(); }}
+      >
+        <Note tone="warning">Ne fermez pas l'application avant la fin.</Note>
+      </ConfirmDialog>
 
       <ScanCardModal open={scanOpen} onClose={() => setScanOpen(false)} />
-    </div>
+    </PageGrid>
   );
 }
