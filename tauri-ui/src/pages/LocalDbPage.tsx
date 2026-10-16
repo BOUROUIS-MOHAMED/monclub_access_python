@@ -212,7 +212,8 @@ export default function LocalDbPage() {
     };
   }, [unlocked]);
 
-  const handleUnlock = useCallback(() => setUnlocked(true), []);
+  // Show the real lease at once (the 1 s tick would first show « 0:00 »).
+  const handleUnlock = useCallback(() => { setUnlocked(true); setRemaining(readUnlock().rem); }, []);
   const handleLock = useCallback(() => {
     sessionStorage.removeItem(UNLOCK_KEY);
     setUnlocked(false);

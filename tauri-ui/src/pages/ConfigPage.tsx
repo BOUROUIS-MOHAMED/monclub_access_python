@@ -247,6 +247,7 @@ export default function ConfigPage() {
           const patched = await patch<any>("/config", { favorites_overlay_anchor: "right-center" });
           const patchedCfg = patched.config || { ...nextCfg, favorites_overlay_anchor: "right-center" };
           setCfg(patchedCfg);
+          setBaseline(patchedCfg);
           setServerSettings(res.serverSettings || {});
           broadcastFeedbackConfig(patchedCfg);
           void applyOverlayAnchor("right-center");
@@ -267,14 +268,19 @@ export default function ConfigPage() {
 
   // Same GET as loadConfig (it IS loadConfig), then the unsaved edits are put
   // back on screen — except `savedKeys`, which must show the server's value.
+  // `editsGenRef` moves on Annuler / Enregistrer: edits taken before one of those
+  // must not come back after the reload.
+  const editsGenRef = useRef(0);
   const reloadKeepingEdits = useCallback(async (savedKeys: string[] = []) => {
     const keep = { ...pendingEditsRef.current };
     for (const k of savedKeys) delete keep[k];
+    const gen = editsGenRef.current;
     await loadConfig();
-    if (Object.keys(keep).length) setCfg((p) => ({ ...p, ...keep }));
+    if (gen === editsGenRef.current && Object.keys(keep).length) setCfg((p) => ({ ...p, ...keep }));
   }, [loadConfig]);
 
   const handleSave = async () => {
+    editsGenRef.current += 1;
     setSaving(true); setError(null); setSuccess(false);
     try {
       const res = await patch<any>("/config", cfg);
@@ -384,6 +390,7 @@ export default function ConfigPage() {
     setError(null);
     try {
       await patch("/config", { start_on_system_startup: enabled });
+      setCfg((p) => ({ ...p, start_on_system_startup: enabled }));
       setBaseline((b) => ({ ...b, start_on_system_startup: enabled }));
     } catch (e) {
       setCfg((p) => ({ ...p, start_on_system_startup: previous }));
@@ -428,6 +435,14 @@ export default function ConfigPage() {
     return String(v).slice(0, 40);
   };
 
+  // The header is published by an effect that re-runs only on its (primitive)
+  // deps, so its buttons go through refs to always act on the current config.
+  const handleSaveRef = useRef(handleSave);
+  handleSaveRef.current = handleSave;
+  const discardEdits = () => { editsGenRef.current += 1; setCfg(baseline); setDirty(false); };
+  const discardEditsRef = useRef(discardEdits);
+  discardEditsRef.current = discardEdits;
+
   // ── Access v5 (boards S22 / S23): sections become tabs ────────────────
   type ConfigTab = "updates" | "startup" | "dock" | "scanner" | "feedback" | "advanced";
   const [section, setSection] = useState<ConfigTab>("updates");
@@ -442,7 +457,7 @@ export default function ConfigPage() {
       <>
         <ActionButton
           kind="outline"
-          onClick={() => { setCfg(baseline); setDirty(false); }}
+          onClick={() => discardEditsRef.current()}
           disabled={changes.length === 0 || saving}
         >
           Annuler
@@ -451,7 +466,7 @@ export default function ConfigPage() {
           kind={dirty ? "primary" : "outline"}
           icon={saving ? Loader2 : Save}
           spin={saving}
-          onClick={handleSave}
+          onClick={() => { void handleSaveRef.current(); }}
           disabled={!dirty || saving}
         >
           Enregistrer
@@ -480,14 +495,14 @@ export default function ConfigPage() {
   // on MB2000 gyms. Same rule as ProfilePage.
   const ultraWorkers = Object.values(status?.ultra?.devices ?? {});
   const ultraConnected = ultraWorkers.filter((d: any) => d?.connected).length;
-  const readerValue = ultraWorkers.length > 0
-    ? `${ultraConnected} / ${ultraWorkers.length} connecté${ultraWorkers.length > 1 ? "s" : ""}`
-    : status?.pullsdk?.connected
-      ? `PullSDK · ${status.pullsdk.ip || "connecté"}`
-      : "aucun connecté";
+  const pullsdkOn = !!status?.pullsdk?.connected;
+  const readerValue = [
+    ultraWorkers.length > 0 ? `${ultraConnected} / ${ultraWorkers.length} connecté${ultraWorkers.length > 1 ? "s" : ""}` : "",
+    pullsdkOn ? `PullSDK ${status?.pullsdk?.ip || "connecté"}` : "",
+  ].filter(Boolean).join(" · ") || "aucun connecté";
   const readerTone = ultraWorkers.length > 0
-    ? (ultraConnected === ultraWorkers.length ? "success" : ultraConnected > 0 ? "warning" : "error")
-    : status?.pullsdk?.connected ? "success" : "grey";
+    ? (ultraConnected === ultraWorkers.length ? "success" : ultraConnected > 0 || pullsdkOn ? "warning" : "error")
+    : pullsdkOn ? "success" : "grey";
 
   const soundFileRow = (opts: {
     uploading: boolean; fileName: string | null | undefined;
@@ -906,7 +921,7 @@ export default function ConfigPage() {
                   ))}
                 </PanelList>
                 <div className="flex gap-2 border-t border-dashed border-grey/20 px-[18px] py-3.5">
-                  <ActionButton kind="outline" className="flex-1" onClick={() => { setCfg(baseline); setDirty(false); }} disabled={saving}>
+                  <ActionButton kind="outline" className="flex-1" onClick={discardEdits} disabled={saving}>
                     Annuler
                   </ActionButton>
                   <ActionButton kind="primary" className="flex-[1.3]" icon={saving ? Loader2 : Save} spin={saving} onClick={handleSave} disabled={saving}>
