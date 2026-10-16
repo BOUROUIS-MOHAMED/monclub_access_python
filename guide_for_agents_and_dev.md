@@ -58,7 +58,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The one-shot credentials re-send at startup — what it drops, its marker table, its place and catch in `init_db` (`db.py::_force_one_credentials_resend`, `::_run_one_shot_credentials_resend`, `local_one_shot_steps`; `tools/bench_credential_resend.py`) | §3.1b "The upgrade window" |
 | What happens when an `init_db` step fails — the six schema migrations and the inline `device_write_hold.pin_scheme` `ALTER` that stop startup, the steps that log and go on, a `try` or an `import logging` added inside `init_db` (`db.py::init_db`, `::_relax_firmware_profiles_not_null`, `::_rebuild_sync_users_without_legacy_fingerprint`, `::_ensure_main_account_id_column`, `::_ensure_pin_scheme_column`, `::_ensure_column_forcing_refresh`, `sync_device_store.py::ensure_ultra_merge_device_columns`, `::_run_one_shot_credentials_resend`) | §3.2d "A failing migration stops startup", §3.1b "The upgrade window" |
 | Anything in `app/core/v2/` (the server clock, the v2 client, the notice socket, leases, commands, ownership backup, problem reports, loss re-add), `access/v2_routes.py`, or a lease-gate call site (`ultra_engine.py::_v2_writes_blocked` and the `_lease_gate` calls, `device_sync.py`, `realtime_agent.py`, `device_attendance.py`, `ultra_worker_pool.py::devices_to_drive`, `access/local_api_routes.py::LEASE_GATED_HANDLERS` / `SCANNER_GATED_HANDLERS`) | §3.9 |
-| The software updater client — check / verify / download / install / start-up gate / journal restore / loop guard / telemetry / update pages (`shared/update_runtime.py`, `shared/release_manifest.py`, `shared/ed25519.py`, `shared/release_keys.py`, `shared/update_versions.py`, `shared/update_files.py`, `shared/update_wrapper.py`, `shared/update_startup.py`, `access/update_runtime.py`, the update handlers in `local_access_api_v2.py`, `UpdatePage.tsx` / `TvUpdatePage.tsx`); the installer half — the safe swap, journal, health wait, same-version / zkemkeeper rules, uninstall data (`installer/MonClubAccess.iss`, `installer/MonClubTV.iss`, `installer/update_safety.iss`, `installer/update_helper.ps1`), the watchdog's journal rule (`packaging/watchdog/monclub_access_watchdog.ps1`), the watchdog task's registration and its Settings control (`packaging/watchdog/register_watchdog.ps1`, the `[Run]` entry and `WatchdogWhenMissing` in `MonClubAccess.iss`, `access/watchdog_control.py`, the `_handle_watchdog_*` handlers in `local_access_api_v2.py`, `tauri-ui/src/components/WatchdogCard.tsx`), the build / sign / publish gates (`build_release.ps1`, `tools/release_sign.py`, `publish_github_release.ps1`) | §11 Software updates |
+| The software updater client — check / verify / download / install / start-up gate / journal restore / loop guard / telemetry / update pages / the manual rollback « Revenir à la version précédente » (`shared/update_runtime.py`, `shared/release_manifest.py`, `shared/ed25519.py`, `shared/release_keys.py`, `shared/update_versions.py`, `shared/update_files.py`, `shared/update_wrapper.py`, `shared/update_startup.py`, `access/update_runtime.py`, the update handlers in `local_access_api_v2.py`, `UpdatePage.tsx` / `TvUpdatePage.tsx`); the installer half — the safe swap, journal, health wait, same-version / zkemkeeper rules, uninstall data (`installer/MonClubAccess.iss`, `installer/MonClubTV.iss`, `installer/update_safety.iss`, `installer/update_helper.ps1`), the watchdog's journal rule (`packaging/watchdog/monclub_access_watchdog.ps1`), the watchdog task's registration and its Settings control (`packaging/watchdog/register_watchdog.ps1`, the `[Run]` entry and `WatchdogWhenMissing` in `MonClubAccess.iss`, `access/watchdog_control.py`, the `_handle_watchdog_*` handlers in `local_access_api_v2.py`, `tauri-ui/src/components/WatchdogCard.tsx`), the build / sign / publish gates (`build_release.ps1`, `tools/release_sign.py`, `publish_github_release.ps1`) | §11 Software updates |
 | What `push_safety.check_bulk_removal` defers (`add_only`, `handover_release`) or lets through (a Confirm-removal approval) | §3.2g, §3.9 |
 | The removal log (`db.py::_log_v2_removal` in `clear_device_revocation_state` / `delete_device_sync_state`) | §3.4a, §3.9 |
 | The Erase-content wizard or the write hold (`app/core/erase_wizard.py` — incl. `::refill_roster`, `::held_waiting_count`, `EraseWizard._refill_check`, and since lane 1c `::_sync_staleness` / `::_sync_max_age_sec` with `app.py`'s `_last_sync_ok_mono` stamp, `::terminal_people` / `::not_refilled` / `::_bind_not_refilled` / `KEEP_MARK`, `::_refill_recheck`, `::_prune_now` / `::_folder_times`, `::_no_answer`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s codes —, `app/core/device_hold.py` — incl. `load(release_unstarted=)` and the `erase-prep`/`erase` phases —, `db.py::set_device_write_hold` / `::clear_device_write_hold` / `::list_device_write_holds`, `::begin_device_erase`, `::release_unstarted_erase_holds`, `::undo_device_erase_record` / `::device_list_is_authoritative` (lane 1f), `erase_wizard.py::check_erase_switch` / `monclub_api.py::get_erase_wizard_switch` (the gym's server switch), `erase_wizard.py::prune_erase_backups` (30-day retention), `::retire_device_records`, `::invalidate_device_records`, `device_sync.py::_filter_users_for_device(quiet=)`, `PullSDKDevice.ERASABLE_TABLES`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s offline answer, the hold in `ultra_engine.py::_v2_writes_blocked`, the worker's `_connected_addr` (`::_connect` / `::_disconnect`), `device_sync.py`'s three hold checks, `v2/handlers.py::device_reconcile`, `app.py`'s start-up `device_hold.load()` and `_sync_tick`'s `device_hold.ensure_loaded()`, `ownership.py::OwnershipSync._worker_idle`, the `erase` routes and handlers, `local_access_api_v2.py::_refuse_held_or_frozen`, `PullSDKDevice.count_table_strict` / `::read_table_strict` / `::erase_table`, `ZKStandaloneDevice.read_device_status` / `::read_user_templates` and the listing's `privilege`, `tauri-ui/src/components/EraseWizardDialog.tsx`) | §3.2h, pullsdk_guide §5, zkemkeeper_guide §4 |
@@ -5777,8 +5777,8 @@ installer through the wrapper below; `updater_exe_name`, `_launch_installer_exe`
 
 | File | Written by | Read by |
 |---|---|---|
-| `state\install_journal.json` `{phase,from,to,at,setupPid}` | Setup | app start-up, wrapper, watchdog |
-| `state\last_update.json` `{result,from,to,reason,log,at}` | Setup, the wrapper (`ABORTED setup_exit_<n>`), the restore helper (`ROLLED_BACK interrupted`) | the app; renamed to `last_update.consumed.json` once reported |
+| `state\install_journal.json` `{phase,from,to,at,setupPid}` | Setup; the app's manual rollback (`phase restoring`, plus `reason user_rollback`, §11.12) | app start-up, wrapper, watchdog |
+| `state\last_update.json` `{result,from,to,reason,log,at}` | Setup, the wrapper (`ABORTED setup_exit_<n>`), the restore helper (`ROLLED_BACK interrupted`, or `user_rollback` for a manual rollback) | the app; renamed to `last_update.consumed.json` once reported |
 | `state\boot_ok.json` `{version,pid,at}` | the app, once its local API listens | Setup (health wait) |
 | `state\update_state.json` | the app only | the app only: pending update, install attempt, per-version strikes/bans, telemetry outbox, TV install id |
 | `logs\update-<ver>-<utc>.log`, `logs\update-wrapper.log`, `logs\update-restore.log`, `logs\update-startup.log` | Setup `/LOG`, wrapper, restore helper, start-up journal check | people |
@@ -5921,7 +5921,8 @@ the watchdog-started 1.5.0 launched the wrapper and quit; the wrapper ran Setup 
   shutdown) or a PC with Fast Startup off retries at the next start. Journal staleness does
   not depend on the boot rule alone (10 min / dead `setupPid` also make it stale), and claim
   liveness uses the restorer's start time (§11.4).
-  `same_version` is no strike. The install button (« Redémarrer et installer » on Access,
+  `same_version` is no strike. A manual rollback (§11.12) bans the version it leaves itself
+  (`banReason user_rollback`) before the app exits. The install button (« Redémarrer et installer » on Access,
   "Restart to update" on TV) still works on a banned version; the page warns.
 - **Direction of `last_update.json`** (L2's `UpdWriteLastUpdate`, the restore helper, the
   wrapper): `ROLLED_BACK` from = the version that failed, to = the one restored;
@@ -5962,8 +5963,8 @@ shared Pascal `installer/update_safety.iss`, file work in `installer/update_help
 extracted to `{tmp}` and also installed into `{app}\watchdog`). `[CODE]`
 
 - **`{app}` layout:** `current\` (the running version; `[Files]` still target it, which keeps
-  Inno's uninstall log valid), `previous\` (the version before the last update — a manual
-  rollback is copying it back), `state\` (§11.1), `logs\`, `downloads\`, `watchdog\` (Access: watchdog
+  Inno's uninstall log valid), `previous\` (the version before the last update — the Update
+  page's « Revenir à la version précédente » copies it back, §11.12), `state\` (§11.1), `logs\`, `downloads\`, `watchdog\` (Access: watchdog
   scripts + `update_helper.ps1`; TV: `update_helper.ps1` only — the client's wrapper runs it). `[CODE]`
 - **`PrepareToInstall`:** FIRST `update_helper -Action other-setup`: another process with this product's
   Setup image name that is not our own Setup (`.exe` stub / `.tmp` ancestors) = a second installer run
@@ -6172,3 +6173,82 @@ detection reads the uninstalling user's HKCU only; an Access installed in the le
   Only `-DryRun` was ever executed (it refused a test-key file before any `gh` call).
 - The C# zip updater (`updater/`, `installer/updater/*.exe`, `build_updater.ps1`) is deleted
   (D2, D27, D28). `[TEST: ::test_the_zip_updater_is_gone]`
+
+### 11.12 Manual rollback — « Revenir à la version précédente » (Access v5 Card B, 2026-10-16)
+
+The Access Update page can put `previous\` (§11.8) back into `current\`. **It has no copy code of
+its own:** the restore is the start-up check's restore helper (§11.4) running the installed
+`update_helper.ps1 -Action recover` (§11.3, §11.9) — the code Setup and the watchdog already run.
+`[CODE: shared/update_runtime.py::local_rollback_info, ::launch_rollback]`
+
+- **When it is offered** (`GET /api/v2/update/status` → `localRollback {available, currentVersion,
+  previousVersion, reason}`, files only, the page polls it every 3 s): target `access` (TV: never,
+  `not_supported`); a frozen build running from `{app}\current` (the `_auto_install_allowed` rule —
+  a source run resolves `%LOCALAPPDATA%\MonClubAccess`, which may be a real install, and is refused as
+  `not_installed_build`); `previous\` holds the exe and `version.json` (`no_previous`); its version
+  parses (`previous_unreadable`), its `component`, when present, is `access`
+  (`previous_other_component`), it is strictly older than the running one (`previous_not_older`) and
+  not older than **`ROLLBACK_MIN_VERSION` = 1.5.0** (`previous_too_old`); `{app}\watchdog\update_helper.ps1`
+  exists (`helper_missing` — without it the wrapper's inline fallback would run and write
+  `interrupted`). Not the server's `rollback` flag, which is a signed downgrade offer (§11.2). `[CODE; TEST:
+  test_updater_v2_user_rollback.py::test_the_rollback_is_not_offered_when]`
+- **Why 1.5.0:** design.md §2 ("remote rollback / downgrade works only for PCs already on ≥ 1.5.0"):
+  a pre-v2 client does not read `update_state.json`, so it would ignore the ban below and update
+  straight back. "1.5.0 = the first v2 release" is the design's name for it; no v2 release has been
+  published yet `[UNVERIFIED: the real number of the first v2 release]`.
+- **`POST /api/v2/update/rollback`** `{previousVersion, currentVersion}` (both required, else 400) =
+  the versions the confirmation named; X-Local-Token gated (not in `_AUTH_EXEMPT`). It refuses with
+  409 `{code}` (nothing written, the app keeps running) when anything above fails, the versions
+  differ (`changed`), an install is starting (`busy`), an Access Setup runs (`setup_running`, unknown
+  = running), a journal or any `install_journal.restoring-*.json` claim exists (`journal_present`),
+  or the pause sentinel is under 30 min old (`update_in_progress`). Otherwise, in this order: **(1)**
+  the running version is banned in `update_state.json` (`versions[v] = {banned: true, banReason:
+  "user_rollback"}`, other fields kept); **(2)** the journal `{phase: "restoring", from: <previous>,
+  to: <running>, at, setupPid: <this pid>, reason: "user_rollback"}` (Setup's direction); **(3)**
+  `build_restore_script` unchanged, started with `launch_hidden_powershell`. A helper that does not
+  start → journal deleted, the ban undone (the entry as it was), 409 `launch_failed`. Then the
+  pending download is dropped, 200, and the app quits after 500 ms — like « Redémarrer et
+  installer ». The app log names who asked (`[Update] rollback … by Update page (<email>)`).
+  `[TEST: ::test_launch_*, ::test_a_helper_that_does_not_start_leaves_no_journal_and_no_ban,
+  ::test_the_handler_*]`
+- **Why the journal is safe:** while the app lives, `setupPid` is alive and the journal is under
+  10 min old, so the app's start-up check and the watchdog's `recover` stand down (exit 22). Once it
+  exits, the journal is stale at once (dead `setupPid`, §11.4) and whichever restorer claims it first
+  — the helper, the watchdog's next tick, a new start-up — finishes the restore; the others back off
+  on the claim. The helper waits up to 90 s for the app, then stops that pid. A process that dies
+  after (2) still gets rolled back. `[CODE]`
+- **The restore:** `recover` (exit 20) mirrors `previous` → `current` after stopping the app + UI
+  running from `current\`, writes `ROLLED_BACK` from = the version left, to = the previous one; the
+  reason is `user_rollback` **only** when the journal carries exactly that value (`-ceq`; anything
+  else, and every Setup journal, keeps `interrupted`; `restore_failed` unchanged). The helper then
+  starts `current\MonClubAccess.exe` unless it runs (the watchdog may have started it after its own
+  restore). `previous\` itself stays as it is. `[TEST: ::test_a_rollback_runs_for_real_through_the_installed_helper_and_relaunches
+  — real PowerShell + the real helper on a throw-away root; test_updater_v2_install_helper.py::test_recover_names_a_manual_rollback_in_its_result,
+  ::test_recover_ignores_any_other_journal_reason]`
+- **The re-update guard is the loop guard's existing ban (§11.5)**, written by the version left
+  because the build that starts afterwards — and consumes the result — is the OLDER one, with its own
+  code: it records `user_rollback` as one strike (not in its `_BAN_REASONS`), which leaves `banned`
+  set (a second strike rewrites `banReason` to `user_rollback (twice)`, still banned). Its start-up
+  gate and 24 h fallback skip the banned version (it is still downloaded and shown); the Update page
+  button still installs it; a NEWER release installs automatically as usual. Nothing in the engine
+  ever clears `banned` (`git log -S banned` on `shared/update_runtime.py` since `793cb61`). The pending
+  download is dropped so the restored version does not install it at its first start; the restored
+  version's normal check downloads the next offer again. `[TEST: ::test_the_restored_version_does_not_install_the_version_left_by_itself
+  (today's engine with the older ban set), ::test_a_newer_release_than_the_version_left_still_installs_automatically]`
+- **What the older version shows:** its telemetry sends `ROLLED_BACK` from = previous, to = the
+  version left, detail `reason=user_rollback`. Its Update page shows the raw reason where it has no
+  text for it (`UpdateNotices*.tsx` `REASONS[reason] ?? reason`): the last result reads as rolled back
+  with reason `user_rollback`, and while the version left is offered the loop-guard warning says it
+  "failed before (user_rollback)" (French on a v5 page, English before). From this change on both
+  notice components have a text for it. `[CODE]`
+- **UI** (`tauri-ui/src/pages/UpdatePage.tsx`, panel « Revenir en arrière »): shown only when
+  `localRollback.available`; the confirmation (`ConfirmDialog`) names both versions (frozen when it
+  opens and sent as the body), warns that the app closes and restarts and the turnstiles pause, says
+  the version left will no longer be installed automatically; it stays open on « Redémarrage… » once
+  the helper runs. `[CODE]`
+- **Not covered / residuals:** the Windows uninstall entry keeps the newer version's
+  `DisplayVersion` (the journal restore never rewrites it — same as an interrupted install; Setup's
+  same-version rule reads `current\version.json`, not the entry) `[CODE: MonClubAccess.iss same-version check]`. No `PENDING` telemetry is
+  sent when the rollback starts. The real restart of the frozen app and its Tauri UI, the watchdog
+  racing the helper on a real PC, and the restored app's first start-up gate are
+  `[UNVERIFIED — spare-PC test pending]`.

@@ -143,6 +143,7 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("POST", "/api/v2/update/download", "_handle_update_download"),
     ("POST", "/api/v2/update/install", "_handle_update_install"),
     ("POST", "/api/v2/update/cancel", "_handle_update_cancel"),
+    ("POST", "/api/v2/update/rollback", "_handle_update_rollback"),
     ("GET", "/api/v2/update/version", "_handle_update_version_info"),
     ("GET", "/api/v2/watchdog", "_handle_watchdog_status"),
     ("POST", "/api/v2/watchdog", "_handle_watchdog_set"),

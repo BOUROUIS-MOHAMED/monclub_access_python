@@ -6712,6 +6712,13 @@ def _build_update_status_payload(app) -> Dict[str, Any]:
                 "availableUntil": lr.get("availableUntil"),
                 "minCompatibleVersion": lr.get("minCompatibleVersion"),
             }
+    if um is not None and callable(getattr(um, "local_rollback_info", None)):
+        # « Revenir à la version précédente »: previous\ is kept by Setup (not the server's
+        # rollback offer `rollback`). Files only -- this payload is polled every 3 s.
+        try:
+            data["localRollback"] = um.local_rollback_info()
+        except Exception:
+            data["localRollback"] = None
     return data
 
 
@@ -6757,6 +6764,56 @@ def _handle_component_update_install(ctx: _Ctx) -> None:
         ctx.send_json(500, {"ok": False, "error": str(exc) or "the installer could not be started"})
         return
     ctx.send_json(200, {"ok": True, "message": "installer started; the app restarts on the new version"})
+    try:
+        ctx.app.after(500, ctx.app.quit_app)  # let the response reach the UI first
+    except Exception:
+        pass
+
+
+def _update_actor() -> str:
+    """Who asked for it, for the logs: the Access account signed in on this PC."""
+    try:
+        from access.store import load_auth_token
+
+        auth = load_auth_token()
+        email = (getattr(auth, "email", None) or "").strip() if auth else ""
+        return f"Update page ({email})" if email else "Update page (no account signed in)"
+    except Exception:
+        return "Update page (account unknown)"
+
+
+def _handle_update_rollback(ctx: _Ctx) -> None:
+    """« Revenir à la version précédente » (Access only): start the restore helper FIRST
+    (shared/update_runtime.py::launch_rollback -- journal + the start-up check's restore helper,
+    which waits for this process to exit, puts previous\\ back and restarts the app); answer 200
+    and quit only when it runs. Body ``{previousVersion, currentVersion}`` = what the confirmation
+    named; a mismatch is refused. Any refusal answers 409 and the app keeps running."""
+    from shared.update_runtime import RollbackRefused
+
+    um = getattr(ctx.app, "_update_manager", None)
+    if not um or not callable(getattr(um, "launch_rollback", None)):
+        ctx.send_json(400, {"ok": False, "error": "update manager not available"})
+        return
+    body = ctx.body()
+    body = body if isinstance(body, dict) else {}
+    expected_previous = body.get("previousVersion")
+    expected_current = body.get("currentVersion")
+    if not isinstance(expected_previous, str) or not isinstance(expected_current, str):
+        ctx.send_json(400, {"ok": False, "error": "body must be {\"previousVersion\": str, \"currentVersion\": str}"})
+        return
+    actor = _update_actor()
+    try:
+        um.launch_rollback(expected_previous=expected_previous, expected_current=expected_current)
+    except RollbackRefused as exc:
+        ctx.app.logger.warning("[Update] rollback %s -> %s by %s refused: %s", expected_current, expected_previous, actor, exc)
+        ctx.send_json(409, {"ok": False, "code": exc.code, "error": str(exc)})
+        return
+    except Exception as exc:
+        ctx.app.logger.error("[Update] rollback %s -> %s by %s FAILED: %s", expected_current, expected_previous, actor, exc)
+        ctx.send_json(500, {"ok": False, "error": str(exc) or "the rollback could not be started"})
+        return
+    ctx.app.logger.warning("[Update] rollback %s -> %s started by %s; the app now exits", expected_current, expected_previous, actor)
+    ctx.send_json(200, {"ok": True, "message": "restore started; the app restarts on the previous version"})
     try:
         ctx.app.after(500, ctx.app.quit_app)  # let the response reach the UI first
     except Exception:

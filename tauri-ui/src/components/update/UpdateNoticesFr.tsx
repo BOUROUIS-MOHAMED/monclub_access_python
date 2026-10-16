@@ -14,6 +14,7 @@ const REASONS: Record<string, string> = {
   setup_failed: "l'installateur a échoué",
   restore_failed: "la version précédente n'a pas pu être entièrement restaurée",
   same_version: "cette version était déjà installée",
+  user_rollback: "vous êtes revenu à la version précédente depuis la page Mise à jour",
   no_result: "l'installateur n'a renvoyé aucun résultat",
 };
 
@@ -74,7 +75,14 @@ export default function UpdateNoticesFr({ status, installError }: { status: Upda
         </Line>
       </Note>
     ) : null,
-    status?.updateAvailable && status.autoInstallBlocked ? (
+    status?.updateAvailable && status.autoInstallBlocked && status.autoInstallBlockedReason?.startsWith("user_rollback") ? (
+      <Note key="blocked" tone="warning">
+        <Line icon={Undo2}>
+          Vous êtes revenu de la version {status.latestVersion} : elle ne sera plus installée automatiquement.
+          « Redémarrer et installer » l'installe quand même.
+        </Line>
+      </Note>
+    ) : status?.updateAvailable && status.autoInstallBlocked ? (
       <Note key="blocked" tone="warning">
         <Line icon={AlertCircle}>
           La version {status.latestVersion} a déjà échoué ({reasonText(status.autoInstallBlockedReason)}) et ne sera plus
