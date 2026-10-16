@@ -13,7 +13,7 @@ import { cn } from "@/lib/utils";
 import { INK, type Tone } from "./tone";
 
 export function DialogFrame({
-  open, onOpenChange, title, sub, width = 480, tabs, footer, children, bodyClassName,
+  open, onOpenChange, title, sub, width = 480, tabs, footer, children, bodyClassName, lockOutside,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -24,10 +24,13 @@ export function DialogFrame({
   footer?: React.ReactNode;
   children?: React.ReactNode;
   bodyClassName?: string;
+  /** A click outside does not close it (forms, running captures); Échap and × still do. */
+  lockOutside?: boolean;
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
+        onInteractOutside={lockOutside ? (e) => e.preventDefault() : undefined}
         className="flex max-h-[88vh] flex-col gap-0 overflow-hidden rounded-2xl border-0 bg-card p-0 text-card-foreground shadow-[var(--shadow-dialog)] sm:rounded-2xl"
         style={{ maxWidth: width }}
       >
