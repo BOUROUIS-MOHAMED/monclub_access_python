@@ -4857,6 +4857,26 @@ the membership in `sync_users` nor `sync_users_held`. `[CODE]`
   targets (other id spaces) and memberships no longer on this PC keep the bare `#id`. A failed
   lookup leaves the rows as they were. `[TEST: tests/test_member_card_details.py::TestMutationTargetNames]`
 
+**Not built: « Renouveler » (Card M 7e).** Two facts block an honest renew button. `[CODE]`
+1. `renew` is a money op (`db.py::_MONEY_OP_KINDS`) and `app.py`'s `_offline_money_mutations_enabled`
+   is `False` with no code path setting it: `submit_offline_mutation` queues a money op without a
+   live attempt and the drain skips it (`money-gated`), so a renew would wait in the queue forever.
+   The flag waits for backend idempotency on `ActiveMembershipController` (see
+   `docs/plans/2026-09-11_gym_agents_in_access_and_offline_verifier.md`).
+2. Backend `ActiveMembershipController` `/gym/activeMembership/renew` (and `/renew/quote`) calls
+   `requireAgentFromCookieIfGym`: a GYM account must send the `currentAgentId` cookie of an agent
+   holding `ACTIVE_MEMBERSHIP_MANAGEMENT` + `ACTIVE_MEMBERSHIP_RENEWAL`, else 400 « Please choose a
+   gym agent first ». `monclub_api.py::_lifecycle_request` sends no cookie, and Access has no agent
+   or role data to mirror the gate (`tauri-ui/src/lib/agentMode.ts` is about the AGENT
+   `accessDataMode`, not staff accounts). The same helper guards `updateActiveMembership`,
+   `deleteActiveMembership` and `ActiveMembershipFreezeController` create/cancel, so Access's
+   Modifier / Geler / Supprimer from a GYM account would get that 400 too
+   `[CODE: backend local checkout 77fae5eb6; UNVERIFIED in the field]`.
+   The backend also computes the renewal dates itself (`renewalKind` QUEUED / START_TODAY /
+   AFTER_EXPIRY, from `/renew/quote`), requires `price` and `payedPrice` (no default to the plan
+   price), refuses an outstanding debt without `debtResolution` (409) and a door loss without
+   `acknowledgeDoorLoss` (409) — none of which the PC can know offline.
+
 ---
 
 ## 4. Protocol resolution — how a device gets its driver
