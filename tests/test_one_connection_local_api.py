@@ -275,3 +275,102 @@ def test_info_goes_through_the_real_worker_queue():
         t.join(2.0)
     assert ctx.last[0] == 200 and ctx.last[1]["params"]["~DeviceName"] == "C3-200"
     raw.get_device_param.assert_called_once()
+
+
+# ─────────────────────── writes: /users/push and /users/delete ───────────────────────
+
+@pytest.fixture()
+def writes(monkeypatch, tmp_path):
+    """A temp database (the template push reads firmware profiles), no hold, no hand-over,
+    a recorded reset, a device with no stored payload."""
+    from app.core import device_hold
+    from app.core.v2 import lease_gate
+    import app.core.db as dbmod
+
+    monkeypatch.setattr(dbmod, "_DB_PATH", str(tmp_path / "test.db"), raising=False)
+    dbmod.init_db()
+
+    state = {"held": False, "frozen": False, "order": []}
+    monkeypatch.setattr(device_hold, "is_held", lambda did: state["held"])
+    monkeypatch.setattr(lease_gate, "writes_frozen", lambda did: state["frozen"])
+    monkeypatch.setattr(dbmod, "reset_push_results_for_pins",
+                        lambda device_id, pins: state["order"].append(("reset", device_id, tuple(pins))))
+    monkeypatch.setattr(dbmod, "get_sync_device_payload", lambda did: {})
+    return state
+
+
+def _push_ctx(worker):
+    return _Ctx(_app(worker), body={"pin": "101", "name": "A", "cardNo": "55", "doorIds": [1, 2]})
+
+
+def test_users_push_writes_on_the_worker_connection(writes):
+    raw = _raw()
+    raw.set_device_data.side_effect = lambda **kw: writes["order"].append(("write", kw["table"])) or 0
+    worker = _Worker(_driver(raw))
+    ctx = _push_ctx(worker)
+    la2._handle_device_users_push(ctx)
+    status, payload = ctx.last
+    assert status == 200 and payload["ok"] is True and payload["authResult"] == "OK"
+    assert payload["templateResult"] == "0/0 pushed" and payload["errors"] == []
+    # The pin's result is reset to unknown before the first write (contract 4.1 §1.1).
+    assert writes["order"][:3] == [("reset", DID, ("101",)), ("write", "user"), ("write", "userauthorize")]
+    datas = [c.kwargs["data"] for c in raw.set_device_data.call_args_list]
+    assert datas == ["Pin=101\tName=A\tCardNo=55\r\n",
+                     "Pin=101\tAuthorizeTimezoneId=1\tAuthorizeDoorId=3\r\n"]
+    assert worker.calls == [("users_push", la2._USER_WRITE_TIMEOUT_SEC)]
+
+
+def test_users_push_sent_no_answer_is_unknown_never_a_clean_failure(writes):
+    ctx = _push_ctx(_Worker(_driver(_raw()), answer={"ok": False, "result": None, "error": "sent, no answer"}))
+    la2._handle_device_users_push(ctx)
+    status, payload = ctx.last
+    assert status == 500 and payload["outcome"] == "unknown" and payload["detail"] == "sent, no answer"
+    assert "peut-être été écrit" in payload["error"]
+    assert writes["order"] == [("reset", DID, ("101",))], "the result stays unknown"
+
+
+def test_users_push_not_taken_by_the_worker_is_503_nothing_sent(writes):
+    raw = _raw()
+    ctx = _push_ctx(_Worker(_driver(raw), answer={"ok": False, "result": None, "error": "timeout"}))
+    la2._handle_device_users_push(ctx)
+    assert ctx.last == (503, {"ok": False, "error": "timeout"})
+    raw.set_device_data.assert_not_called()
+
+
+@pytest.mark.parametrize("guard,code", [("held", "DEVICE_ON_HOLD"), ("frozen", "HANDOVER_IN_PROGRESS")])
+def test_users_push_guards_refuse_before_anything_is_queued(writes, guard, code):
+    writes[guard] = True
+    worker = _Worker(_driver(_raw()))
+    ctx = _push_ctx(worker)
+    la2._handle_device_users_push(ctx)
+    assert ctx.last[0] == 409 and ctx.last[1]["code"] == code
+    assert worker.calls == [] and writes["order"] == []
+
+
+def test_users_delete_deletes_on_the_worker_connection(writes):
+    raw = _raw()
+    worker = _Worker(_driver(raw))
+    ctx = _Ctx(_app(worker), body={"pin": "101"})
+    la2._handle_device_users_delete(ctx)
+    assert ctx.last == (200, {"ok": True})
+    assert [c.kwargs["table"] for c in raw.delete_device_data.call_args_list] == \
+        ["templatev10", "template", "userauthorize", "user"]
+    assert all(c.kwargs["data"] == "Pin=101" for c in raw.delete_device_data.call_args_list)
+    assert worker.calls == [("users_delete", la2._USER_WRITE_TIMEOUT_SEC)]
+
+
+def test_users_delete_sent_no_answer_is_unknown(writes):
+    ctx = _Ctx(_app(_Worker(_driver(_raw()), answer={"ok": False, "result": None, "error": "sent, no answer"})),
+               body={"pin": "101"})
+    la2._handle_device_users_delete(ctx)
+    status, payload = ctx.last
+    assert status == 500 and payload["outcome"] == "unknown" and "peut-être été supprimé" in payload["error"]
+
+
+@pytest.mark.parametrize("guard,code", [("held", "DEVICE_ON_HOLD"), ("frozen", "HANDOVER_IN_PROGRESS")])
+def test_users_delete_guards_refuse_before_anything_is_queued(writes, guard, code):
+    writes[guard] = True
+    worker = _Worker(_driver(_raw()))
+    ctx = _Ctx(_app(worker), body={"pin": "101"})
+    la2._handle_device_users_delete(ctx)
+    assert ctx.last[0] == 409 and ctx.last[1]["code"] == code and worker.calls == []

@@ -4979,8 +4979,9 @@ def _handle_erase_holds(ctx: _Ctx) -> None:
 
 
 def _refuse_held_or_frozen(ctx: _Ctx, did: int) -> bool:
-    """A direct user write (a second PullSDK session) to a turnstile an erase holds, or one
-    being handed over, is refused before any connect (guide §3.2h). True = refused (sent)."""
+    """A direct user write (on the ULTRA worker's connection, or a one-shot session when no
+    worker holds the turnstile) to a turnstile an erase holds, or one being handed over, is
+    refused before anything is queued or connected (guide §3.2h). True = refused (sent)."""
     from app.core import device_hold
     from app.core.v2 import lease_gate
     if device_hold.is_held(did):
@@ -4992,6 +4993,23 @@ def _refuse_held_or_frozen(ctx: _Ctx, did: int) -> bool:
                             "error": "this turnstile is being handed over to another PC"})
         return True
     return False
+
+
+# A direct user write that the worker had started when the wait ran out (guide §3.1a): it may
+# have landed. Never answered as a clean failure.
+def _send_write_unknown(ctx: _Ctx, maybe_done: str) -> None:
+    ctx.send_json(500, {
+        "ok": False, "outcome": "unknown", "detail": "sent, no answer",
+        "error": f"commande envoyée à l'appareil, sans réponse à temps — {maybe_done} : "
+                 f"vérifier sur l'appareil",
+    })
+
+
+# The worker runs a direct user write as ONE request_run_sdk call: a user row, its door rights,
+# its templates (each template probes up to 10 table/format combinations, _push_templates, which
+# has no door yield). Doors and rtlog wait for it. Chosen, not measured: the caller waits this
+# long for the worker to take it, then as long again for its answer (request_run_sdk).
+_USER_WRITE_TIMEOUT_SEC = 10.0
 
 
 def _handle_device_users_push(ctx: _Ctx) -> None:
@@ -5014,153 +5032,171 @@ def _handle_device_users_push(ctx: _Ctx) -> None:
         return
     if _refuse_held_or_frozen(ctx, did):
         return
-    sdk, err = _connect_device(ctx, did)
-    if err:
-        ctx.send_json(500, {"ok": False, "error": err})
-        return
     # Not a MonClub push attempt (the content is the operator's), but it changes what the
     # turnstile holds for this pin: its last push result becomes unknown BEFORE the first write,
-    # durably (contract revision 4.1 §1.1). No record, no write.
+    # durably (contract revision 4.1 §1.1). No record, no write. Done here, before the call is
+    # queued: a call the worker then skips leaves "unknown", the safe state.
     try:
         from app.core.db import reset_push_results_for_pins
         reset_push_results_for_pins(device_id=did, pins=[pin])
     except Exception as e:
-        try: sdk.disconnect()
-        except Exception: pass
         ctx.send_json(500, {"ok": False, "error": f"the push could not be recorded first: {e}"})
         return
 
-    try:
-        # Push user
-        pairs = [f"Pin={pin}"]
-        if name: pairs.append(f"Name={name}")
-        if card_no: pairs.append(f"CardNo={card_no}")
-        user_data = "\t".join(pairs) + "\r\n"
-        sdk.set_device_data(table="user", data=user_data, options="")
+    # Everything that reads the database or the request is prepared here, on the request
+    # thread; only the device writes run in _push (on the worker thread under ULTRA).
+    #
+    # Templates -- DELEGATED to the same DeviceSyncEngine._push_templates the
+    # full and ULTRA sync paths use.
+    #
+    # This handler used to be a second, weaker implementation of the same job: ONE
+    # table and ONE body format (vs the shared method's 10 probed combinations plus
+    # the firmware-profile fast path), no deviceCapabilities bias, no pre-delete,
+    # Size=0 sent verbatim, and `ok: true` returned even when it pushed nothing.
+    # A member could be "pushed" here and still not open the door.
+    from app.core.device_sync import (
+        DeviceSyncEngine,
+        _decoded_template_len,
+        _template_wire,
+    )
+    from app.core.settings_reader import parse_fingerprint_template_version
+    from app.core.db import get_sync_device_payload
 
-        # Push authorize — AuthorizeDoorId is a BITMASK (door1=1, door2=2, door3=4, door4=8).
-        # Push ONE record with the combined bitmask for all doors.
-        auth_result = "OK"
-        bitmask = 0
+    try:
+        from types import SimpleNamespace
+        # As the worker builds its own (ultra_engine.py): a config-less app still pushes.
+        engine = DeviceSyncEngine(cfg=getattr(ctx.app, "cfg", None) or SimpleNamespace(), logger=_logger)
+    except Exception as e:
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+        return
+
+    # Same table-order bias the main sync applies.
+    template_version_override = None
+    try:
+        template_version_override = parse_fingerprint_template_version(
+            (get_sync_device_payload(did) or {}).get("deviceCapabilities")
+        )
+    except Exception:
+        pass
+
+    # Conditional pre-delete, matching the main sync: only a device whose firmware
+    # profile recorded delete_then_insert/one_by_one (an observed silent-upsert
+    # failure) needs old rows cleared first. The default is a no-op -- exactly what
+    # this handler did before.
+    pre_delete = False
+    try:
+        profile = engine._get_firmware_profile(did)
+        pre_delete = profile.insert_strategy in ("delete_then_insert", "one_by_one")
+    except Exception:
+        pass
+
+    # This is the one template path that does NOT flow through
+    # _collect_templates_for_pin, so it is where a HEX templateData can still
+    # arrive (straight off an HTTP body). Normalise it here too, or the device is
+    # written a template it can never match.
+    tpl_errors: List[str] = []
+    wire_templates: List[Dict[str, Any]] = []
+    for t in (templates or []):
+        if not isinstance(t, dict):
+            continue
+        td = _safe_str(t.get("templateData"), "").strip()
+        if not td:
+            continue
+        try:
+            td, _nbytes = _template_wire(td, t.get("templateEncoding"))
+        except Exception as ex:
+            tpl_errors.append(
+                f"FingerID={t.get('fingerId')!r}: templateEncoding=HEX but "
+                f"templateData is not decodable hex ({ex})"
+            )
+            continue
+        # _push_templates falls back to Size=0 for a missing templateSize,
+        # because its normal caller (_collect_templates_for_pin) has already
+        # normalised it. This handler is the untrusted-input boundary, so it
+        # does that job here -- Size must be the DECODED byte count, never the
+        # encoded text length and never 0.
+        ts = _safe_int(t.get("templateSize"), 0)
+        if ts <= 0:
+            ts = _nbytes if _nbytes is not None else _decoded_template_len(td)
+        wire_templates.append({**t, "templateData": td, "templateSize": ts})
+
+    # fingerId is deliberately NOT coerced here. _push_templates skips and REPORTS
+    # an unusable fingerId; coercing a missing one to slot 0 would write a
+    # biometric to a finger the caller never named.
+    # The operator names the pin directly; it is recorded under the scheme the device
+    # runs, so the upstream push report names mainAccountId for an ACCOUNT device and
+    # activeMembershipId for a MEMBERSHIP one (guide §3.2b).
+    from app.core.device_sync import device_pin_scheme
+
+    try:
+        raw_pin_source = device_pin_scheme(get_sync_device_payload(did) or {})
+    except Exception:
+        # The device's scheme cannot be read, so which id this pin IS is unknown. NULL
+        # would read back as MEMBERSHIP and report an account pin against the person whose
+        # membership has that number; UNKNOWN is stored and never reported (the report
+        # skips any source but ACCOUNT/MEMBERSHIP). Review #10.
+        _logger.warning(
+            "[API] users/push device=%s pin=%s: device pin scheme unreadable -- the push "
+            "outcome is recorded as UNKNOWN and not reported upstream", did, pin,
+        )
+        raw_pin_source = "UNKNOWN"
+
+    pairs = [f"Pin={pin}"]
+    if name: pairs.append(f"Name={name}")
+    if card_no: pairs.append(f"CardNo={card_no}")
+    user_data = "\t".join(pairs) + "\r\n"
+    # AuthorizeDoorId is a BITMASK (door1=1, door2=2, door3=4, door4=8).
+    # Push ONE record with the combined bitmask for all doors.
+    bitmask = 0
+    try:
         for door in door_ids:
             bitmask |= 1 << (int(door) - 1)
+    except Exception as e:
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+        return
+    auth_data = f"Pin={pin}\tAuthorizeTimezoneId=1\tAuthorizeDoorId={bitmask}\r\n"
+
+    def _push(sdk):
+        h, _on_worker = _pullsdk_handle(sdk)
+        h.set_device_data(table="user", data=user_data, options="")
+        auth_result = "OK"
         try:
-            auth_data = f"Pin={pin}\tAuthorizeTimezoneId=1\tAuthorizeDoorId={bitmask}\r\n"
-            sdk.set_device_data(table="userauthorize", data=auth_data, options="")
+            h.set_device_data(table="userauthorize", data=auth_data, options="")
         except Exception as ex:
             auth_result = str(ex)
-
-        # Push templates -- DELEGATED to the same DeviceSyncEngine._push_templates the
-        # full and ULTRA sync paths use.
-        #
-        # This handler used to be a second, weaker implementation of the same job: ONE
-        # table and ONE body format (vs the shared method's 10 probed combinations plus
-        # the firmware-profile fast path), no deviceCapabilities bias, no pre-delete,
-        # Size=0 sent verbatim, and `ok: true` returned even when it pushed nothing.
-        # A member could be "pushed" here and still not open the door.
-        from app.core.device_sync import (
-            DeviceSyncEngine,
-            _decoded_template_len,
-            _template_wire,
-        )
-        from app.core.settings_reader import parse_fingerprint_template_version
-        from app.core.db import get_sync_device_payload
-
-        engine = DeviceSyncEngine(cfg=ctx.app.cfg, logger=_logger)
-
-        # Same table-order bias the main sync applies.
-        template_version_override = None
-        try:
-            template_version_override = parse_fingerprint_template_version(
-                (get_sync_device_payload(did) or {}).get("deviceCapabilities")
-            )
-        except Exception:
-            pass
-
-        # Conditional pre-delete, matching the main sync: only a device whose firmware
-        # profile recorded delete_then_insert/one_by_one (an observed silent-upsert
-        # failure) needs old rows cleared first. The default is a no-op -- exactly what
-        # this handler did before.
-        try:
-            profile = engine._get_firmware_profile(did)
-            if profile.insert_strategy in ("delete_then_insert", "one_by_one"):
-                engine._delete_auth_and_templates_best_effort(
-                    sdk=sdk, pin=pin, fingerprint_enabled=True,
-                )
-        except Exception:
-            pass
-
-        # This is the one template path that does NOT flow through
-        # _collect_templates_for_pin, so it is where a HEX templateData can still
-        # arrive (straight off an HTTP body). Normalise it here too, or the device is
-        # written a template it can never match.
-        tpl_errors: List[str] = []
-        wire_templates: List[Dict[str, Any]] = []
-        for t in (templates or []):
-            if not isinstance(t, dict):
-                continue
-            td = _safe_str(t.get("templateData"), "").strip()
-            if not td:
-                continue
+        if pre_delete:
             try:
-                td, _nbytes = _template_wire(td, t.get("templateEncoding"))
-            except Exception as ex:
-                tpl_errors.append(
-                    f"FingerID={t.get('fingerId')!r}: templateEncoding=HEX but "
-                    f"templateData is not decodable hex ({ex})"
+                engine._delete_auth_and_templates_best_effort(
+                    sdk=h, pin=pin, fingerprint_enabled=True,
                 )
-                continue
-            # _push_templates falls back to Size=0 for a missing templateSize,
-            # because its normal caller (_collect_templates_for_pin) has already
-            # normalised it. This handler is the untrusted-input boundary, so it
-            # does that job here -- Size must be the DECODED byte count, never the
-            # encoded text length and never 0.
-            ts = _safe_int(t.get("templateSize"), 0)
-            if ts <= 0:
-                ts = _nbytes if _nbytes is not None else _decoded_template_len(td)
-            wire_templates.append({**t, "templateData": td, "templateSize": ts})
-
-        # fingerId is deliberately NOT coerced here. _push_templates skips and REPORTS
-        # an unusable fingerId; coercing a missing one to slot 0 would write a
-        # biometric to a finger the caller never named.
-        # The operator names the pin directly; it is recorded under the scheme the device
-        # runs, so the upstream push report names mainAccountId for an ACCOUNT device and
-        # activeMembershipId for a MEMBERSHIP one (guide §3.2b).
-        from app.core.device_sync import device_pin_scheme
-
-        try:
-            raw_pin_source = device_pin_scheme(get_sync_device_payload(did) or {})
-        except Exception:
-            # The device's scheme cannot be read, so which id this pin IS is unknown. NULL
-            # would read back as MEMBERSHIP and report an account pin against the person whose
-            # membership has that number; UNKNOWN is stored and never reported (the report
-            # skips any source but ACCOUNT/MEMBERSHIP). Review #10.
-            _logger.warning(
-                "[API] users/push device=%s pin=%s: device pin scheme unreadable -- the push "
-                "outcome is recorded as UNKNOWN and not reported upstream", did, pin,
-            )
-            raw_pin_source = "UNKNOWN"
+            except Exception:
+                pass
         pushed, push_errs = engine._push_templates(
-            sdk, pin=pin, templates=wire_templates, device_id=did,
+            h, pin=pin, templates=wire_templates, device_id=did,
             template_version_override=template_version_override,
             pin_source=raw_pin_source,
         )
-        tpl_errors.extend(push_errs)
+        return {"authResult": auth_result, "pushed": pushed, "errors": list(push_errs)}
 
-        # `ok` now means what it says. Reporting true on a failed template push is the
-        # same defect F0 fixed on the sync paths.
-        ok = (auth_result == "OK") and not tpl_errors
-        ctx.send_json(200, {
-            "ok": ok,
-            "authResult": auth_result,
-            "templateResult": f"{pushed}/{len(templates)} pushed",
-            "errors": tpl_errors,
-        })
-    except Exception as e:
-        ctx.send_json(500, {"ok": False, "error": str(e)})
-    finally:
-        try: sdk.disconnect()
-        except Exception: pass
+    r = _run_on_device_sdk(ctx, did, _push, label="users_push", timeout=_USER_WRITE_TIMEOUT_SEC)
+    if not r["ok"]:
+        if r["error"] == "sent, no answer":
+            _logger.warning("[API] users/push device=%s pin=%s SENT, NO ANSWER", did, pin)
+            _send_write_unknown(ctx, "l'utilisateur a peut-être été écrit")
+        else:
+            _send_run_failure(ctx, r)
+        return
+    res = r["result"] or {}
+    tpl_errors.extend(res.get("errors") or [])
+    # `ok` now means what it says. Reporting true on a failed template push is the
+    # same defect F0 fixed on the sync paths.
+    ok = (res.get("authResult") == "OK") and not tpl_errors
+    ctx.send_json(200, {
+        "ok": ok,
+        "authResult": res.get("authResult"),
+        "templateResult": f"{res.get('pushed', 0)}/{len(templates)} pushed",
+        "errors": tpl_errors,
+    })
 
 
 def _handle_device_users_list(ctx: _Ctx) -> None:
@@ -5203,24 +5239,28 @@ def _handle_device_users_delete(ctx: _Ctx) -> None:
         return
     if _refuse_held_or_frozen(ctx, did):
         return
-    sdk, err = _connect_device(ctx, did)
-    if err:
-        ctx.send_json(500, {"ok": False, "error": err})
-        return
-    try:
-        cond = f"Pin={pin}"
+    cond = f"Pin={pin}"
+
+    # Four DeleteDeviceData calls; a refused one is skipped, as before.
+    def _delete(sdk):
+        h, _on_worker = _pullsdk_handle(sdk)
         for table in ["templatev10", "template", "userauthorize", "user"]:
             try:
-                if sdk.supports_delete_device_data():
-                    sdk.delete_device_data(table=table, data=cond, options="")
+                if h.supports_delete_device_data():
+                    h.delete_device_data(table=table, data=cond, options="")
             except Exception:
                 pass
-        ctx.send_json(200, {"ok": True})
-    except Exception as e:
-        ctx.send_json(500, {"ok": False, "error": str(e)})
-    finally:
-        try: sdk.disconnect()
-        except Exception: pass
+        return True
+
+    r = _run_on_device_sdk(ctx, did, _delete, label="users_delete", timeout=_USER_WRITE_TIMEOUT_SEC)
+    if not r["ok"]:
+        if r["error"] == "sent, no answer":
+            _logger.warning("[API] users/delete device=%s pin=%s SENT, NO ANSWER", did, pin)
+            _send_write_unknown(ctx, "l'utilisateur a peut-être été supprimé")
+        else:
+            _send_run_failure(ctx, r)
+        return
+    ctx.send_json(200, {"ok": True})
 
 
 def _handle_device_door_presets_list(ctx: _Ctx) -> None:

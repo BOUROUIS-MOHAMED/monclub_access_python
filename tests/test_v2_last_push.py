@@ -749,4 +749,6 @@ class TestTheAdminUsersPushRoute:
         sdk = MagicMock()
         sent = self._call(monkeypatch, sdk)
         assert sent and sent[-1][0] == 500
-        assert not sdk.set_device_data.called and sdk.disconnect.called
+        # Since 2026-10-16 the reset runs before the write is queued or connected (one
+        # connection per turnstile, guide §3.1a): no session is opened at all.
+        assert not sdk.set_device_data.called and not sdk.disconnect.called
