@@ -231,7 +231,8 @@ export default function ConfigPage() {
     window.dispatchEvent(new CustomEvent("access-feedback-config-updated", { detail: nextCfg }));
   }, []);
 
-  const loadConfig = useCallback(async () => {
+  // Resolves to the config it put on screen, or null when the GET failed.
+  const loadConfig = useCallback(async (): Promise<Record<string, any> | null> => {
     setLoading(true);
     try {
       const res = await get<any>("/config");
@@ -251,7 +252,7 @@ export default function ConfigPage() {
           setServerSettings(res.serverSettings || {});
           broadcastFeedbackConfig(patchedCfg);
           void applyOverlayAnchor("right-center");
-          return;
+          return patchedCfg;
         } catch {
           // fall through to normal load if the migration PATCH fails
         }
@@ -260,7 +261,8 @@ export default function ConfigPage() {
       setBaseline(nextCfg);
       setServerSettings(res.serverSettings || {});
       broadcastFeedbackConfig(nextCfg);
-    } catch (e) { setError(String(e)); }
+      return nextCfg;
+    } catch (e) { setError(String(e)); return null; }
     finally { setLoading(false); }
   }, [broadcastFeedbackConfig]);
 
@@ -271,13 +273,33 @@ export default function ConfigPage() {
   // `editsGenRef` moves on Annuler / Enregistrer: edits taken before one of those
   // must not come back after the reload.
   const editsGenRef = useRef(0);
+  // Every auto-save that succeeds records its keys here with a rising number. A reload
+  // whose GET was answered before such a save landed would put the old value back in
+  // the baseline (and the save would read « non enregistré » again), so after the GET
+  // the values saved since the reload started are laid back over cfg AND baseline.
+  const autoSaveSeqRef = useRef(0);
+  const autoSavedRef = useRef(new Map<string, { seq: number; value: any }>());
+  const recordAutoSaved = useCallback((saved: Record<string, any>) => {
+    const seq = ++autoSaveSeqRef.current;
+    for (const [k, value] of Object.entries(saved)) autoSavedRef.current.set(k, { seq, value });
+  }, []);
   const reloadKeepingEdits = useCallback(async (savedKeys: string[] = []) => {
     const keep = { ...pendingEditsRef.current };
     for (const k of savedKeys) delete keep[k];
     const gen = editsGenRef.current;
-    await loadConfig();
-    if (gen === editsGenRef.current && Object.keys(keep).length) setCfg((p) => ({ ...p, ...keep }));
-  }, [loadConfig]);
+    const startSeq = autoSaveSeqRef.current;
+    const loaded = await loadConfig();
+    const savedSince: Record<string, any> = {};
+    for (const [k, { seq, value }] of autoSavedRef.current) if (seq > startSeq) savedSince[k] = value;
+    const keepNow = gen === editsGenRef.current ? keep : {};
+    if (Object.keys(keepNow).length || Object.keys(savedSince).length) {
+      setCfg((p) => ({ ...p, ...keepNow, ...savedSince }));
+    }
+    if (Object.keys(savedSince).length) {
+      setBaseline((b) => ({ ...b, ...savedSince }));
+      if (loaded) broadcastFeedbackConfig({ ...loaded, ...savedSince });
+    }
+  }, [broadcastFeedbackConfig, loadConfig]);
 
   const handleSave = async () => {
     editsGenRef.current += 1;
@@ -319,14 +341,19 @@ export default function ConfigPage() {
       // unsaved edit on the page. Take only the keys just saved, and count
       // them as saved (baseline) so they never show as « non enregistré ».
       const saved = Object.fromEntries(Object.keys(changes).map((k) => [k, nextCfg[k]]));
+      recordAutoSaved(saved);
       setCfg((p) => ({ ...p, ...saved }));
       setBaseline((b) => ({ ...b, ...saved }));
       broadcastFeedbackConfig(nextCfg);
     } catch (e) {
       setError(String(e));
+      // Put the keys back as they were before the click, so a reload that fails too does
+      // not leave the optimistic value on screen as an unsaved edit.
+      const previous = Object.fromEntries(Object.keys(changes).map((k) => [k, cfg[k]]));
+      setCfg((p) => ({ ...p, ...previous }));
       await reloadKeepingEdits(Object.keys(changes));
     }
-  }, [broadcastFeedbackConfig, cfg, reloadKeepingEdits]);
+  }, [broadcastFeedbackConfig, cfg, recordAutoSaved, reloadKeepingEdits]);
 
   const handleFeedbackSoundUpload = useCallback(async (kind: FeedbackSoundKind, file: File | null) => {
     if (!file) return;
@@ -390,6 +417,7 @@ export default function ConfigPage() {
     setError(null);
     try {
       await patch("/config", { start_on_system_startup: enabled });
+      recordAutoSaved({ start_on_system_startup: enabled });
       setCfg((p) => ({ ...p, start_on_system_startup: enabled }));
       setBaseline((b) => ({ ...b, start_on_system_startup: enabled }));
     } catch (e) {

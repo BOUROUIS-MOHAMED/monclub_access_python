@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useEffect } from "react";
+import { useState, useCallback, useMemo, useEffect, useRef, type ReactNode } from "react";
 import { useDevices, usePullSdk, usePopupStream } from "@/api/hooks";
 import { useApp } from "@/context/AppContext";
 import { usePageChrome } from "@/context/PageChromeContext";
@@ -30,6 +30,14 @@ interface DeviceContentState {
   rows: Record<string, unknown>[];
   count: number;
   loading: boolean;
+  error: string | null;
+}
+// Row counts per controller table, from the live GET /devices/{id}/info (`counts`). Read once
+// per dialog opening, when « Contenu » is first shown. A table missing from `values` was not
+// read (the server drops a count it could not get) -- it is never shown as 0.
+interface DeviceCountsState {
+  status: "idle" | "loading" | "ok" | "error";
+  values: Record<string, number>;
   error: string | null;
 }
 
@@ -138,6 +146,13 @@ const INFO_TABS: { value: InfoTab; label: string }[] = [
 function valueText(v: unknown): string {
   return typeof v === "object" ? JSON.stringify(v) : String(v);
 }
+
+// A failed live read (/info, /table): a PC that does not drive this turnstile is refused on
+// purpose (409 notDriver) -- say so instead of showing the raw refusal as a fault.
+function liveReadError(e: unknown): string {
+  if (isNotDriverError(e)) return "Ce PC ne pilote pas ce tourniquet : la lecture en direct n'est possible que depuis son PC pilote.";
+  return String(e);
+}
 // Protocol family the device speaks. Mirrors app/sdk/device_driver.resolve_device_protocol:
 // anything absent or unrecognised resolves to ZK_PULLSDK (the backend column defaults to
 // it), so a missing field can never route a working PullSDK panel away from its path.
@@ -153,6 +168,23 @@ const PROTOCOL_LABEL: Record<DeviceProtocol, string> = {
   ZK_PULLSDK: "PullSDK",
   ZK_STANDALONE: "ZKTeco autonome",
 };
+
+// The live table/parameter reads (/devices/{id}/table, /info) are PullSDK-only: the server
+// refuses them with 409 on a ZK_STANDALONE terminal. Their buttons are disabled there, and a
+// disabled button gets no pointer events, so the reason sits on this focusable wrapper.
+function StandaloneGate({ standalone, reason, children }: {
+  standalone: boolean; reason: string; children: ReactNode;
+}) {
+  if (!standalone) return <>{children}</>;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span tabIndex={0} aria-label={reason} className="inline-flex rounded-lg">{children}</span>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-[280px]">{reason}</TooltipContent>
+    </Tooltip>
+  );
+}
 
 export default function DevicesPage() {
   const { data, loading, error, reload } = useDevices(false);
@@ -173,7 +205,11 @@ export default function DevicesPage() {
     deviceId: number; cached: Record<string, unknown>; live: any | null;
     liveError: string | null; liveLoading: boolean; presets: DoorPreset[]; presetsLoading: boolean;
     content: DeviceContentState;
+    counts: DeviceCountsState;
+    /** Which opening of the dialog this is: a counts answer from an earlier opening is dropped. */
+    openSeq: number;
   } | null>(null);
+  const infoOpenSeqRef = useRef(0);
 
   // Control panel (re-entry block + clock). One scan-modify-apply object per device.
   const [control, setControl] = useState<ControlState | null>(null);
@@ -186,6 +222,9 @@ export default function DevicesPage() {
   const [nothingErasedIds, setNothingErasedIds] = useState<Set<number>>(new Set());
   // The start-up read of the holds failed: Access then holds EVERY turnstile until it reads.
   const [holdsUnknown, setHoldsUnknown] = useState(false);
+  // For the automatic Contenu counts read only: "not read yet" and "the read threw" both
+  // block it (the rows keep the behaviour above, which shows no hold when the read throws).
+  const [holdsRead, setHoldsRead] = useState<"pending" | "ok" | "failed">("pending");
   const reloadHolds = useCallback(async () => {
     try {
       const res = await liveEraseApi.holds();
@@ -195,7 +234,8 @@ export default function DevicesPage() {
         || (h.reason === "erase-prep" && h.terminalScheme != null && h.terminalScheme !== h.pinScheme))
         .map((h) => Number(h.deviceId))));
       setHoldsUnknown(!!res.loadFailed);
-    } catch { /* an older Access API without the wizard: no hold is shown */ }
+      setHoldsRead("ok");
+    } catch { /* an older Access API without the wizard: no hold is shown */ setHoldsRead("failed"); }
   }, []);
   useEffect(() => { void reloadHolds(); }, [reloadHolds, data]);
 
@@ -401,26 +441,53 @@ export default function DevicesPage() {
         loading: false,
         error: null,
       },
+      counts: { status: "idle", values: {}, error: null },
+      openSeq: ++infoOpenSeqRef.current,
     });
     loadPresets(deviceId);
   }, [devices, loadPresets]);
 
   const handleFetchLiveInfo = useCallback(async () => {
     if (!infoDialog) return;
+    const deviceId = infoDialog.deviceId;
     setInfoDialog((p) => p ? { ...p, liveLoading: true, liveError: null, live: null } : p);
-    try { const info = await pullsdk.getInfo(infoDialog.deviceId); setInfoDialog((p) => p ? { ...p, live: info, liveLoading: false } : p); }
-    catch (e) { setInfoDialog((p) => p ? { ...p, liveError: String(e), liveLoading: false } : p); }
+    try {
+      const info = await pullsdk.getInfo(deviceId);
+      // The same answer carries the table counts: reuse them rather than reading again.
+      setInfoDialog((p) => p && p.deviceId === deviceId ? {
+        ...p, live: info, liveLoading: false,
+        counts: info?.counts ? { status: "ok", values: info.counts, error: null } : p.counts,
+      } : p);
+    }
+    catch (e) { setInfoDialog((p) => p && p.deviceId === deviceId ? { ...p, liveError: liveReadError(e), liveLoading: false } : p); }
   }, [infoDialog, pullsdk]);
+
+  // Contenu row counts: one live /info read, started by the tab (see the effect below).
+  const fetchContentCounts = useCallback(async (deviceId: number, openSeq: number) => {
+    const mine = (p: { deviceId: number; openSeq: number } | null) => !!p && p.deviceId === deviceId && p.openSeq === openSeq;
+    setInfoDialog((p) => mine(p) ? { ...p!, counts: { status: "loading", values: {}, error: null } } : p);
+    try {
+      const info = await pullsdk.getInfo(deviceId);
+      setInfoDialog((p) => mine(p)
+        ? { ...p!, counts: { status: "ok", values: info?.counts ?? {}, error: null } }
+        : p);
+    } catch (e) {
+      setInfoDialog((p) => mine(p)
+        ? { ...p!, counts: { status: "error", values: {}, error: liveReadError(e) } }
+        : p);
+    }
+  }, [pullsdk]);
 
   const handleFetchContent = useCallback(async (tableName: string) => {
     if (!infoDialog) return;
+    const deviceId = infoDialog.deviceId;
     setInfoDialog((p) => p ? {
       ...p,
       content: { ...p.content, tableName, loading: true, error: null, rows: [] },
     } : p);
     try {
-      const res = await pullsdk.getTable(infoDialog.deviceId, tableName, { maxRows: "250" });
-      setInfoDialog((p) => p ? {
+      const res = await pullsdk.getTable(deviceId, tableName, { maxRows: "250" });
+      setInfoDialog((p) => p && p.deviceId === deviceId ? {
         ...p,
         content: {
           tableName,
@@ -431,7 +498,7 @@ export default function DevicesPage() {
         },
       } : p);
     } catch (e) {
-      setInfoDialog((p) => p ? {
+      setInfoDialog((p) => p && p.deviceId === deviceId ? {
         ...p,
         content: {
           ...p.content,
@@ -439,7 +506,7 @@ export default function DevicesPage() {
           rows: [],
           count: 0,
           loading: false,
-          error: String(e),
+          error: liveReadError(e),
         },
       } : p);
     }
@@ -484,6 +551,28 @@ export default function DevicesPage() {
   // Infos appareil tabs: controlled, so opening the dialog goes back to « Cache ».
   const [infoTab, setInfoTab] = useState<InfoTab>("cached");
   const openInfo = (deviceId: number) => { setInfoTab("cached"); handleInfo(deviceId); };
+
+  // Why the Contenu counts are NOT read live right now -- only states this page already
+  // knows: an erase hold (or holds not read yet), the erase wizard open on this device,
+  // or a user push running on it. null = free to read.
+  const infoDeviceId = infoDialog?.deviceId ?? null;
+  const countsBlockedReason: string | null = infoDeviceId == null ? null
+    : holdsRead === "pending" ? "Lecture des retenues d'effacement en cours…"
+    : holdsRead === "failed" ? "Les retenues d'effacement n'ont pas pu être lues : pas de lecture en direct automatique."
+    : holdsUnknown ?"Les retenues d'effacement n'ont pas pu être lues : aucune lecture en direct tant qu'elles ne le sont pas."
+    : heldIds.has(infoDeviceId) ? "Ce tourniquet est en retenue après un effacement : pas de lecture en direct pendant ce temps."
+    : eraseDialog?.deviceId === infoDeviceId ? "L'assistant d'effacement est ouvert pour cet appareil."
+    : status?.deviceSync?.progress?.running && status.deviceSync.progress.deviceId === infoDeviceId
+      ? "Un envoi des utilisateurs est en cours sur cet appareil."
+      : null;
+  const infoIsPullSdk = infoDialog ? protocolOf(infoDialog.cached) === "ZK_PULLSDK" : false;
+  const countsStatus = infoDialog?.counts.status;
+  const infoOpenSeq = infoDialog?.openSeq ?? 0;
+  useEffect(() => {
+    if (infoTab !== "content" || infoDeviceId == null || !infoIsPullSdk) return;
+    if (countsStatus !== "idle" || countsBlockedReason) return;
+    void fetchContentCounts(infoDeviceId, infoOpenSeq);
+  }, [infoTab, infoDeviceId, infoOpenSeq, infoIsPullSdk, countsStatus, countsBlockedReason, fetchContentCounts]);
 
   // Composition by protocol (what really differs between devices) and the access-mode check,
   // counted from the roster on screen -- never assumed.
@@ -885,19 +974,47 @@ export default function DevicesPage() {
         {infoTab === "content" && (
           <div className="flex flex-col gap-3 pb-2">
             {infoProtocol === "ZK_STANDALONE" && <Note>{standaloneNote}</Note>}
+            {infoProtocol === "ZK_PULLSDK" && countsBlockedReason && infoDialog?.counts.status !== "ok" && (
+              <Note tone="warning">Nombre de lignes non lu. {countsBlockedReason}</Note>
+            )}
+            {infoProtocol === "ZK_PULLSDK" && infoDialog?.counts.status === "error" && (
+              <Note tone="error" className="flex flex-wrap items-center gap-2">
+                <span className="min-w-0 flex-1">Nombre de lignes non lu : {infoDialog.counts.error}</span>
+                <ActionButton
+                  size="xs" icon={RefreshCw} disabled={!!countsBlockedReason}
+                  onClick={() => setInfoDialog((p) => p ? { ...p, counts: { status: "idle", values: {}, error: null } } : p)}
+                >
+                  Réessayer
+                </ActionButton>
+              </Note>
+            )}
             <div>
-              {CONTENT_TABLES.map((table) => (
-                <DialogRow key={table.key} label={CONTENT_LABEL[table.key] ?? table.label} hint={<span className="font-mono">table {table.key}</span>}>
-                  <ActionButton
-                    size="sm"
-                    kind={infoDialog?.content.tableName === table.key ? "dark" : "outline"}
-                    onClick={() => void handleFetchContent(table.key)}
-                    disabled={!!infoDialog?.content.loading}
+              {CONTENT_TABLES.map((table) => {
+                const counts = infoDialog?.counts;
+                const n = counts?.status === "ok" ? counts.values[table.key] : undefined;
+                const countText = infoProtocol !== "ZK_PULLSDK" ? null
+                  : counts?.status === "loading" ? <span className="inline-flex items-center gap-1"><Loader2 className="h-3 w-3 animate-spin" />lecture…</span>
+                  : counts?.status === "ok" ? (n != null ? `${n.toLocaleString("fr-FR")} ligne${n > 1 ? "s" : ""}` : "non lu")
+                  : null;
+                return (
+                  <DialogRow
+                    key={table.key}
+                    label={CONTENT_LABEL[table.key] ?? table.label}
+                    hint={<><span className="font-mono">table {table.key}</span>{countText != null && <> · {countText}</>}</>}
                   >
-                    Lire
-                  </ActionButton>
-                </DialogRow>
-              ))}
+                    <StandaloneGate standalone={infoProtocol === "ZK_STANDALONE"} reason={standaloneNote}>
+                      <ActionButton
+                        size="sm"
+                        kind={infoDialog?.content.tableName === table.key ? "dark" : "outline"}
+                        onClick={() => void handleFetchContent(table.key)}
+                        disabled={!!infoDialog?.content.loading || infoProtocol === "ZK_STANDALONE"}
+                      >
+                        Lire
+                      </ActionButton>
+                    </StandaloneGate>
+                  </DialogRow>
+                );
+              })}
             </div>
             <Note>Lit directement les tables du contrôleur (250 lignes max). Pour effacer, utilisez « Effacer le contenu ».</Note>
             {infoDialog?.content.loading && (
@@ -906,7 +1023,7 @@ export default function DevicesPage() {
               </div>
             )}
             {infoDialog?.content.error && <Note tone="error">{infoDialog.content.error}</Note>}
-            {!infoDialog?.content.loading && !infoDialog?.content.error && !infoDialog?.content.tableName && (
+            {infoProtocol === "ZK_PULLSDK" && !infoDialog?.content.loading && !infoDialog?.content.error && !infoDialog?.content.tableName && (
               <p className="py-4 text-center text-[13px] text-muted-foreground">
                 Choisissez une table pour lancer la lecture live.
               </p>
@@ -956,12 +1073,14 @@ export default function DevicesPage() {
           <div className="flex flex-col gap-3 pb-2">
             {infoProtocol === "ZK_STANDALONE" && <Note>{standaloneNote}</Note>}
             <DialogRow label="Récupérer les infos en direct" hint="Connexion TCP via PullSDK : peut échouer si l'appareil n'est pas joignable.">
-              <ActionButton
-                size="sm" kind="dark" icon={infoDialog?.liveLoading ? Loader2 : RefreshCw} spin={!!infoDialog?.liveLoading}
-                onClick={handleFetchLiveInfo} disabled={!!infoDialog?.liveLoading}
-              >
-                {infoDialog?.liveLoading ? "Connexion…" : "Récupérer"}
-              </ActionButton>
+              <StandaloneGate standalone={infoProtocol === "ZK_STANDALONE"} reason={standaloneNote}>
+                <ActionButton
+                  size="sm" kind="dark" icon={infoDialog?.liveLoading ? Loader2 : RefreshCw} spin={!!infoDialog?.liveLoading}
+                  onClick={handleFetchLiveInfo} disabled={!!infoDialog?.liveLoading || infoProtocol === "ZK_STANDALONE"}
+                >
+                  {infoDialog?.liveLoading ? "Connexion…" : "Récupérer"}
+                </ActionButton>
+              </StandaloneGate>
             </DialogRow>
             {infoDialog?.liveError && <Note tone="error">{infoDialog.liveError}</Note>}
             {infoDialog?.live?.params && Object.keys(infoDialog.live.params).length > 0 && (
