@@ -694,7 +694,7 @@ export default function DevicesPage() {
                 <FlexRow key={did} minHeight={60}>
                   <FlexCell
                     flex={2.1}
-                    title={protocol === "ZK_STANDALONE" ? "Connexion gérée en continu par le service — pas de session manuelle." : undefined}
+                    title={protocol === "ZK_STANDALONE" || hasWorker ? "Connexion gérée en continu par le service — pas de session manuelle." : undefined}
                   >
                     <ToneIcon icon={faulty ? WifiOff : Router} tone={state === "connected" ? "primary" : tone} size={34} />
                     <CellText
@@ -764,8 +764,12 @@ export default function DevicesPage() {
                     {/* Manual connect exists only for PullSDK panels. A ZK_STANDALONE
                         terminal is driven by its own COM event sink, which the live
                         worker already owns -- offering "Connect" here would open a
-                        second session and could only ever fail. */}
-                    {!faulty && protocol === "ZK_PULLSDK" && (
+                        second session and could only ever fail. The same holds for a
+                        PullSDK panel this PC's ULTRA worker holds: one connection per
+                        turnstile, so the server refuses a manual session (409
+                        HELD_BY_ULTRA_WORKER) -- offered only to close one already open. */}
+                    {!faulty && protocol === "ZK_PULLSDK"
+                      && !(hasWorker && !connectedIds.has(did)) && (
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <ActionButton

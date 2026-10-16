@@ -3966,6 +3966,9 @@ def _ultra_worker_holding(ctx: _Ctx, device_id: int) -> Any:
     return None
 
 
+_HELD_BY_WORKER_FR = "La connexion à ce tourniquet est tenue par le service ULTRA de ce PC"
+
+
 def _pullsdk_handle(sdk: Any) -> Tuple[Any, bool]:
     """(low-level ``PullSDK``, on_worker) for a fn run by ``_run_on_device_sdk``.
 
@@ -4049,6 +4052,15 @@ def _handle_device_connect(ctx: _Ctx) -> None:
             "error": f"protocol {proto} has no manual PullSDK session",
         })
         return
+    if _ultra_worker_holding(ctx, did) is not None:
+        # One connection per turnstile (guide §3.1a): this PC's ULTRA worker holds it, so a
+        # manual session would be a second one. Same deliberate-refusal shape as above.
+        _logger.info("[LocalAPI] device_connect refused: deviceId=%s held by the ULTRA worker", did)
+        ctx.send_json(409, {
+            "ok": False, "code": "HELD_BY_ULTRA_WORKER",
+            "error": _HELD_BY_WORKER_FR + " : pas de session manuelle en plus.",
+        })
+        return
     sdk, err = _connect_device(ctx, did)
     if err:
         _logger.warning("[LocalAPI] device_connect FAILED: deviceId=%s err=%s", did, err)
@@ -4070,8 +4082,17 @@ def _handle_device_disconnect(ctx: _Ctx) -> None:
     with _device_sdk_lock:
         sdk = _device_sdk_pool.pop(did, None)
     if sdk:
+        # A manual session is always closed, worker or not: refusing would leave it open.
         try: sdk.disconnect()
         except Exception: pass
+    elif _ultra_worker_holding(ctx, did) is not None:
+        # Nothing manual to close. Answering 200 here read as "déconnecté" while the worker
+        # still held the turnstile; the worker's connection is never closed from here.
+        ctx.send_json(409, {
+            "ok": False, "code": "HELD_BY_ULTRA_WORKER",
+            "error": _HELD_BY_WORKER_FR + " : aucune session manuelle à fermer.",
+        })
+        return
     ctx.send_json(200, {"ok": True})
 
 

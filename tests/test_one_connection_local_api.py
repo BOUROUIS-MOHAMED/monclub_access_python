@@ -374,3 +374,52 @@ def test_users_delete_guards_refuse_before_anything_is_queued(writes, guard, cod
     ctx = _Ctx(_app(worker), body={"pin": "101"})
     la2._handle_device_users_delete(ctx)
     assert ctx.last[0] == 409 and ctx.last[1]["code"] == code and worker.calls == []
+
+
+# ─────────────────────── manual session: /connect and /disconnect ───────────────────────
+
+@pytest.fixture()
+def pool(monkeypatch):
+    p = {}
+    monkeypatch.setattr(la2, "_device_sdk_pool", p)
+    return p
+
+
+def test_connect_is_refused_while_the_worker_holds_the_turnstile(pool):
+    ctx = _Ctx(_app(_Worker(_driver(_raw()))))
+    la2._handle_device_connect(ctx)
+    status, payload = ctx.last
+    assert status == 409 and payload["code"] == "HELD_BY_ULTRA_WORKER"
+    assert payload["error"].startswith("La connexion à ce tourniquet est tenue par le service ULTRA")
+    assert pool == {}
+
+
+def test_connect_without_a_worker_still_opens_the_manual_session(pool, monkeypatch):
+    sdk = MagicMock()
+    monkeypatch.setattr(la2, "_connect_device", lambda ctx, did: (sdk, None))
+    ctx = _Ctx(SimpleNamespace(_ultra_engine=SimpleNamespace(running=True, _workers={})))
+    la2._handle_device_connect(ctx)
+    assert ctx.last == (200, {"ok": True}) and pool == {DID: sdk}
+
+
+def test_disconnect_with_nothing_manual_open_does_not_claim_it_disconnected(pool):
+    drv = _driver(_raw())
+    ctx = _Ctx(_app(_Worker(drv)))
+    la2._handle_device_disconnect(ctx)
+    assert ctx.last[0] == 409 and ctx.last[1]["code"] == "HELD_BY_ULTRA_WORKER"
+    drv._sdk.disconnect.assert_not_called()             # the worker's connection is untouched
+
+
+def test_disconnect_always_closes_a_manual_session_even_with_a_worker(pool):
+    manual = MagicMock()
+    pool[DID] = manual
+    ctx = _Ctx(_app(_Worker(_driver(_raw()))))
+    la2._handle_device_disconnect(ctx)
+    assert ctx.last == (200, {"ok": True}) and pool == {}
+    manual.disconnect.assert_called_once()
+
+
+def test_disconnect_without_a_worker_is_unchanged(pool):
+    ctx = _Ctx(SimpleNamespace(_ultra_engine=None))
+    la2._handle_device_disconnect(ctx)
+    assert ctx.last == (200, {"ok": True})
