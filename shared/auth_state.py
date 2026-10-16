@@ -191,6 +191,20 @@ def jwt_session_window(token: str) -> tuple[str | None, str | None]:
     return _epoch_to_utc_iso(claims.get("iat")), _epoch_to_utc_iso(claims.get("exp"))
 
 
+def jwt_account_role(token: str) -> str | None:
+    """The account role from the token's ``roles`` claim, without the ``ROLE_`` prefix
+    (the backend writes ``["ROLE_GYM"]`` or ``["ROLE_ADMIN"]``). None unless there is
+    exactly one role."""
+    roles = (read_jwt_claims(token) or {}).get("roles")
+    if not isinstance(roles, list):
+        return None
+    names = [r.strip() for r in roles if isinstance(r, str) and r.strip()]
+    if len(names) != 1:
+        return None
+    name = names[0]
+    return name[len("ROLE_"):] if name.startswith("ROLE_") else name
+
+
 __all__ = [
     "AuthTokenState",
     "protect_auth_token",
@@ -199,4 +213,5 @@ __all__ = [
     "is_refresh_due",
     "read_jwt_claims",
     "jwt_session_window",
+    "jwt_account_role",
 ]

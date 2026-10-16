@@ -35,6 +35,10 @@ export interface SessionBlock {
    * its claims; null when absent or unreadable. Optional: the TV status omits them. */
   sessionIssuedAt?: string | null;
   sessionExpiresAt?: string | null;
+  /** The token's single role without `ROLE_` ("GYM" | "ADMIN" today); null when unknown. */
+  accountRole?: string | null;
+  /** The gym name cached from GET gym/me for this login; null until fetched or with no gym. */
+  gymName?: string | null;
 }
 
 export interface ModeBlock {

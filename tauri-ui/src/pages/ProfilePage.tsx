@@ -6,9 +6,10 @@
 // polls (session / mode / sync / pullsdk / ultra / updates / deviceSync) plus
 // LocalDbPage's unlock lease. Card P (guide §3.13): the session row reads the
 // stored token's window (sessionIssuedAt → sessionExpiresAt) for its days and
-// bar. Not rendered because no data source exists:
-//   · a person's name or role — SessionBlock only has the e-mail (the account
-//     name is its local part); · the gym name; · a member count.
+// bar; the role comes from the token's `roles` claim; the gym name from
+// GET gym/me, cached per login. Not rendered because no data source exists:
+//   · a person's name — no account that can log in has one on the backend, so
+//     the account name is the e-mail's local part; · a member count.
 
 import { useEffect, useState } from "react";
 import { useApp } from "@/context/AppContext";
@@ -51,6 +52,13 @@ function frDate(iso: string | null): string {
 function plural(n: number, one: string, many: string): string {
   return `${n} ${n > 1 ? many : one}`;
 }
+
+// The backend's two login roles (the Access login refuses the others); an
+// unknown code shows no label rather than a guess.
+const ROLE_LABEL: Record<string, string> = {
+  GYM: "Compte salle",
+  ADMIN: "Administrateur",
+};
 
 export default function ProfilePage() {
   const { status, logout } = useApp();
@@ -110,6 +118,8 @@ export default function ProfilePage() {
 
   const accountName = s.email ? s.email.split("@")[0] : "Compte";
   const avatarLetter = (accountName[0] || "?").toUpperCase();
+  const roleLabel = s.accountRole ? ROLE_LABEL[s.accountRole] : undefined;
+
   // Session row: the token's clock when its window is readable (days, bar and
   // the 7-day warning all from it), otherwise the server's loginDaysRemaining.
   const tw = tokenWindow(s.sessionIssuedAt, s.sessionExpiresAt);
@@ -129,11 +139,15 @@ export default function ProfilePage() {
           <Avatar initials={avatarLetter} tone="primary" size={56} />
           <div className="min-w-0 flex-1">
             <h2 className="m-0 truncate text-[17px] font-bold">{accountName}</h2>
+            {s.gymName && (
+              <div className="truncate text-[13px] font-semibold">{s.gymName}</div>
+            )}
             <div className="truncate text-[13px] text-muted-foreground">
               {s.email ?? "—"} · dernière connexion {frDateTime(s.lastLoginAt)}
             </div>
           </div>
           <div className="flex flex-wrap justify-end gap-1.5">
+            {roleLabel && <Chip tone="grey">{roleLabel}</Chip>}
             {s.restricted ? (
               <>
                 <Chip tone="error">Accès restreint</Chip>

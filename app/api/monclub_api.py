@@ -636,6 +636,30 @@ class MonClubApi:
         except Exception as e:
             raise MonClubApiError(f"erase wizard switch: the answer is not JSON: {e}") from e
 
+    def get_gym_me(self, *, token: str, timeout: int = 10) -> Dict[str, Any]:
+        """``GET {base}/manager/access/v1/gym/me`` -- the logged-in account's gym
+        (backend ``GymAccessController.checkGymAccessLicence``: ``{name, enabled,
+        contract_end_date}``; ``name`` is the literal ``"N/A"`` when the account has no gym).
+        Read for display only (Profil). Returns the parsed JSON object of a 200; raises
+        MonClubApiHttpError on any other status and MonClubApiError on a transport failure or
+        a body that is not a JSON object."""
+        url = f"{self._derive_api_base()}/manager/access/v1/gym/me"
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        try:
+            r = self._session.get(url, headers=headers, timeout=timeout)
+        except Exception as e:
+            raise MonClubApiError(f"gym/me request failed: {e}") from e
+        if r.status_code != 200:
+            raise MonClubApiHttpError(f"gym/me: HTTP {r.status_code}",
+                                      status_code=r.status_code, body=(r.text or "").strip()[:200])
+        try:
+            data = r.json()
+        except Exception as e:
+            raise MonClubApiError(f"gym/me: the answer is not JSON: {e}") from e
+        if not isinstance(data, dict):
+            raise MonClubApiError("gym/me: the answer is not a JSON object")
+        return data
+
     def create_user_fingerprint(self, *, token: str, payload: Dict[str, Any], timeout: int = 25) -> Dict[str, Any]:
         url = (self.endpoints.create_user_fingerprint_url or "").strip()
         if not url:

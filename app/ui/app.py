@@ -723,6 +723,10 @@ class MainApp:
         self._offline_retry_interval_sec = 3600
         self._last_offline_retry_epoch = 0.0
         self._last_sync_online = False
+        # Profil's gym name (GET gym/me): fetched off the sync worker after an online sync.
+        from app.core.gym_info import GymNameRefresher
+
+        self._gym_name_refresher = GymNameRefresher(api_factory=self._api, logger=self.logger)
         # Lifecycle-mutation queue (edit/renew/freeze/balance/delete/taxes on synced members).
         self._offline_mutation_lock = threading.Lock()
         self._last_mutation_retry_epoch = 0.0
@@ -3882,6 +3886,13 @@ class MainApp:
                 self.maybe_run_offline_retry(sync_online=sync_online, source="hourly")
             except Exception:
                 pass
+
+            if sync_online:
+                # Display only (Profil); starts its own thread, never waits here.
+                try:
+                    self._gym_name_refresher.maybe_refresh()
+                except Exception:
+                    self.logger.debug("[GYM-ME] refresh not started", exc_info=True)
 
             try:
                 if sync_run_id is not None:

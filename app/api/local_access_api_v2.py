@@ -847,15 +847,25 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
         "contractEndDate": (contract_meta.get("contractEndDate") if contract_meta else None),
     }
 
-    # Profil (Access v5): the stored access token's window, read from its claims (no signature
-    # check -- display only; the token itself is never sent). Unknown values are None, never guessed.
+    # Profil (Access v5): the stored access token's window and role, read from its claims
+    # (no signature check -- display only; the token itself is never sent), and the gym name
+    # cached from GET gym/me for this login. Unknown values are None, never guessed.
     session["sessionIssuedAt"] = None
     session["sessionExpiresAt"] = None
+    session["accountRole"] = None
+    session["gymName"] = None
     if auth and auth.token:
         try:
-            from shared.auth_state import jwt_session_window
+            from shared.auth_state import jwt_account_role, jwt_session_window
 
             session["sessionIssuedAt"], session["sessionExpiresAt"] = jwt_session_window(auth.token)
+            session["accountRole"] = jwt_account_role(auth.token)
+        except Exception:
+            pass
+        try:
+            from app.core.db import load_gym_name
+
+            session["gymName"] = load_gym_name(auth.email)
         except Exception:
             pass
 
