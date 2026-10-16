@@ -4832,7 +4832,9 @@ the membership in `sync_users` nor `sync_users_held`. `[CODE]`
   or a gym whose turnstiles another PC drives, may have few or none); `user_id` is filled at insert
   by the AGENT and ULTRA writers only, so DEVICE-mode attendance and unresolved events are not
   listed; rows are pruned after the backend `history_retention_days` (`retentionDays` in the
-  answer, from `settings_reader.get_backend_global_settings`) once uploaded (§3.5). The ULTRA writer
+  answer, from `settings_reader.get_backend_global_settings`) once uploaded (§3.5; the prune runs in
+  `device_attendance.py::DeviceAttendanceMaintenanceEngine.run_blocking`, called on every sync tick
+  whatever the mode). The ULTRA writer
   stores `user_id` = the resolved roster row's `userId` (`ultra_engine.py`, `_resolved_user_id`), the
   same id space as `sync_users.user_id`. `[TEST:
   tests/test_member_card_details.py::TestMemberHistory]`
@@ -4868,11 +4870,16 @@ the membership in `sync_users` nor `sync_users_held`. `[CODE]`
    is `False` with no code path setting it: `submit_offline_mutation` queues a money op without a
    live attempt and the drain skips it (`money-gated`), so a renew would wait in the queue forever.
    The flag waits for backend idempotency on `ActiveMembershipController` (see
-   `docs/plans/2026-09-11_gym_agents_in_access_and_offline_verifier.md`).
+   `docs/plans/2026-09-11_gym_agents_in_access_and_offline_verifier.md`); on backend `main`
+   (77fae5eb6) `X-Idempotency-Key` / `clientRequestId` are still handled by other controllers
+   (tax, events, passes, orders), not this one.
 2. Backend `ActiveMembershipController` `/gym/activeMembership/renew` (and `/renew/quote`) calls
    `requireAgentFromCookieIfGym`: a GYM account must send the `currentAgentId` cookie of an agent
    holding `ACTIVE_MEMBERSHIP_MANAGEMENT` + `ACTIVE_MEMBERSHIP_RENEWAL`, else 400 « Please choose a
-   gym agent first ». `monclub_api.py::_lifecycle_request` sends no cookie, and Access has no agent
+   gym agent first ». `monclub_api.py::_lifecycle_request` sends no cookie; its `requests.Session`
+   could only hold one from a `Set-Cookie`, and Access calls no `GymAgentController` endpoint (the
+   one that issues the server-verified `currentAgentId`, `AgentSessionCookieFilter`) while the login
+   answer sets only `token` / `refreshToken`. Access has no agent
    or role data to mirror the gate (`tauri-ui/src/lib/agentMode.ts` is about the AGENT
    `accessDataMode`, not staff accounts). The same helper guards `updateActiveMembership`,
    `deleteActiveMembership` and `ActiveMembershipFreezeController` create/cancel, so Access's
