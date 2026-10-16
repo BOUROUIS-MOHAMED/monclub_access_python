@@ -62,6 +62,28 @@ export function formatDate(value: string | null | undefined): string {
   return Number.isNaN(dt.getTime()) ? value : dt.toLocaleString("fr-FR");
 }
 
+/**
+ * « à l'instant » / « il y a 4 min » / « il y a 2 h » / « il y a 3 j » between a stored
+ * timestamp and `now`. Takes what the server writes: UTC with `Z` / `+00:00`, or the naive
+ * local "YYYY-MM-DD HH:MM:SS" of `now_iso()` (read as local time, like `formatDate`).
+ * null when the value is missing or unreadable, or lies in the future (a clock mismatch):
+ * the caller then shows the clock time instead -- never « dans … ». Callers keep the exact
+ * time in a `title` tooltip (`formatDate`) and refresh through a timer they already have.
+ */
+export function relativeTimeFr(value: string | null | undefined, now: Date | number): string | null {
+  if (!value) return null;
+  const at = new Date(value).getTime();
+  if (Number.isNaN(at)) return null;
+  const sec = Math.floor(((typeof now === "number" ? now : now.getTime()) - at) / 1000);
+  if (sec < 0) return null;
+  if (sec < 60) return "à l'instant";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `il y a ${min} min`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `il y a ${h} h`;
+  return `il y a ${Math.floor(h / 24)} j`;
+}
+
 /** « 850 ms » / « 1,8 s » (same thresholds as before, French decimal comma). */
 export function formatDuration(ms: number | null | undefined): string {
   const value = Number(ms || 0);

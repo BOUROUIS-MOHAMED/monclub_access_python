@@ -5,6 +5,7 @@ import type { AgentDeviceSnap, DeviceDto, DoorPresetDto } from "@/api/types";
 import { useAgentStatus, useDevices } from "@/api/hooks";
 import { useApp } from "@/context/AppContext";
 import { hasAgentDevices } from "@/lib/agentMode";
+import { formatDate, relativeTimeFr } from "@/lib/historyCopy";
 import { cn } from "@/lib/utils";
 import { ActionButton } from "@/components/ui/action-button";
 import { Chip } from "@/components/ui/chip";
@@ -184,11 +185,14 @@ function resolveDeviceStatus(
   return { statusTone: ultraWorker ? "error" : "grey", statusLabel: "Non connecté", connected: false, lastError: "" };
 }
 
-function formatClock(value: string | null | undefined): string {
+// « Dernière sync il y a 2 min »; the clock time when no relative time can be given. The
+// panel re-renders on its existing 3 s agent-status poll, which keeps it current.
+function formatClock(value: string | null | undefined, now: number): string {
   if (!value) return "Aucune sync";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return toStringValue(value, "Aucune sync");
-  return `Dernière sync ${date.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}`;
+  const rel = relativeTimeFr(value, now);
+  return `Dernière sync ${rel ?? date.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}`;
 }
 
 function plural(n: number, word: string): string {
@@ -459,8 +463,11 @@ export default function TrayPanelPage() {
               <div className="mt-[3px] flex min-w-0 items-center gap-1.5 text-[12px] text-muted-foreground">
                 <span className="truncate">{sessionEmail}</span>
                 {!showLoginState && (
-                  <Chip size="sm" tone="grey" className="bg-muted text-foreground">
-                    {formatClock(status?.sync?.lastSyncAt)}
+                  <Chip
+                    size="sm" tone="grey" className="bg-muted text-foreground"
+                    title={status?.sync?.lastSyncAt ? formatDate(status.sync.lastSyncAt) : undefined}
+                  >
+                    {formatClock(status?.sync?.lastSyncAt, Date.now())}
                   </Chip>
                 )}
                 {!showLoginState && hasAgentDevices(status) && (
