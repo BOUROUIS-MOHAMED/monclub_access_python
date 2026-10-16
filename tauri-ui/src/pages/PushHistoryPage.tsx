@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Eye, Loader2, RefreshCw, Send } from "lucide-react";
+import { CircleCheck, CircleX, Eye, Hash, Loader2, RefreshCw, Send, TriangleAlert } from "lucide-react";
 
 import { get } from "@/api/client";
 import type {
@@ -8,58 +8,19 @@ import type {
   PushBatchPinsResponse,
   PushPinHistoryRow,
 } from "@/api/types";
-import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { usePageChrome } from "@/context/PageChromeContext";
+import { ActionButton } from "@/components/ui/action-button";
+import { Chip } from "@/components/ui/chip";
+import { FilterSelect } from "@/components/ui/filter-select";
+import { CellText, FlexCell, FlexRow, FlexTable } from "@/components/ui/flex-table";
+import { KpiCard, KpiRow } from "@/components/ui/kpi-card";
+import { Note, PageGrid, Panel, PanelHeader } from "@/components/ui/panel";
+import { INK } from "@/components/ui/tone";
 import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+  PIN_OPERATION, PUSH_POLICY, STATUS_FILTER_OPTIONS, formatDate, formatDuration, runStatus,
+} from "@/lib/historyCopy";
 
-function formatDate(value: string | null | undefined): string {
-  if (!value) return "—";
-  const dt = new Date(value);
-  return Number.isNaN(dt.getTime()) ? value : dt.toLocaleString("fr-FR");
-}
-
-function formatDuration(ms: number | null | undefined): string {
-  const value = Number(ms || 0);
-  if (!value) return "—";
-  if (value < 1000) return `${value} ms`;
-  return `${(value / 1000).toFixed(1)} s`;
-}
-
-function statusVariant(status: string) {
-  switch (String(status || "").toUpperCase()) {
-    case "SUCCESS":
-      return "success" as const;
-    case "PARTIAL":
-      return "warning" as const;
-    case "FAILED":
-      return "destructive" as const;
-    default:
-      return "outline" as const;
-  }
-}
-
-function StatsCard({ label, value }: { label: string; value: number }) {
-  return (
-    <Card className="py-4">
-      <CardHeader className="pb-2">
-        <CardTitle className="text-sm text-muted-foreground">{label}</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <div className="text-2xl font-semibold">{value}</div>
-      </CardContent>
-    </Card>
-  );
-}
+const policyLabel = (p: string) => PUSH_POLICY[p] ?? p ?? "—";
 
 export default function PushHistoryPage() {
   const [rows, setRows] = useState<PushBatchHistoryRow[]>([]);
@@ -124,219 +85,156 @@ export default function PushHistoryPage() {
     }
   }, []);
 
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between gap-3 flex-wrap">
-        <div className="flex items-center gap-3">
-          <Send className="h-5 w-5 text-primary" />
-          <h1 className="text-lg font-semibold">Historique push</h1>
-          <Badge variant="secondary" className="text-xs">{total}</Badge>
-        </div>
-        <div className="flex items-center gap-2 flex-wrap">
-          <Input
+  usePageChrome(() => ({
+    subtitle: `Ce poste → appareils · ${total} envoi${total > 1 ? "s" : ""} conservé${total > 1 ? "s" : ""} (30 jours)`,
+    actions: (
+      <>
+        <div className="flex h-9 items-center gap-[7px] rounded-lg border border-grey/32 bg-card px-3 focus-within:border-primary">
+          <Hash className="h-[17px] w-[17px] shrink-0 text-muted-foreground" aria-hidden="true" />
+          <input
             value={deviceIdFilter}
             onChange={(event) => setDeviceIdFilter(event.target.value)}
-            placeholder="Filtrer par deviceId"
-            className="w-[170px]"
+            placeholder="N° d'appareil"
+            aria-label="Filtrer par numéro d'appareil"
+            className="w-[110px] bg-transparent text-[14px] font-bold text-foreground outline-none placeholder:font-semibold placeholder:text-muted-foreground"
           />
-          <Select value={statusFilter} onValueChange={setStatusFilter}>
-            <SelectTrigger className="w-[170px]">
-              <SelectValue placeholder="Statut" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="__all">Tous les statuts</SelectItem>
-              <SelectItem value="SUCCESS">SUCCESS</SelectItem>
-              <SelectItem value="PARTIAL">PARTIAL</SelectItem>
-              <SelectItem value="FAILED">FAILED</SelectItem>
-              <SelectItem value="IN_PROGRESS">IN_PROGRESS</SelectItem>
-            </SelectContent>
-          </Select>
-          <Button size="sm" variant="outline" onClick={() => void load()} disabled={loading}>
-            <RefreshCw className={loading ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
-            Recharger
-          </Button>
         </div>
-      </div>
+        <FilterSelect label="Statut" value={statusFilter} options={STATUS_FILTER_OPTIONS} onChange={setStatusFilter} />
+        <ActionButton kind="outline" icon={RefreshCw} spin={loading} onClick={() => void load()} disabled={loading}>
+          Recharger
+        </ActionButton>
+      </>
+    ),
+  }), [total, deviceIdFilter, statusFilter, loading, load]);
 
-      {error && (
-        <Alert variant="destructive">
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      )}
+  const filtered = statusFilter !== "__all" || !!deviceIdFilter.trim();
+  const sel = selectedBatch;
+  const selStatus = sel ? runStatus(sel.status) : null;
 
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-        <StatsCard label="Batches chargés" value={rows.length} />
-        <StatsCard label="SUCCESS" value={stats.success} />
-        <StatsCard label="PARTIAL" value={stats.partial} />
-        <StatsCard label="Pins en échec" value={pinsFailed} />
-      </div>
+  return (
+    <div className="flex flex-col gap-[18px]">
+      {error && <Note tone="error">{error}</Note>}
 
-      <Card className="py-4">
-        <CardHeader>
-          <CardTitle className="text-sm">Pushs récents vers les appareils</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {loading ? (
-            <div className="py-10 flex justify-center">
-              <Loader2 className="h-6 w-6 animate-spin text-primary" />
-            </div>
+      <KpiRow cols={4}>
+        <KpiCard label="Envois chargés" value={rows.length} sub="les plus récents" icon={Send} tone="primary" />
+        <KpiCard label="Réussis" value={stats.success} sub="sur les envois chargés" icon={CircleCheck} tone="success" />
+        <KpiCard label="Partiels" value={stats.partial} sub="au moins un PIN en échec" icon={TriangleAlert} tone="warning" subTone={stats.partial > 0 ? "warning" : undefined} />
+        <KpiCard label="PIN en échec" value={pinsFailed} sub="sur les envois chargés" icon={CircleX} tone="error" subTone={pinsFailed > 0 ? "error" : undefined} />
+      </KpiRow>
+
+      <PageGrid>
+        <Panel className="col-span-7">
+          <PanelHeader title="Envois récents vers les appareils" sub="Les 100 plus récents pour les filtres choisis" />
+          <FlexTable
+            label="Envois récents vers les appareils"
+            columns={[
+              { label: "Date", flex: 1.35 },
+              { label: "Appareil", flex: 1.3 },
+              { label: "Politique", flex: 1.1 },
+              { label: "Statut", flex: 0.75 },
+              { label: "PIN", flex: 0.75, align: "right" },
+              { label: "", flex: 0.4, align: "right" },
+            ]}
+            empty={loading ? (
+              <Loader2 className="mx-auto h-6 w-6 animate-spin text-primary" />
+            ) : filtered ? (
+              // Do not blame filters that are not set.
+              "Aucun envoi trouvé pour les filtres actuels."
+            ) : (
+              <span className="block space-y-1">
+                <span className="block">Aucun envoi enregistré.</span>
+                <span className="block text-[12px]">
+                  Les envois de ce poste vers les appareils apparaissent ici au fil des synchronisations.
+                </span>
+              </span>
+            )}
+          >
+            {loading ? null : rows.map((row) => {
+              const st = runStatus(row.status);
+              return (
+                <FlexRow key={row.id} selected={sel?.id === row.id}>
+                  <FlexCell flex={1.35}>
+                    <CellText title={formatDate(row.created_at)} sub={formatDuration(row.duration_ms)} mono subMono titleClassName="text-[12.5px] text-muted-foreground" />
+                  </FlexCell>
+                  <FlexCell flex={1.3}><CellText title={row.device_name || "—"} sub={`appareil #${row.device_id}`} strong /></FlexCell>
+                  <FlexCell flex={1.1}><CellText title={policyLabel(row.policy)} sub={row.policy} subMono /></FlexCell>
+                  <FlexCell flex={0.75}><Chip tone={st.tone}>{st.l}</Chip></FlexCell>
+                  <FlexCell flex={0.75} align="right">
+                    <CellText
+                      title={`${row.pins_success} / ${row.pins_attempted}`}
+                      sub={row.pins_failed > 0 ? `${row.pins_failed} KO` : ""}
+                      titleClassName="font-bold"
+                      subClassName={INK.error}
+                    />
+                  </FlexCell>
+                  <FlexCell flex={0.4} align="right">
+                    <ActionButton kind="outline" size="xs" iconOnly icon={Eye} title="Voir le détail" onClick={() => void openDetail(row.id)}>Voir le détail</ActionButton>
+                  </FlexCell>
+                </FlexRow>
+              );
+            })}
+          </FlexTable>
+        </Panel>
+
+        <Panel className="col-span-5">
+          {detailLoading && !sel ? (
+            <div className="flex justify-center py-10"><Loader2 className="h-6 w-6 animate-spin text-primary" /></div>
+          ) : sel && selStatus ? (
+            <>
+              <PanelHeader
+                title={`${sel.device_name || `Appareil #${sel.device_id}`} · ${selStatus.l}`}
+                sub={[
+                  formatDate(sel.created_at),
+                  formatDuration(sel.duration_ms),
+                  policyLabel(sel.policy),
+                  sel.sync_run_id != null ? `run #${sel.sync_run_id}` : "",
+                ].filter(Boolean).join(" · ")}
+              />
+              <div className="flex flex-wrap gap-1.5 px-[18px] pt-3">
+                <Chip tone="grey">{sel.pins_attempted} tentés</Chip>
+                <Chip tone="success">{sel.pins_success} OK</Chip>
+                <Chip tone={sel.pins_failed > 0 ? "error" : "grey"}>{sel.pins_failed} KO</Chip>
+              </div>
+              {sel.error_message && <Note tone="warning" className="mx-[18px] mt-3">{sel.error_message}</Note>}
+              <FlexTable
+                label="Détail par PIN"
+                columns={[
+                  { label: "PIN", flex: 0.6 },
+                  { label: "Membre", flex: 1.6 },
+                  { label: "Statut", flex: 0.8, align: "right" },
+                ]}
+                empty="Aucun détail par PIN pour cet envoi. Les terminaux autonomes n'enregistrent que le total."
+              >
+                {selectedPins.map((pin) => {
+                  const ps = runStatus(pin.status);
+                  const op = PIN_OPERATION[pin.operation] ?? pin.operation;
+                  return (
+                    <FlexRow key={pin.id} minHeight={52}>
+                      <FlexCell flex={0.6}><CellText title={pin.pin} mono /></FlexCell>
+                      <FlexCell flex={1.6} title={pin.error_message || ""}>
+                        <CellText
+                          title={pin.full_name || "—"}
+                          sub={pin.error_message || `${op} · ${formatDuration(pin.duration_ms)}`}
+                          strong
+                          subClassName={pin.error_message ? INK.error : undefined}
+                        />
+                      </FlexCell>
+                      <FlexCell flex={0.8} align="right"><Chip tone={ps.tone}>{ps.l}</Chip></FlexCell>
+                    </FlexRow>
+                  );
+                })}
+              </FlexTable>
+            </>
           ) : (
-            <div className="rounded-md border overflow-auto">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Date</TableHead>
-                    <TableHead>Appareil</TableHead>
-                    <TableHead>Sync run</TableHead>
-                    <TableHead>Policy</TableHead>
-                    <TableHead>Statut</TableHead>
-                    <TableHead>Pins</TableHead>
-                    <TableHead>Durée</TableHead>
-                    <TableHead className="text-right">Détails</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {rows.length > 0 ? rows.map((row) => (
-                    <TableRow key={row.id}>
-                      <TableCell className="text-xs whitespace-nowrap">{formatDate(row.created_at)}</TableCell>
-                      <TableCell>
-                        <div className="flex flex-col">
-                          <span className="font-medium">{row.device_name}</span>
-                          <span className="text-xs text-muted-foreground font-mono">deviceId={row.device_id}</span>
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-xs font-mono">{row.sync_run_id ?? "—"}</TableCell>
-                      <TableCell className="text-xs">{row.policy}</TableCell>
-                      <TableCell>
-                        <Badge variant={statusVariant(row.status)}>{row.status}</Badge>
-                      </TableCell>
-                      <TableCell className="text-xs">
-                        {row.pins_success}/{row.pins_attempted}
-                        {row.pins_failed > 0 ? <span className="text-destructive"> ({row.pins_failed} KO)</span> : null}
-                      </TableCell>
-                      <TableCell className="text-xs">{formatDuration(row.duration_ms)}</TableCell>
-                      <TableCell className="text-right">
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          className="gap-1.5"
-                          onClick={() => void openDetail(row.id)}
-                        >
-                          <Eye className="h-4 w-4" />
-                          Voir
-                        </Button>
-                      </TableCell>
-                    </TableRow>
-                  )) : (
-                    <TableRow>
-                      <TableCell colSpan={8} className="text-center py-10 text-sm text-muted-foreground">
-                        {/* Do not blame filters that are not set. On a gym whose only
-                            terminal is autonomous this is the ONLY message the page
-                            ever shows, and it sent operators hunting for a filter to
-                            clear that did not exist. */}
-                        {(statusFilter !== "__all" || deviceIdFilter.trim()) ? (
-                          "Aucun batch trouvé pour les filtres actuels."
-                        ) : (
-                          <span className="block space-y-1">
-                            <span className="block">Aucun batch enregistré.</span>
-                            <span className="block text-[12px]">
-                              Les batches sont enregistrés pour les centrales PullSDK. Les
-                              terminaux autonomes reçoivent leur liste via le service temps
-                              réel, qui n'enregistre pas de batch ici&nbsp;: consultez
-                              «&nbsp;Historique sync&nbsp;» et les journaux.
-                            </span>
-                          </span>
-                        )}
-                      </TableCell>
-                    </TableRow>
-                  )}
-                </TableBody>
-              </Table>
-            </div>
+            <>
+              <PanelHeader title="Détail par PIN" />
+              <div className="px-[18px] pb-5 pt-2 text-[13.5px] text-muted-foreground">
+                Choisissez un envoi (<Eye className="inline h-3.5 w-3.5 align-[-2px]" />) pour voir chaque PIN écrit sur l'appareil.
+              </div>
+            </>
           )}
-        </CardContent>
-      </Card>
-
-      <Dialog
-        open={!!selectedBatch || detailLoading}
-        onOpenChange={(open) => {
-          if (!open) {
-            setSelectedBatch(null);
-            setSelectedPins([]);
-          }
-        }}
-      >
-        <DialogContent className="max-w-5xl max-h-[85vh] overflow-auto">
-          <DialogHeader>
-            <DialogTitle>Détail du batch push</DialogTitle>
-          </DialogHeader>
-          {detailLoading && !selectedBatch ? (
-            <div className="py-10 flex justify-center">
-              <Loader2 className="h-6 w-6 animate-spin text-primary" />
-            </div>
-          ) : selectedBatch ? (
-            <div className="space-y-4">
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-                <StatsCard label="Pins tentés" value={selectedBatch.pins_attempted} />
-                <StatsCard label="Pins OK" value={selectedBatch.pins_success} />
-                <StatsCard label="Pins KO" value={selectedBatch.pins_failed} />
-                <Card className="py-4">
-                  <CardHeader className="pb-2">
-                    <CardTitle className="text-sm text-muted-foreground">Statut</CardTitle>
-                  </CardHeader>
-                  <CardContent className="space-y-2">
-                    <Badge variant={statusVariant(selectedBatch.status)}>{selectedBatch.status}</Badge>
-                    <div className="text-xs text-muted-foreground">
-                      {selectedBatch.device_name} · {formatDuration(selectedBatch.duration_ms)}
-                    </div>
-                  </CardContent>
-                </Card>
-              </div>
-
-              {selectedBatch.error_message && (
-                <Alert variant="warning">
-                  <AlertDescription>{selectedBatch.error_message}</AlertDescription>
-                </Alert>
-              )}
-
-              <div className="rounded-md border overflow-auto">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>PIN</TableHead>
-                      <TableHead>Nom</TableHead>
-                      <TableHead>Opération</TableHead>
-                      <TableHead>Statut</TableHead>
-                      <TableHead>Durée</TableHead>
-                      <TableHead>Erreur</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {selectedPins.length > 0 ? selectedPins.map((pin) => (
-                      <TableRow key={pin.id}>
-                        <TableCell className="font-mono text-xs">{pin.pin}</TableCell>
-                        <TableCell className="text-xs">{pin.full_name || "—"}</TableCell>
-                        <TableCell className="text-xs">{pin.operation}</TableCell>
-                        <TableCell>
-                          <Badge variant={statusVariant(pin.status)}>{pin.status}</Badge>
-                        </TableCell>
-                        <TableCell className="text-xs">{formatDuration(pin.duration_ms)}</TableCell>
-                        <TableCell className="text-xs">{pin.error_message || "—"}</TableCell>
-                      </TableRow>
-                    )) : (
-                      <TableRow>
-                        <TableCell colSpan={6} className="text-center py-8 text-sm text-muted-foreground">
-                          Aucun détail pin disponible pour ce batch.
-                        </TableCell>
-                      </TableRow>
-                    )}
-                  </TableBody>
-                </Table>
-              </div>
-            </div>
-          ) : null}
-        </DialogContent>
-      </Dialog>
+        </Panel>
+      </PageGrid>
     </div>
   );
 }
