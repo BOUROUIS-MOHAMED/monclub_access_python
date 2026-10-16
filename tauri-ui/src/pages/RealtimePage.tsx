@@ -62,12 +62,16 @@ export default function RealtimePage() {
 
   useEffect(() => { load(); const id = setInterval(load, 10_000); return () => clearInterval(id); }, [load]);
   const isReader = status?.role === "READER";
-  useEffect(() => { if (isReader || (status?.readerOf?.length ?? 0) > 0) loadHistory(null); }, [isReader, status?.readerOf?.length, loadHistory]);
+  const showsHistory = isReader || (status?.readerOf?.length ?? 0) > 0;
+  useEffect(() => { if (showsHistory) loadHistory(null); }, [showsHistory, status?.readerOf?.length, loadHistory]);
+
+  // « Actualiser » also reloads the door history when it is on screen (the only retry after a failed load).
+  const refresh = useCallback(() => { void load(); if (showsHistory) void loadHistory(null); }, [load, loadHistory, showsHistory]);
 
   usePageChrome(() => ({
     subtitle: isReader ? "Ce PC lit l'historique, il n'écrit dans aucun tourniquet" : "Qui écrit dans quel tourniquet",
-    actions: <ActionButton kind="outline" icon={RefreshCw} onClick={load}>Actualiser</ActionButton>,
-  }), [isReader, load]);
+    actions: <ActionButton kind="outline" icon={RefreshCw} onClick={refresh}>Actualiser</ActionButton>,
+  }), [isReader, refresh, showsHistory]);
 
   if (!status) {
     return error
@@ -145,7 +149,7 @@ export default function RealtimePage() {
         </Panel>
       )}
 
-      {(isReader || status.readerOf.length > 0) && (
+      {showsHistory && (
         <Panel>
           <PanelHeader title="Historique des portes" sub="Depuis le serveur · tourniquets des PC pilotes suivis" />
           {historyError && <Note tone="error" className="mx-[18px] mt-3">Historique non chargé : {historyError}</Note>}
@@ -160,7 +164,7 @@ export default function RealtimePage() {
             ]}
             empty={loadingHistory
               ? <Loader2 className="mx-auto h-5 w-5 animate-spin text-primary" />
-              : "Aucun passage à afficher."}
+              : historyError ? "Historique non chargé." : "Aucun passage à afficher."}
             footer={
               <>
                 {nextBefore && (
