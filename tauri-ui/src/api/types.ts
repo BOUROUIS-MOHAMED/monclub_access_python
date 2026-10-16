@@ -476,6 +476,66 @@ export interface OfflineQueueListResponse {
   states: OfflineCreationState[];
 }
 
+// ─── Utilisateurs member card (GET /api/v2/members/{activeMembershipId}/card) ───
+// Read only when the card opens. Local copy of the server's data; no template, no secret.
+export interface MemberCardFingerprint {
+  fingerId: number | null;
+  label: string | null;
+  enabled: boolean;
+}
+
+export interface MemberCardResponse {
+  ok: boolean;
+  activeMembershipId: number;
+  userId: number | null;
+  /** The row sits in sync_users_held (off the turnstile roster for the gym date). */
+  held: boolean;
+  fingerprintCount: number;
+  fingerprints: MemberCardFingerprint[];
+  /** QR (TOTP) credentials granting this membership — state only, never the secret. */
+  qrCredentials: { enabled: boolean; rotatedAt: string | null; updatedAt: string | null }[];
+  /** The sync_users_held hold (reason frozen | expired | not_started, gym date), null on the roster. */
+  hold: { reason: string | null; forDate: string | null; at: string | null } | null;
+  /** Protocol-2 freeze days; null when this PC cannot say (no/untrusted windows, no window). */
+  freeze: {
+    gymDate: string;
+    frozenToday: boolean;
+    /** offDays after the gym date — freeze start/end dates are not synced. */
+    nextFreezeDays: string[];
+    beyondHorizon: boolean;
+    horizonEnd: string | null;
+  } | null;
+}
+
+// GET /api/v2/members/{activeMembershipId}/history?limit= — door events THIS PC stored for the
+// person behind the membership (rows with no resolved member are not attributable).
+export interface MemberHistoryRow {
+  id: number;
+  /** Local wall clock "YYYY-MM-DDTHH:MM:SS" (event time, else the PC's receive time). */
+  at: string;
+  allowed: boolean;
+  /** Raw refusal code; word it with aDenyCopy(reason).short. */
+  reason: string;
+  deviceId: number | null;
+  deviceName: string;
+  doorId: number | null;
+  /** CARD | FINGER_PRINT | QR_CODE … (same source as the dashboard feed). */
+  method: string;
+  /** The membership the event was resolved to (may be another plan of the same person). */
+  activeMembershipId: number | null;
+  source: string;
+}
+
+export interface MemberHistoryResponse {
+  ok: boolean;
+  activeMembershipId: number;
+  userId: number | null;
+  limit: number;
+  /** Backend history_retention_days (what the local prune uses), null if unknown. */
+  retentionDays: number | null;
+  rows: MemberHistoryRow[];
+}
+
 // ─── E) Local fingerprints (GET /api/v2/fingerprints) ───
 export interface LocalFingerprintDto {
   id: number;

@@ -2017,6 +2017,89 @@ def _handle_members_roster(ctx: _Ctx) -> None:
     })
 
 
+def _handle_member_card(ctx: _Ctx) -> None:
+    """GET /api/v2/members/{activeMembershipId}/card -- the member card's extra lines for ONE
+    membership, read when the card opens (never per roster row). Local copy only, works
+    offline. Never returns a fingerprint template. 404 when this PC holds no row for it."""
+    from app.core.db import get_member_card_details
+
+    amid = ctx.param_int("activeMembershipId", 0)
+    if amid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "a positive activeMembershipId is required"})
+        return
+    details = get_member_card_details(amid)
+    if details is None:
+        ctx.send_json(404, {"ok": False, "error": "membership not on this PC"})
+        return
+    ctx.send_json(200, {"ok": True, **details})
+
+
+def _handle_member_history(ctx: _Ctx) -> None:
+    """GET /api/v2/members/{activeMembershipId}/history?limit= -- the latest door events this PC
+    stored for the person behind the membership (db.list_member_access_history), shaped like
+    the dashboard feed: time (event time, else the PC's receive time), device name, door,
+    allowed, raw refusal code (the UI words it), method. ``retentionDays`` is the backend
+    history_retention_days the prune uses. 404 when this PC holds no row for the membership."""
+    from app.core.db import list_member_access_history
+    from app.core.device_attendance import (
+        _credential_type_from_raw,
+        _load_json_object,
+        _lower_keys,
+        _normalize_datetime_text,
+    )
+
+    amid = ctx.param_int("activeMembershipId", 0)
+    if amid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "a positive activeMembershipId is required"})
+        return
+    res = list_member_access_history(amid, limit=ctx.q_int("limit", default=20))
+    if res is None:
+        ctx.send_json(404, {"ok": False, "error": "membership not on this PC"})
+        return
+
+    device_names: Dict[int, str] = {}
+    try:
+        from access.store import list_sync_devices_payload
+
+        for dev in list_sync_devices_payload() or []:
+            did = _safe_int(dev.get("id") or dev.get("deviceId"), 0)
+            if did > 0:
+                device_names[did] = _safe_str(dev.get("name"), "")
+    except Exception:
+        pass
+    retention = None
+    try:
+        from app.core.settings_reader import get_backend_global_settings
+
+        retention = _safe_int((get_backend_global_settings() or {}).get("history_retention_days"), 0) or None
+    except Exception:
+        retention = None
+
+    out: List[Dict[str, Any]] = []
+    for r in res["rows"]:
+        did = _safe_int(r.get("device_id"), 0) if r.get("device_id") is not None else None
+        out.append({
+            "id": r.get("id"),
+            "at": _normalize_datetime_text(r.get("event_time"), fallback=r.get("created_at")),
+            "allowed": bool(r.get("allowed")),
+            "reason": _safe_str(r.get("reason"), ""),
+            "deviceId": did,
+            "deviceName": device_names.get(int(did or 0), ""),
+            "doorId": r.get("door_id"),
+            "method": _credential_type_from_raw(_lower_keys(_load_json_object(r.get("raw_json")))),
+            "activeMembershipId": r.get("active_membership_id"),
+            "source": _safe_str(r.get("history_source"), ""),
+        })
+    ctx.send_json(200, {
+        "ok": True,
+        "activeMembershipId": amid,
+        "userId": res["userId"],
+        "limit": res["limit"],
+        "retentionDays": retention,
+        "rows": out,
+    })
+
+
 def _handle_member_photo(ctx: _Ctx) -> None:
     """Attach a member photo. For a SYNCED member (real activeMembershipId) it uploads
     immediately via the managed-media presign flow; for an OFFLINE-PENDING member
@@ -3704,13 +3787,18 @@ def _handle_member_mutation(ctx: _Ctx) -> None:
 
 
 def _handle_mutations_list(ctx: _Ctx) -> None:
-    from app.core.db import list_offline_mutations, count_offline_mutations
+    from app.core.db import annotate_offline_mutation_targets, list_offline_mutations, count_offline_mutations
     raw = ctx.q("state", "states", default="")
     states = [s.strip().lower() for s in raw.replace(";", ",").split(",") if s.strip()] or None
     include_archived = _safe_str(ctx.q("includeArchived", "include", default=""), "") in ("1", "true")
     limit = ctx.q_int("limit", default=200)
     offset = ctx.q_int("offset", default=0)
     rows = list_offline_mutations(states=states, include_archived=include_archived, limit=limit, offset=offset)
+    # Display names for the UI only (Card M 8); a failed lookup leaves the rows as they were.
+    try:
+        annotate_offline_mutation_targets(rows)
+    except Exception:
+        pass
     total = count_offline_mutations(states=states, include_archived=include_archived)
     ctx.send_json(200, {"ok": True, "rows": rows, "total": total})
 

@@ -65,6 +65,7 @@ This file is only useful while it is true. If you change any of the following, y
 | What a turnstile's heartbeat line reports as waiting (`device_sync.py::count_waiting_pins`, `ultra_engine.py::_count_waiting_pins` and the snapshot's `failed_pins`, `_sync_one_device`'s `_last_waiting_pins`, `realtime_agent.py::get_status_snapshot`'s `failedPins`, `pc_identity.py::build_heartbeat_payload`, `::_report_held_turnstiles` and its `held` key, `erase_wizard.py::held_waiting_count`, the wizard's `_set_waiting`) | §3.10 |
 | Who writes to `access.db` — the DbWriter, `_run_db_write_sync` (its lanes, `priority=`, the inline nested call, the 60 s wait), a write outside it, the tripwire's allowlist (`tests/test_db_single_writer.py::ALLOWED_DIRECT`), which writes are in the door lane (`db.py::insert_access_history`, `::save_agent_rtlog_state`), the AGENT history claim (`realtime_agent.py::DecisionService.run`'s `F-013` block) | §3.11 |
 | The member fee lines of the entry screen -- what is stored, how it reaches the popup, how the screen judges and draws it (`db.py::_member_fees_json`, `::_member_fees_list`, `::_ensure_column_forcing_refresh`, `sync_users.fees_json` in `_SYNC_USER_COLUMNS` and the five member writers, `sync_access_software_settings.fee_due_soon_days`, `settings_reader.py::normalize_global_settings`'s `fee_due_soon_days`, `access_types.py::NotificationRequest.fees`, `ultra_engine.py::_enqueue_notification(user_fees=)`, `ultra_pc_entry.py::member_popup_fields`, `realtime_agent.py::_popup_payload_from_request`, `tauri-ui/src/lib/feeAlerts.ts`, `PopupWindow.tsx` `AFeeLine` / `AFeeMark`) | §3.12 |
+| The Utilisateurs member card data and the mutation-queue names (`db.py::get_member_card_details`, `::_member_row_for_card`, `::_member_freeze_facts`, `::_list_held_users_for_roster` and its call in `::list_members_roster`, `::list_member_access_history`, `::annotate_offline_mutation_targets`, `local_access_api_v2.py::_handle_member_card`, `::_handle_mutations_list`'s names, `::_handle_member_history`, `tauri-ui/src/pages/UsersPage.tsx` `cardDetailLine`) | §3.14 |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -1801,6 +1802,8 @@ Access desktop UI (`tauri-ui/src`) was grepped in this repo. `[CODE]`
 | `GET /api/v2/push-history/{batchId}/pins`, `GET /api/v2/devices/{deviceId}/mirror-plan`, `GET /api/v2/db/access-history`, `GET /api/v2/popup/poll` | — | Raw pins / stored rows / engine-enriched notifications, no pin → member mapping in the handler (`popup/poll` payloads are enriched by `_handle_allow`, which is converted) | Display only |
 | `POST /api/v2/members/photo`, `POST /api/v2/members/mutation`, `POST /api/v2/enroll/retry-push` | `activeMembershipId` / `targetId` | Backend-side membership ids; no device pin | n/a |
 | `GET /api/v2/sync/cache/users`, `GET /api/v2/members` (`_handle_members_roster`) | paging/filter | Cached rows; they now also carry `mainAccountId` | n/a |
+| `GET /api/v2/members/{activeMembershipId}/card` (`_handle_member_card`, tauri-ui UsersPage member card) | path id | One membership's extra card lines from the local copy (§3.14); no device pin | n/a |
+| `GET /api/v2/members/{activeMembershipId}/history` (`_handle_member_history`, tauri-ui UsersPage member card) | path id, `limit` | `access_history` rows by the membership's `user_id` (stored at insert); no pin → member mapping in the handler (§3.14) | Display only |
 | `POST /api/v2/devices/{deviceId}/force-resync` | — | `clear_device_sync_hashes` (UPDATE) + scheduler `force_resync` | n/a |
 
 `[UNVERIFIED]` Whether any dashboard or UI screen calls `users/push` or `users/delete` with a pin: the
@@ -3875,7 +3878,7 @@ no `tzdata`, so `zoneinfo.ZoneInfo('Africa/Tunis')` raises; the Tunis offset is 
 | `access_v2_state` (one row) | the last `syncMeta`, `trusted`, the clock (`server_epoch`, `utc_offset_sec`, `skew_sec`, `floor_date`, `max_pc_epoch`, `clock_suspect`, `clock_reason`), `applied_date`, `grace_days`. NOT cleared by `clear_version_tokens` |
 | `member_access_window` | the window of every membership of today's set; replaced whole by each members section |
 | `sync_upcoming_users`, `sync_upcoming_credentials` | `upcoming[]` / `upcomingCredentials` exactly as last sent (the row's JSON; credentials stored disabled) |
-| `sync_users_held` | rows of today's set taken off the roster for a later gym date; the same 20 columns as `sync_users` (`_SYNC_USER_COLUMNS`) + reason/date |
+| `sync_users_held` | rows of today's set taken off the roster for a later gym date; the same 20 columns as `sync_users` (`_SYNC_USER_COLUMNS`) + reason/date. Also listed, flagged, on the Utilisateurs roster and member card (§3.14) |
 | `member_person_link` | membership → `userId` (+ `mainAccountId`), never deleted; written with `member_account_link` by every `sync_users` writer (no `mainAccountId` filter), back-filled at `init_db` — used by §3.4f |
 
 `windowsVersion` lives in `sync_version_tokens` (so logout and hard reset drop it and the request
@@ -4790,6 +4793,102 @@ renouveler. », the last line ending « +N autre(s) »; `AMulti` puts one small 
 tile's photo (red when a fee is unpaid, else gold). `[TEST: tauri-ui src/lib/feeAlerts.test.ts
 (npm test)]` The layout on a real entry TV with two fee lines and the gold expiry footer together
 is `[UNVERIFIED]`: checked by type-check and by reading the 1280×720 stage sizes only.
+
+### 3.14 The Utilisateurs member card data (Access v5 Card M, 2026-10-16)
+
+The member card (Utilisateurs › Répertoire › « Voir la fiche ») shows lines the roster row does not
+carry. They come from `GET /api/v2/members/{activeMembershipId}/card` (`_handle_member_card` →
+`db.py::get_member_card_details`), called by `UsersPage.tsx` only when a card is open — once when it
+opens and again after each roster reload — never per roster row, and never for an offline-created
+member (no server id yet: the card says « après synchronisation »). 404 when this PC holds no row for
+the membership in `sync_users` nor `sync_users_held`. `[CODE]`
+
+- **Fingerprints (« Empreintes »).** `_member_row_for_card` reads that ONE row's `fingerprints_json`
+  (from `sync_users`, else `sync_users_held`); the answer carries `fingerprintCount` and, per entry,
+  `fingerId` / `label` / `enabled` — never `templateData`. The roster keeps its template-free read
+  (`list_members_roster` → `include_templates=False`, the 8.8 s field measurement of
+  `list_sync_users_page`). The count is the local copy of the server's member row, like Enrôlement's
+  « Déjà enregistrées ». `[TEST: tests/test_member_card_details.py::TestFingerprintCount,
+  ::TestCardEndpoint]`
+- **QR (« QR code (application) »).** The rows of `sync_gym_access_credentials` — today's list as
+  the server sent it — whose `granted_active_membership_ids_json`, parsed as JSON (never a text
+  match: 12 must not match 123), contains the membership. The answer carries `enabled`,
+  `rotatedAt`, `updatedAt`; `secret_hex` is not even selected. `sync_users.qr_code_payload` is not
+  used: nothing fills it (the backend sends no such field). The card says « activé sur le compte »,
+  not "valid": the QR check (§3.1b roster check, allowed days) can still refuse a scan, and the
+  upcoming credentials of §3.8 (a renewal starting today) are not read here. `[TEST:
+  tests/test_member_card_details.py::TestQrCredential]`
+- **Visits (« Derniers passages »).** `GET /api/v2/members/{activeMembershipId}/history?limit=`
+  (`_handle_member_history` → `db.py::list_member_access_history`, default 20, capped at
+  `MEMBER_HISTORY_LIMIT_MAX` = 200; the card asks 10). It lists `access_history` rows of the PERSON:
+  the membership's `sync_users`/`sync_users_held` `user_id`, then `WHERE user_id = ?` newest first —
+  the `ix_access_history_user_door_day` prefix, no new index. A row resolved to another plan of the
+  same person carries its own `activeMembershipId` and the card marks it « autre abonnement ». Rows
+  are shaped like the dashboard feed (`_handle_dashboard_overview`): time = `event_time`, else
+  `created_at` (the list is ORDERED by `created_at`, so a late-arriving device record can sit above a
+  later-timed one); device name from the synced devices; door number; `method` from
+  `_credential_type_from_raw`; the raw refusal code, worded in the UI by `aDenyCopy(reason).short`.
+  Limits, said in the card's footnote: only events THIS PC stored (a READER PC under driver leases,
+  or a gym whose turnstiles another PC drives, may have few or none); `user_id` is filled at insert
+  by the AGENT and ULTRA writers only, so DEVICE-mode attendance and unresolved events are not
+  listed; rows are pruned after the backend `history_retention_days` (`retentionDays` in the
+  answer, from `settings_reader.get_backend_global_settings`) once uploaded (§3.5; the prune runs in
+  `device_attendance.py::DeviceAttendanceMaintenanceEngine.run_blocking`, called on every sync tick
+  whatever the mode). The ULTRA writer
+  stores `user_id` = the resolved roster row's `userId` (`ultra_engine.py`, `_resolved_user_id`), the
+  same id space as `sync_users.user_id`. `[TEST:
+  tests/test_member_card_details.py::TestMemberHistory]`
+- **Freeze (« Gel ») and held members.** From the protocol-2 data of §3.8, never `datetime.now()`:
+  `_member_freeze_facts` returns None (the card says « non connu ») without an `access_v2_state`
+  row, with untrusted windows (the flip moves nothing then either), without an `applied_date` or
+  without a `member_access_window` row. Else `frozenToday` = the row is in `sync_users_held` with
+  `held_reason = 'frozen'` AND `held_for_date` = the applied gym date (an older hold does not say
+  "today"); `nextFreezeDays` = the window's `offDays` after the gym date; `horizonEnd` /
+  `beyondHorizon` bound what is known. Freeze start/end dates are not synced and are not shown —
+  only days. **The roster now lists held rows** (`list_members_roster` →
+  `_list_held_users_for_roster`, template-free like the roster read): a member frozen today used to
+  vanish from Utilisateurs. Each carries `heldReason` / `heldForDate` / `heldToday` and gets a flag
+  (« gelé aujourd'hui », « gelé », « pas encore commencé », « hors des tourniquets »); an id on both
+  tables is listed once (the `sync_users` row); `heldToday` also needs trusted windows. Counts
+  (« abonnements sur ce poste ») include them, like `db.list_local_member_ids` (a held member is
+  still in the server's list); their status stays the `validTo` one (a member frozen today counts in
+  « Actifs »), so `counts.held` is returned too and L'effectif shows « dont hors des tourniquets ».
+  A failed held read is logged and the roster falls back to `sync_users` only. Nothing on the door
+  path reads the roster. `[TEST: tests/test_member_card_details.py::TestFreeze,
+  ::TestHeldMembersOnTheRoster]`
+- **Names on « Modifications d'abonnement ».** `GET /api/v2/mutations` (`_handle_mutations_list`)
+  runs `db.py::annotate_offline_mutation_targets` on the listed rows: for `target_kind =
+  'active_membership'` one batch read of `active_membership_id, full_name, membership_id` from
+  `sync_users_held` then `sync_users` (the roster row wins), plus `_membership_title_index`, adds
+  `targetMemberName` / `targetMembershipTitle`; the tab shows « {plan} · {member} » over `#id`.
+  `list_offline_mutations` itself is unchanged (the drain never pays for the join). Tax and freeze
+  targets (other id spaces) and memberships no longer on this PC keep the bare `#id`. A failed
+  lookup leaves the rows as they were. `[TEST: tests/test_member_card_details.py::TestMutationTargetNames]`
+
+**Not built: « Renouveler » (Card M 7e).** Two facts block an honest renew button. `[CODE]`
+1. `renew` is a money op (`db.py::_MONEY_OP_KINDS`) and `app.py`'s `_offline_money_mutations_enabled`
+   is `False` with no code path setting it: `submit_offline_mutation` queues a money op without a
+   live attempt and the drain skips it (`money-gated`), so a renew would wait in the queue forever.
+   The flag waits for backend idempotency on `ActiveMembershipController` (see
+   `docs/plans/2026-09-11_gym_agents_in_access_and_offline_verifier.md`); on backend `main`
+   (77fae5eb6) `X-Idempotency-Key` / `clientRequestId` are still handled by other controllers
+   (tax, events, passes, orders), not this one.
+2. Backend `ActiveMembershipController` `/gym/activeMembership/renew` (and `/renew/quote`) calls
+   `requireAgentFromCookieIfGym`: a GYM account must send the `currentAgentId` cookie of an agent
+   holding `ACTIVE_MEMBERSHIP_MANAGEMENT` + `ACTIVE_MEMBERSHIP_RENEWAL`, else 400 « Please choose a
+   gym agent first ». `monclub_api.py::_lifecycle_request` sends no cookie; its `requests.Session`
+   could only hold one from a `Set-Cookie`, and Access calls no `GymAgentController` endpoint (the
+   one that issues the server-verified `currentAgentId`, `AgentSessionCookieFilter`) while the login
+   answer sets only `token` / `refreshToken`. Access has no agent
+   or role data to mirror the gate (`tauri-ui/src/lib/agentMode.ts` is about the AGENT
+   `accessDataMode`, not staff accounts). The same helper guards `updateActiveMembership`,
+   `deleteActiveMembership` and `ActiveMembershipFreezeController` create/cancel, so Access's
+   Modifier / Geler / Supprimer from a GYM account would get that 400 too
+   `[CODE: backend local checkout 77fae5eb6; UNVERIFIED in the field]`.
+   The backend also computes the renewal dates itself (`renewalKind` QUEUED / START_TODAY /
+   AFTER_EXPIRY, from `/renew/quote`), requires `price` and `payedPrice` (no default to the plan
+   price), refuses an outstanding debt without `debtResolution` (409) and a door loss without
+   `acknowledgeDoorLoss` (409) — none of which the PC can know offline.
 
 ---
 

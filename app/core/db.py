@@ -8098,12 +8098,20 @@ def list_members_roster(
     list_sync_users_page before adding a consumer that would read them.
     [TEST: tests/test_local_state_template_free.py]"""
     users, _total = list_sync_users_page(limit=0, offset=0, include_templates=False)
+    # Held rows (§3.8: off the turnstile roster for the gym date -- frozen, expired, not
+    # started) are still memberships of the server's list on this PC; without them a member
+    # frozen today vanished from Utilisateurs. Flagged with heldReason so none reads as a plain
+    # roster row. [TEST: tests/test_member_card_details.py::TestHeldMembersOnTheRoster]
+    users = list(users) + _list_held_users_for_roster({
+        _to_int_or_none(u.get("activeMembershipId")) for u in users
+    })
     title_idx = _membership_title_index()
     muts_by_target = _active_mutations_by_target()
     today = datetime.now().date()
 
     enriched: List[Dict[str, Any]] = []
-    counts = {"all": 0, "active": 0, "expired": 0, "pending": 0}
+    # "held" is not a status: those rows are also counted in active/expired by validTo.
+    counts = {"all": 0, "active": 0, "expired": 0, "pending": 0, "held": 0}
     for u in users:
         row = dict(u)
         pending = bool(u.get("offlinePending"))
@@ -8129,6 +8137,8 @@ def list_members_roster(
         enriched.append(row)
         counts["all"] += 1
         counts[st] = counts.get(st, 0) + 1
+        if u.get("heldReason"):
+            counts["held"] += 1
 
     s = (status or "all").strip().lower()
     if s in ("active", "expired", "pending"):
@@ -8171,6 +8181,226 @@ def list_members_roster(
     off = max(0, int(offset or 0))
     page_rows = enriched[off:off + lim]
     return page_rows, filtered_total, counts
+
+
+def _list_held_users_for_roster(skip_ids: set) -> List[Dict[str, Any]]:
+    """sync_users_held rows as roster payloads, template-free (fingerprints_json is not
+    selected), each with ``heldReason`` / ``heldForDate`` and ``heldToday`` (held for the gym
+    date last applied by a flip, windows trusted). An id already on sync_users is skipped.
+    A read failure is logged and gives [] (the roster then shows sync_users only, as before)."""
+    try:
+        with get_conn() as conn:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(sync_users_held)").fetchall()]
+            keep = [c for c in cols if c != "fingerprints_json"]
+            if not keep:
+                return []
+            rows = [dict(r) for r in conn.execute(
+                "SELECT " + ", ".join(f'"{c}"' for c in keep) + " FROM sync_users_held"
+            ).fetchall()]
+            st = conn.execute("SELECT applied_date, trusted FROM access_v2_state WHERE id = 1").fetchone()
+    except Exception:
+        logging.getLogger(__name__).warning("members roster: held rows unreadable", exc_info=True)
+        return []
+    applied = str(st[0]) if st is not None and st[0] and st[1] else None
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        amid = _to_int_or_none(r.get("active_membership_id"))
+        if amid is not None and amid in skip_ids:
+            continue
+        u = _coerce_user_row_to_payload(r)
+        u["heldReason"] = r.get("held_reason")
+        u["heldForDate"] = r.get("held_for_date")
+        u["heldToday"] = bool(applied and r.get("held_for_date") == applied)
+        out.append(u)
+    return out
+
+
+def _member_row_for_card(conn: sqlite3.Connection, active_membership_id: int) -> tuple[Dict[str, Any] | None, Dict[str, Any] | None]:
+    """(row, hold) for one membership: the sync_users row, else the sync_users_held row with
+    its hold columns in ``hold``. Selects only the columns the member card reads -- one row's
+    fingerprints_json, never a roster-wide template read (list_sync_users_page CAUTION)."""
+    cols = "user_id, active_membership_id, membership_id, full_name, fingerprints_json"
+    r = conn.execute(
+        f"SELECT {cols} FROM sync_users WHERE active_membership_id = ? LIMIT 1",
+        (int(active_membership_id),),
+    ).fetchone()
+    if r is not None:
+        return dict(r), None
+    r = conn.execute(
+        f"SELECT {cols}, held_reason, held_for_date, held_at FROM sync_users_held "
+        "WHERE active_membership_id = ? LIMIT 1",
+        (int(active_membership_id),),
+    ).fetchone()
+    if r is None:
+        return None, None
+    d = dict(r)
+    hold = {
+        "reason": d.pop("held_reason", None),
+        "forDate": d.pop("held_for_date", None),
+        "at": d.pop("held_at", None),
+    }
+    return d, hold
+
+
+def get_member_card_details(active_membership_id: int) -> Dict[str, Any] | None:
+    """What the Utilisateurs member card shows beyond the roster row, for ONE membership,
+    read only when the card is opened (Access v5 Card M). None when this PC holds no row for
+    the membership (neither sync_users nor sync_users_held).
+
+    * ``fingerprints`` -- the prints of the local copy of the server's member row: finger id,
+      label, enabled. Never the template itself. ``fingerprintCount`` = number of entries.
+    * ``qrCredentials`` -- the rows of sync_gym_access_credentials (today's list, as the server
+      sent it) whose granted ids contain this membership: enabled flag and rotation date only.
+      ``secret_hex`` is never selected.
+    """
+    try:
+        amid = int(active_membership_id)
+    except (TypeError, ValueError):
+        return None
+    if amid <= 0:
+        return None
+    with get_conn() as conn:
+        row, hold = _member_row_for_card(conn, amid)
+        if row is None:
+            return None
+        cred_rows = [dict(r) for r in conn.execute(
+            "SELECT enabled, rotated_at, updated_at, granted_active_membership_ids_json "
+            "FROM sync_gym_access_credentials"
+        ).fetchall()]
+        state_row = conn.execute(
+            "SELECT trusted, applied_date, horizon_end FROM access_v2_state WHERE id = 1"
+        ).fetchone()
+        win_row = conn.execute(
+            "SELECT access_from, access_until, off_days_json, off_days_beyond_horizon "
+            "FROM member_access_window WHERE active_membership_id = ?",
+            (amid,),
+        ).fetchone()
+
+    qr: List[Dict[str, Any]] = []
+    for c in cred_rows:
+        granted = _expand_gym_access_credential_json_fields(c).get("granted_active_membership_ids") or []
+        # Parsed ids, never a substring match on the JSON text (12 would match 123).
+        if amid not in {i for i in (_to_int_or_none(g) for g in granted) if i is not None}:
+            continue
+        qr.append({
+            "enabled": bool(_to_int_or_none(c.get("enabled")) or 0),
+            "rotatedAt": c.get("rotated_at"),
+            "updatedAt": c.get("updated_at"),
+        })
+
+    fps: List[Dict[str, Any]] = []
+    try:
+        raw = json.loads(row.get("fingerprints_json") or "[]")
+    except Exception:
+        raw = []
+    for f in raw if isinstance(raw, list) else []:
+        if not isinstance(f, dict):
+            continue
+        fps.append({
+            "fingerId": _to_int_or_none(f.get("fingerId")),
+            "label": f.get("label") if isinstance(f.get("label"), str) else None,
+            "enabled": f.get("enabled") is not False,
+        })
+
+    return {
+        "activeMembershipId": amid,
+        "userId": _to_int_or_none(row.get("user_id")),
+        "held": hold is not None,
+        "fingerprintCount": len(fps),
+        "fingerprints": fps,
+        "qrCredentials": qr,
+        "hold": hold,
+        "freeze": _member_freeze_facts(state_row, win_row, hold),
+    }
+
+
+def _member_freeze_facts(state_row: Any, win_row: Any, hold: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    """The freeze lines of the member card from the protocol-2 data (§3.8), or None when that
+    data cannot say: no access_v2_state row, untrusted windows (the flip moves nothing then, and
+    neither does this card claim anything), no applied gym date, or no stored window.
+
+    * ``frozenToday`` -- the row is held out of the roster for reason ``frozen`` FOR the applied
+      gym date (a hold set on an earlier date does not say "today").
+    * ``nextFreezeDays`` -- the window's ``offDays`` AFTER the gym date, sorted. Freeze periods
+      (start/end) are not synced: only these days are known, up to ``horizonEnd``;
+      ``beyondHorizon`` = the server said more exist past it.
+    """
+    from app.core import access_dates as _ad
+
+    if state_row is None or win_row is None:
+        return None
+    st = dict(state_row)
+    if not st.get("trusted"):
+        return None
+    gym = _ad.parse_iso_date(st.get("applied_date"))
+    if gym is None:
+        return None
+    w = _window_from_columns(win_row[0], win_row[1], win_row[2], win_row[3])
+    if w is None:
+        return None
+    frozen_today = bool(
+        hold is not None
+        and str(hold.get("reason") or "") == "frozen"
+        and _ad.parse_iso_date(hold.get("forDate")) == gym
+    )
+    return {
+        "gymDate": gym.isoformat(),
+        "frozenToday": frozen_today,
+        "nextFreezeDays": [d.isoformat() for d in sorted(w.off_days) if d > gym],
+        "beyondHorizon": bool(w.off_days_beyond_horizon),
+        "horizonEnd": st.get("horizon_end"),
+    }
+
+
+MEMBER_HISTORY_LIMIT_MAX = 200
+
+
+def list_member_access_history(active_membership_id: int, *, limit: int = 20) -> Dict[str, Any] | None:
+    """The latest door events stored on THIS PC for the person behind one membership
+    (Utilisateurs member card, Card M 7c). None when this PC holds no row for the membership.
+
+    By person: access_history.user_id is resolved at insert time by the AGENT and ULTRA
+    writers, and the person's other memberships are the same visitor -- each row carries its
+    own active_membership_id so the UI can tell them apart. The query is the
+    ix_access_history_user_door_day prefix (user_id). Rows with no user_id (DEVICE-mode
+    attendance, an event no member was resolved for) cannot be attributed and are not listed.
+    A member row with no user_id falls back to ``active_membership_id = ?`` (no index, rare).
+    """
+    try:
+        amid = int(active_membership_id)
+    except (TypeError, ValueError):
+        return None
+    if amid <= 0:
+        return None
+    lim = max(1, min(int(limit or 20), MEMBER_HISTORY_LIMIT_MAX))
+    cols = (
+        "id, created_at, event_time, device_id, door_id, allowed, reason, event_type, "
+        "history_source, raw_json, active_membership_id"
+    )
+    with get_conn() as conn:
+        found = None
+        for table in ("sync_users", "sync_users_held"):
+            found = conn.execute(
+                f"SELECT user_id FROM {table} WHERE active_membership_id = ? LIMIT 1", (amid,),
+            ).fetchone()
+            if found is not None:
+                break
+        if found is None:
+            return None
+        uid = _to_int_or_none(found[0])
+        if uid is not None:
+            rows = conn.execute(
+                f"SELECT {cols} FROM access_history WHERE user_id = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (uid, lim),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT {cols} FROM access_history WHERE active_membership_id = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (amid, lim),
+            ).fetchall()
+    return {"userId": uid, "limit": lim, "rows": [dict(r) for r in rows]}
 
 
 @_tel.timed("DB_READ_list_sync_users_by_active_membership_ids", slow_ms=50, warn_ms=1000)
@@ -12179,6 +12409,47 @@ def list_offline_mutations(
     params.extend([max(1, int(limit or 200)), max(0, int(offset or 0))])
     with get_conn() as conn:
         return [_mutation_row_to_dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+
+
+def annotate_offline_mutation_targets(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Add ``targetMemberName`` / ``targetMembershipTitle`` to the rows whose target is an
+    ``active_membership`` this PC holds (sync_users, else sync_users_held), for the « Modifications
+    d'abonnement » tab (Card M 8). One batch read of three columns -- never ``SELECT *``, which
+    would load fingerprint templates. Tax/freeze targets (other id spaces) and memberships no
+    longer on this PC are left as they are: the UI shows ``#id``. Mutates and returns ``rows``."""
+    ids = sorted({
+        int(t) for t in (
+            _to_int_or_none(r.get("target_id")) for r in rows
+            if str(r.get("target_kind") or "") == "active_membership"
+        ) if t is not None and t > 0
+    })
+    if not ids:
+        return rows
+    found: Dict[int, tuple[str | None, Any]] = {}
+    with get_conn() as conn:
+        for table in ("sync_users_held", "sync_users"):          # sync_users last: it wins
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                ph = ",".join("?" for _ in chunk)
+                for r in conn.execute(
+                    f"SELECT active_membership_id, full_name, membership_id FROM {table} "
+                    f"WHERE active_membership_id IN ({ph})",
+                    tuple(chunk),
+                ).fetchall():
+                    found[int(r[0])] = (r[1], r[2])
+    if not found:
+        return rows
+    titles = _membership_title_index()
+    for r in rows:
+        if str(r.get("target_kind") or "") != "active_membership":
+            continue
+        hit = found.get(_to_int_or_none(r.get("target_id")) or 0)
+        if hit is None:
+            continue
+        name, membership_id = hit
+        r["targetMemberName"] = name or ""
+        r["targetMembershipTitle"] = titles.get(str(membership_id), "") if membership_id is not None else ""
+    return rows
 
 
 def count_offline_mutations(*, states: List[str] | None = None, include_archived: bool = False) -> int:
