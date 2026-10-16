@@ -111,6 +111,9 @@ type MutationRow = {
   server_result_json?: string | null;
   expected_version?: number | null;
   payload?: Record<string, any>;
+  /** Set by GET /mutations when target_kind is active_membership and the PC holds that row. */
+  targetMemberName?: string;
+  targetMembershipTitle?: string;
 };
 
 const MUTATION_ACTIVE_STATES = ["pending", "processing", "failed_retryable", "blocked_auth", "conflict"];
@@ -1710,10 +1713,10 @@ export default function UsersPage() {
         label="Modifications d'abonnement"
         columns={[
           { label: "Opération", flex: 1.2 },
-          { label: "Abonnement", flex: 0.9 },
+          { label: "Abonnement", flex: 1.6 },
           { label: "État", flex: 1.1 },
           { label: "Argent", flex: 0.6 },
-          { label: "Erreur", flex: 2 },
+          { label: "Erreur", flex: 1.5 },
           { label: "Actions", flex: 1.9, align: "right" },
         ]}
         empty="Aucune modification en file."
@@ -1725,10 +1728,18 @@ export default function UsersPage() {
           return (
             <FlexRow key={mu.local_id} minHeight={60}>
               <FlexCell flex={1.2}><CellText title={op} strong /></FlexCell>
-              <FlexCell flex={0.9}><CellText title={`#${mu.target_id}`} mono /></FlexCell>
+              <FlexCell flex={1.6}>
+                {mu.targetMemberName != null ? (
+                  <CellText
+                    title={[mu.targetMembershipTitle, mu.targetMemberName].filter(Boolean).join(" · ") || `#${mu.target_id}`}
+                    sub={`#${mu.target_id}`}
+                    subMono
+                  />
+                ) : <CellText title={`#${mu.target_id}`} mono />}
+              </FlexCell>
               <FlexCell flex={1.1}><Chip tone={st.tone}>{st.l}</Chip></FlexCell>
               <FlexCell flex={0.6}>{mu.money ? <Chip tone="warning" size="sm">argent</Chip> : <CellText title="—" titleClassName="text-muted-foreground" />}</FlexCell>
-              <FlexCell flex={2} title={mu.last_error_message || ""}>
+              <FlexCell flex={1.5} title={mu.last_error_message || ""}>
                 <CellText title={mu.last_error_message || "—"} titleClassName={mu.last_error_message ? INK.error : "text-muted-foreground"} />
               </FlexCell>
               <FlexCell flex={1.9} align="right" className="gap-1.5">

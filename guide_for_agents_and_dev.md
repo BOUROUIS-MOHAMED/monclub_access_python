@@ -65,7 +65,7 @@ This file is only useful while it is true. If you change any of the following, y
 | What a turnstile's heartbeat line reports as waiting (`device_sync.py::count_waiting_pins`, `ultra_engine.py::_count_waiting_pins` and the snapshot's `failed_pins`, `_sync_one_device`'s `_last_waiting_pins`, `realtime_agent.py::get_status_snapshot`'s `failedPins`, `pc_identity.py::build_heartbeat_payload`, `::_report_held_turnstiles` and its `held` key, `erase_wizard.py::held_waiting_count`, the wizard's `_set_waiting`) | §3.10 |
 | Who writes to `access.db` — the DbWriter, `_run_db_write_sync` (its lanes, `priority=`, the inline nested call, the 60 s wait), a write outside it, the tripwire's allowlist (`tests/test_db_single_writer.py::ALLOWED_DIRECT`), which writes are in the door lane (`db.py::insert_access_history`, `::save_agent_rtlog_state`), the AGENT history claim (`realtime_agent.py::DecisionService.run`'s `F-013` block) | §3.11 |
 | The member fee lines of the entry screen -- what is stored, how it reaches the popup, how the screen judges and draws it (`db.py::_member_fees_json`, `::_member_fees_list`, `::_ensure_column_forcing_refresh`, `sync_users.fees_json` in `_SYNC_USER_COLUMNS` and the five member writers, `sync_access_software_settings.fee_due_soon_days`, `settings_reader.py::normalize_global_settings`'s `fee_due_soon_days`, `access_types.py::NotificationRequest.fees`, `ultra_engine.py::_enqueue_notification(user_fees=)`, `ultra_pc_entry.py::member_popup_fields`, `realtime_agent.py::_popup_payload_from_request`, `tauri-ui/src/lib/feeAlerts.ts`, `PopupWindow.tsx` `AFeeLine` / `AFeeMark`) | §3.12 |
-| The Utilisateurs member card data and the mutation-queue names (`db.py::get_member_card_details`, `::_member_row_for_card`, `::_member_freeze_facts`, `::_list_held_users_for_roster` and its call in `::list_members_roster`, `::list_member_access_history`, `local_access_api_v2.py::_handle_member_card`, `::_handle_member_history`, `tauri-ui/src/pages/UsersPage.tsx` `cardDetailLine`) | §3.14 |
+| The Utilisateurs member card data and the mutation-queue names (`db.py::get_member_card_details`, `::_member_row_for_card`, `::_member_freeze_facts`, `::_list_held_users_for_roster` and its call in `::list_members_roster`, `::list_member_access_history`, `::annotate_offline_mutation_targets`, `local_access_api_v2.py::_handle_member_card`, `::_handle_mutations_list`'s names, `::_handle_member_history`, `tauri-ui/src/pages/UsersPage.tsx` `cardDetailLine`) | §3.14 |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -4848,6 +4848,14 @@ the membership in `sync_users` nor `sync_users_held`. `[CODE]`
   like `db.list_local_member_ids` (a held member is still in the server's list). Nothing on the door
   path reads the roster. `[TEST: tests/test_member_card_details.py::TestFreeze,
   ::TestHeldMembersOnTheRoster]`
+- **Names on « Modifications d'abonnement ».** `GET /api/v2/mutations` (`_handle_mutations_list`)
+  runs `db.py::annotate_offline_mutation_targets` on the listed rows: for `target_kind =
+  'active_membership'` one batch read of `active_membership_id, full_name, membership_id` from
+  `sync_users_held` then `sync_users` (the roster row wins), plus `_membership_title_index`, adds
+  `targetMemberName` / `targetMembershipTitle`; the tab shows « {plan} · {member} » over `#id`.
+  `list_offline_mutations` itself is unchanged (the drain never pays for the join). Tax and freeze
+  targets (other id spaces) and memberships no longer on this PC keep the bare `#id`. A failed
+  lookup leaves the rows as they were. `[TEST: tests/test_member_card_details.py::TestMutationTargetNames]`
 
 ---
 

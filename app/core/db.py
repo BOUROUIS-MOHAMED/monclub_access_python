@@ -12406,6 +12406,47 @@ def list_offline_mutations(
         return [_mutation_row_to_dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
 
 
+def annotate_offline_mutation_targets(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Add ``targetMemberName`` / ``targetMembershipTitle`` to the rows whose target is an
+    ``active_membership`` this PC holds (sync_users, else sync_users_held), for the « Modifications
+    d'abonnement » tab (Card M 8). One batch read of three columns -- never ``SELECT *``, which
+    would load fingerprint templates. Tax/freeze targets (other id spaces) and memberships no
+    longer on this PC are left as they are: the UI shows ``#id``. Mutates and returns ``rows``."""
+    ids = sorted({
+        int(t) for t in (
+            _to_int_or_none(r.get("target_id")) for r in rows
+            if str(r.get("target_kind") or "") == "active_membership"
+        ) if t is not None and t > 0
+    })
+    if not ids:
+        return rows
+    found: Dict[int, tuple[str | None, Any]] = {}
+    with get_conn() as conn:
+        for table in ("sync_users_held", "sync_users"):          # sync_users last: it wins
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                ph = ",".join("?" for _ in chunk)
+                for r in conn.execute(
+                    f"SELECT active_membership_id, full_name, membership_id FROM {table} "
+                    f"WHERE active_membership_id IN ({ph})",
+                    tuple(chunk),
+                ).fetchall():
+                    found[int(r[0])] = (r[1], r[2])
+    if not found:
+        return rows
+    titles = _membership_title_index()
+    for r in rows:
+        if str(r.get("target_kind") or "") != "active_membership":
+            continue
+        hit = found.get(_to_int_or_none(r.get("target_id")) or 0)
+        if hit is None:
+            continue
+        name, membership_id = hit
+        r["targetMemberName"] = name or ""
+        r["targetMembershipTitle"] = titles.get(str(membership_id), "") if membership_id is not None else ""
+    return rows
+
+
 def count_offline_mutations(*, states: List[str] | None = None, include_archived: bool = False) -> int:
     sql = "SELECT COUNT(*) AS c FROM offline_mutation_queue"
     clauses: List[str] = []

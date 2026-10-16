@@ -3787,13 +3787,18 @@ def _handle_member_mutation(ctx: _Ctx) -> None:
 
 
 def _handle_mutations_list(ctx: _Ctx) -> None:
-    from app.core.db import list_offline_mutations, count_offline_mutations
+    from app.core.db import annotate_offline_mutation_targets, list_offline_mutations, count_offline_mutations
     raw = ctx.q("state", "states", default="")
     states = [s.strip().lower() for s in raw.replace(";", ",").split(",") if s.strip()] or None
     include_archived = _safe_str(ctx.q("includeArchived", "include", default=""), "") in ("1", "true")
     limit = ctx.q_int("limit", default=200)
     offset = ctx.q_int("offset", default=0)
     rows = list_offline_mutations(states=states, include_archived=include_archived, limit=limit, offset=offset)
+    # Display names for the UI only (Card M 8); a failed lookup leaves the rows as they were.
+    try:
+        annotate_offline_mutation_targets(rows)
+    except Exception:
+        pass
     total = count_offline_mutations(states=states, include_archived=include_archived)
     ctx.send_json(200, {"ok": True, "rows": rows, "total": total})
 

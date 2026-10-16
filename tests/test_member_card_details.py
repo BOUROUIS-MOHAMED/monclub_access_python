@@ -11,6 +11,8 @@ GET /api/v2/members/{activeMembershipId}/card reads ONE membership when the card
   for the person behind the membership, newest first, capped.
 * 7d -- freeze days from the protocol-2 window (§3.8) against the APPLIED gym date, never with
   untrusted windows; members held off the roster stay reachable on the Utilisateurs roster.
+* 8  -- GET /api/v2/mutations names an active_membership target (« {plan} · {member} »); other
+  targets keep their bare id.
 
 Every test patches ``app.core.db._DB_PATH`` to a temp file.
 """
@@ -407,6 +409,65 @@ class TestHeldMembersOnTheRoster:
 
         rows, total, _ = db.list_members_roster()
         assert total == 1 and "heldReason" not in rows[0]
+
+
+# --------------------------------------------------------------------------- 8
+
+_GOLD = {"id": 50, "title": "Gold", "description": "", "price": 99.0, "durationInDays": 30}
+
+
+def _memberships(db, plans):
+    db.save_sync_cache_delta(
+        {
+            "users": [], "membersDeltaMode": True, "validMemberIds": [], "devices": [],
+            "gymAccessCredentials": [], "infrastructures": [], "membership": plans,
+            "contractStatus": True, "contractEndDate": "2026-12-31", "accessSoftwareSettings": {},
+        },
+        {"members": False, "devices": False, "credentials": False, "settings": True},
+    )
+
+
+class TestMutationTargetNames:
+    def test_membership_targets_get_plan_and_member_others_stay_bare(self, db):
+        db.upsert_delta_users([
+            _user(1, 100, card="1001", fps=[_fp(0)]),
+            _user(7, 700, card="1007", membership_id=51),
+        ])
+        _memberships(db, [_GOLD])
+        _hold(db, 7)
+        db.insert_offline_mutation(op_kind="edit", target_kind="active_membership", target_id=1, payload={})
+        db.insert_offline_mutation(op_kind="freeze_create", target_kind="active_membership", target_id=7, payload={})
+        db.insert_offline_mutation(op_kind="delete", target_kind="active_membership", target_id=555, payload={})
+        db.insert_offline_mutation(op_kind="tax_cancel", target_kind="active_membership_tax", target_id=1, payload={})
+
+        rows = db.annotate_offline_mutation_targets(db.list_offline_mutations())
+        by = {(r["target_kind"], r["target_id"]): r for r in rows}
+
+        assert by[("active_membership", 1)]["targetMemberName"] == "Member 100"
+        assert by[("active_membership", 1)]["targetMembershipTitle"] == "Gold"
+        assert by[("active_membership", 7)]["targetMemberName"] == "Member 700"     # held row
+        assert by[("active_membership", 7)]["targetMembershipTitle"] == ""          # plan 51 unknown
+        assert "targetMemberName" not in by[("active_membership", 555)]             # not on this PC
+        assert "targetMemberName" not in by[("active_membership_tax", 1)]           # other id space
+        assert _TEMPLATE_DATA not in json.dumps(rows)
+
+    def test_the_list_endpoint_carries_the_names(self, db):
+        from app.api.local_access_api_v2 import _handle_mutations_list
+
+        db.upsert_delta_users([_user(1, 100, card="1001")])
+        _memberships(db, [_GOLD])
+        db.insert_offline_mutation(op_kind="edit", target_kind="active_membership", target_id=1, payload={})
+
+        class _ListCtx(_Ctx):
+            def q(self, *names, default=""):
+                return default
+
+        ctx = _ListCtx(query={"limit": "50"})
+        _handle_mutations_list(ctx)
+        status, body = ctx.sent
+        assert status == 200 and body["total"] == 1
+        assert body["rows"][0]["targetMemberName"] == "Member 100"
+        assert body["rows"][0]["targetMembershipTitle"] == "Gold"
 
 
 class TestCardEndpoint:
