@@ -2534,6 +2534,12 @@ def init_db() -> None:
         # auth-refresh: opaque rotating refresh token + proactive-refresh deadline (Task 18)
         _ensure_column(conn, "auth_state", "refresh_token_protected", "refresh_token_protected TEXT")
         _ensure_column(conn, "auth_state", "next_refresh_at",         "next_refresh_at TEXT")
+        # Profil: the gym name from GET /manager/access/v1/gym/me, with the login e-mail it was
+        # fetched for (load_gym_name returns it only for that e-mail; logout deletes the row).
+        _ensure_column(conn, "auth_state", "gym_name",                "gym_name TEXT")
+        _ensure_column(conn, "auth_state", "gym_name_email",          "gym_name_email TEXT")
+        # Card P2: the account holder's name from the same gym/me answer (account_name), same binding.
+        _ensure_column(conn, "auth_state", "account_name",            "account_name TEXT")
         _ensure_column(conn, "sync_access_software_settings", "sdk_read_initial_bytes", "sdk_read_initial_bytes INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "optional_data_sync_delay_minutes", "optional_data_sync_delay_minutes INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "manual_sync_mode", "manual_sync_mode INTEGER")
@@ -4985,6 +4991,47 @@ def load_auth_token() -> AuthTokenState | None:
             refresh_token=refresh_token,
             next_refresh_at=next_refresh_at,
         )
+
+
+def save_gym_name(*, email: str, gym_name: str, account_name: str = "") -> None:
+    """Cache the gym name -- and, since Card P2, the account holder's name -- the backend gave
+    for this login (Profil shows them; an offline PC keeps the last ones). Written to the existing
+    auth_state row only: no row means logged out, and names fetched for a session that has just
+    ended must not create one. "" stores "no name"."""
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
+        conn.execute(
+            "UPDATE auth_state SET gym_name=?, account_name=?, gym_name_email=? WHERE id=1",
+            (gym_name, account_name, email),
+        )
+    return _run_db_write_sync("save_gym_name", _write)
+
+
+def _load_gym_me_field(email: str, column: str) -> str | None:
+    want = (email or "").strip().lower()
+    if not want:
+        return None
+    with get_conn() as conn:
+        r = conn.execute(
+            "SELECT gym_name, account_name, gym_name_email FROM auth_state WHERE id=1"
+        ).fetchone()
+    if not r:
+        return None
+    value = (r[column] or "").strip()
+    if not value or (r["gym_name_email"] or "").strip().lower() != want:
+        return None
+    return value
+
+
+def load_gym_name(email: str) -> str | None:
+    """The cached gym name, only when it was fetched for ``email`` (a re-login as another
+    account must not show the previous gym). None when absent or for another e-mail."""
+    return _load_gym_me_field(email, "gym_name")
+
+
+def load_account_name(email: str) -> str | None:
+    """The cached account holder's name (gym/me ``account_name``, Card P2), same rule as
+    ``load_gym_name``. None when absent, unset on the backend, or for another e-mail."""
+    return _load_gym_me_field(email, "account_name")
 
 
 def clear_auth_token() -> None:

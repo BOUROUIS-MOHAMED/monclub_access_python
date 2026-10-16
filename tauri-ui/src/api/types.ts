@@ -31,6 +31,17 @@ export interface SessionBlock {
   gymDate?: string | null;
   /** True once a protocol-2 sync answer has been trusted (windows/upcoming lists valid). */
   accessDatesTrusted?: boolean;
+  /** Card P: the stored access token's `iat` / `exp` (ISO-8601 UTC with an offset), read from
+   * its claims; null when absent or unreadable. Optional: the TV status omits them. */
+  sessionIssuedAt?: string | null;
+  sessionExpiresAt?: string | null;
+  /** The token's single role without `ROLE_` ("GYM" | "ADMIN" today); null when unknown. */
+  accountRole?: string | null;
+  /** The gym name cached from GET gym/me for this login; null until fetched or with no gym. */
+  gymName?: string | null;
+  /** Card P2: the account holder's name (gym/me `account_name`), cached per login; null when
+   * unset or the backend predates it -- Profil then falls back to the e-mail's local part. */
+  accountName?: string | null;
 }
 
 export interface ModeBlock {

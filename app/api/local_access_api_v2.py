@@ -847,6 +847,30 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
         "contractEndDate": (contract_meta.get("contractEndDate") if contract_meta else None),
     }
 
+    # Profil (Access v5): the stored access token's window and role, read from its claims
+    # (no signature check -- display only; the token itself is never sent), and the gym name
+    # cached from GET gym/me for this login. Unknown values are None, never guessed.
+    session["sessionIssuedAt"] = None
+    session["sessionExpiresAt"] = None
+    session["accountRole"] = None
+    session["gymName"] = None
+    session["accountName"] = None
+    if auth and auth.token:
+        try:
+            from shared.auth_state import jwt_account_role, jwt_session_window
+
+            session["sessionIssuedAt"], session["sessionExpiresAt"] = jwt_session_window(auth.token)
+            session["accountRole"] = jwt_account_role(auth.token)
+        except Exception:
+            pass
+        try:
+            from app.core.db import load_account_name, load_gym_name
+
+            session["gymName"] = load_gym_name(auth.email)
+            session["accountName"] = load_account_name(auth.email)
+        except Exception:
+            pass
+
     try:
         expiry = app._compute_expiry_warnings()
         session["loginDaysRemaining"] = expiry.get("loginDaysRemaining")
@@ -1021,6 +1045,7 @@ def _handle_auth_login(ctx: _Ctx) -> None:
 
         from access.store import save_auth_token
         save_auth_token(email=email, token=token)
+        _reset_gym_name_refresh(ctx.app)
         try:
             from tv.auth_bridge import mirror_access_auth_to_tv
 
@@ -1051,6 +1076,14 @@ def _handle_auth_login(ctx: _Ctx) -> None:
     except Exception as e:
         ctx.app.logger.exception("Login failed via API v2")
         ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
+def _reset_gym_name_refresh(app: Any) -> None:
+    """Profil's gym name: the next online sync fetches it again (guide §3.15). Never fatal."""
+    try:
+        app._gym_name_refresher.reset()
+    except Exception:
+        pass
 
 
 def _handle_auth_status(ctx: _Ctx) -> None:
@@ -1323,6 +1356,7 @@ def _handle_auth_logout(ctx: _Ctx) -> None:
         pass
     from access.store import clear_auth_token
     clear_auth_token()
+    _reset_gym_name_refresh(ctx.app)
     try:
         from tv.auth_bridge import clear_tv_auth_bridge_state
 

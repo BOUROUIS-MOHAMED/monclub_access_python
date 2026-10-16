@@ -65,6 +65,7 @@ This file is only useful while it is true. If you change any of the following, y
 | What a turnstile's heartbeat line reports as waiting (`device_sync.py::count_waiting_pins`, `ultra_engine.py::_count_waiting_pins` and the snapshot's `failed_pins`, `_sync_one_device`'s `_last_waiting_pins`, `realtime_agent.py::get_status_snapshot`'s `failedPins`, `pc_identity.py::build_heartbeat_payload`, `::_report_held_turnstiles` and its `held` key, `erase_wizard.py::held_waiting_count`, the wizard's `_set_waiting`) | §3.10 |
 | Who writes to `access.db` — the DbWriter, `_run_db_write_sync` (its lanes, `priority=`, the inline nested call, the 60 s wait), a write outside it, the tripwire's allowlist (`tests/test_db_single_writer.py::ALLOWED_DIRECT`), which writes are in the door lane (`db.py::insert_access_history`, `::save_agent_rtlog_state`), the AGENT history claim (`realtime_agent.py::DecisionService.run`'s `F-013` block) | §3.11 |
 | The member fee lines of the entry screen -- what is stored, how it reaches the popup, how the screen judges and draws it (`db.py::_member_fees_json`, `::_member_fees_list`, `::_ensure_column_forcing_refresh`, `sync_users.fees_json` in `_SYNC_USER_COLUMNS` and the five member writers, `sync_access_software_settings.fee_due_soon_days`, `settings_reader.py::normalize_global_settings`'s `fee_due_soon_days`, `access_types.py::NotificationRequest.fees`, `ultra_engine.py::_enqueue_notification(user_fees=)`, `ultra_pc_entry.py::member_popup_fields`, `realtime_agent.py::_popup_payload_from_request`, `tauri-ui/src/lib/feeAlerts.ts`, `PopupWindow.tsx` `AFeeLine` / `AFeeMark`) | §3.12 |
+| What `/api/v2/status` shows Profil about the login -- `sessionIssuedAt` / `sessionExpiresAt` / `accountRole` (`shared/auth_state.py::read_jwt_claims`, `::jwt_session_window`, `::jwt_account_role`), `gymName` / `accountName` and their cache (`app/core/gym_info.py`, `MonClubApi.get_gym_me`, `db.py::save_gym_name` / `::load_gym_name` / `::load_account_name`, the `auth_state.gym_name*` and `account_name` columns, the call in the sync worker) | §3.15 Profil |
 | Which sync run a push batch answers -- the `push_batch_sync_run` link and what carries its ids (`db.py::insert_push_batch(sync_run_ids=)`, `::list_push_batches_for_sync_run`; `app.py::_request_running_ultra_sync(sync_run_id=)` and its two calls in the sync tick; `ultra_engine.py::UltraEngine.request_sync_now(sync_run_ids=)`, `::_worker_full_sync_accepted_or_pending`, `UltraDeviceWorker.request_full_sync(sync_run_ids=)`, `::_drain_full_sync_commands`'s `run_kw`, `::_run_standalone_full_sync`, `::_maybe_mirror_reconcile`; `device_sync.py::run_one_device_on_connected_sdk` / `::_run_single_device_sync` / `::_sync_one_device`) -- or the history and Base locale figures (`db.py::push_batch_hourly`, `::local_db_kpis`) | §3.13 |
 | The Utilisateurs member card data and the mutation-queue names (`db.py::get_member_card_details`, `::_member_row_for_card`, `::_member_freeze_facts`, `::_list_held_users_for_roster` and its call in `::list_members_roster`, `::list_member_access_history`, `::annotate_offline_mutation_targets`, `local_access_api_v2.py::_handle_member_card`, `::_handle_mutations_list`'s names, `::_handle_member_history`, `tauri-ui/src/pages/UsersPage.tsx` `cardDetailLine`) | §3.14 |
 | The test / verification commands | §9 Verifying this guide |
@@ -4959,6 +4960,65 @@ the membership in `sync_users` nor `sync_users_held`. `[CODE]`
    AFTER_EXPIRY, from `/renew/quote`), requires `price` and `payedPrice` (no default to the plan
    price), refuses an outstanding debt without `debtResolution` (409) and a door loss without
    `acknowledgeDoorLoss` (409) — none of which the PC can know offline.
+
+---
+
+### 3.15 Profil — the session window, the role and the gym name (Access v5 Card P, 2026-10-16)
+
+**Display only.** Five `/api/v2/status` `session` fields feed the Profil page and nothing else:
+no door decision, sync, restriction or logout reads them. `[CODE:
+local_access_api_v2.py::_build_status_payload_uncached; grep finds no other reader]`
+
+- `sessionIssuedAt` / `sessionExpiresAt` — the stored access token's `iat` / `exp` claims, as
+  ISO-8601 UTC strings with an offset (`shared/auth_state.py::jwt_session_window`). The payload
+  is read **without** a signature check (`::read_jwt_claims`); the backend checks it on every
+  call. The token's length is the backend's `app.jwt.access-expiry-ms` (env
+  `JWT_ACCESS_EXPIRY_MS`, 30-day fallback), so `exp − iat` is read, never assumed. A missing or
+  non-numeric claim is `null`. `[TEST: tests/test_profile_session_data.py]` Production issued
+  30-day tokens on 2026-08-30: a PC snapshot's `auth_state` has `last_login_at` 2026-08-30 21:05
+  and `next_refresh_at` (= expiresAt − 3 days) 2026-09-26 21:05 UTC. `[FIELD:
+  _wd_pc_snapshot_2026-10-10, _l4_pc_snapshot_2026-10-09 access.db]` (`MonClubApi.login`'s
+  docstring still says "7-day JWT" — stale.)
+  This is the token's clock, **not** the local restriction's: `_restriction_reasons` /
+  `_compute_expiry_warnings` measure `last_login_at` + `max_login_age_minutes` (default
+  43200 = 30 days, naive local time). Both restart on a successful refresh
+  (`do_proactive_refresh` calls `save_auth_token`, which writes `last_login_at = now_iso()`), so
+  they run together when both lengths are 30 days; they differ when an operator changes either.
+  `[CODE: app.py::_restriction_reasons, monclub_api.py::do_proactive_refresh, db.py::save_auth_token]`
+- `accountRole` — the token's `roles` claim without `ROLE_` (`::jwt_account_role`); the backend
+  writes one role, `ROLE_GYM` or `ROLE_ADMIN` (the Access login refuses the others). `null`
+  unless there is exactly one. `[CODE: backend JwtService.generateNativeToken,
+  MainAccountModel.getAuthorities, GymAccessController.signInGymAccess]`
+- `gymName` — from `GET /manager/access/v1/gym/me` (`MonClubApi.get_gym_me`), cached in
+  `auth_state.gym_name` with the e-mail it was fetched for (`auth_state.gym_name_email`).
+  `db.py::load_gym_name` returns it only for the current login's e-mail, so a re-login as another
+  account never shows the previous gym; a token refresh keeps it; logout (`clear_auth_token`)
+  deletes the row and `save_gym_name` never recreates it. The backend answers the literal
+  `"N/A"` for an account with no gym (the ADMIN account); that and a blank name store `""`,
+  read as `null`. The answer's `enabled` flag is not read (false for every non-GYM account).
+  `[TEST: tests/test_profile_session_data.py]`
+
+**When gym/me is called.** From the sync worker, after a sync that reached the backend
+(`sync_online`), through `app/core/gym_info.py::GymNameRefresher.maybe_refresh`: one daemon
+thread at a time, the sync never waits. Due at the first online sync after start, at once after
+an Access login or logout (`local_access_api_v2.py::_reset_gym_name_refresh` -> `reset()`; a
+login triggers a sync) or when the login e-mail changes (the TV login mirror), then once an hour
+after any backend answer (an HTTP refusal included) or 5 minutes after a transport failure. A
+fetch still in flight at a reset finishes but does not re-arm the throttle. A failure is logged and changes nothing else — no logout, no token change. No new poll
+loop. `[TEST: tests/test_profile_session_data.py]` Not seen against the live backend or in the
+running app `[UNVERIFIED]`.
+
+**The account holder's name — `accountName` (Card P2, 2026-10-16).** The backend added
+`main_account.display_name` (« Nom du responsable », set in the dashboard's /account page by the
+ADMIN account or a gym agent with `GYM_SETTINGS_MANAGEMENT`) and returns it in the same `gym/me`
+answer as `account_name`. `gym_info.py::account_name_from_answer` reads it (blank, non-string or
+absent = `""`), `db.py::save_gym_name(account_name=)` stores it in `auth_state.account_name` with
+the gym name and the same e-mail binding, `::load_account_name` reads it back. Before Card P2 no
+account that can log in had a name at all (GYM accounts are created with `.user(null)`, the ADMIN
+account with no profile). Profil shows `accountName`, else the e-mail's local part — so a backend
+without the key, or a name nobody set, keeps the old display. `[TEST:
+tests/test_profile_session_data.py]` The backend side is on branch
+`claude/account-display-name` (V144 hand-run DDL) and is not deployed `[UNVERIFIED]`.
 
 ---
 

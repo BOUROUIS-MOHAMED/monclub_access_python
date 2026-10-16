@@ -4,10 +4,12 @@
 //
 // Everything rendered here comes from the /status snapshot the app already
 // polls (session / mode / sync / pullsdk / ultra / updates / deviceSync) plus
-// LocalDbPage's unlock lease. Not rendered because no data source exists:
-//   · a person's name or role — SessionBlock only has the e-mail (the account
-//     name is its local part); · the gym name; · a member count;
-//   · the session progress bar — /status gives the days left, not the total.
+// LocalDbPage's unlock lease. Card P (guide §3.15): the session row reads the
+// stored token's window (sessionIssuedAt → sessionExpiresAt) for its days and
+// bar; the role comes from the token's `roles` claim; the gym name from
+// GET gym/me, cached per login; the account name is the holder's name from
+// that same answer (Card P2), else the e-mail's local part. Not rendered
+// because no data source exists: · a member count.
 
 import { useEffect, useState } from "react";
 import { useApp } from "@/context/AppContext";
@@ -17,6 +19,7 @@ import { Avatar, Chip } from "@/components/ui/chip";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { ListRow, Note, PageGrid, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
 import { hasAgentDevices } from "@/lib/agentMode";
+import { tokenWindow } from "@/lib/sessionWindow";
 import {
   Bot, Clock, Database, Info, LogIn, LogOut, Mail, RefreshCw, Router, ShieldCheck, Users,
 } from "lucide-react";
@@ -49,6 +52,13 @@ function frDate(iso: string | null): string {
 function plural(n: number, one: string, many: string): string {
   return `${n} ${n > 1 ? many : one}`;
 }
+
+// The backend's two login roles (the Access login refuses the others); an
+// unknown code shows no label rather than a guess.
+const ROLE_LABEL: Record<string, string> = {
+  GYM: "Compte salle",
+  ADMIN: "Administrateur",
+};
 
 export default function ProfilePage() {
   const { status, logout } = useApp();
@@ -106,8 +116,16 @@ export default function ProfilePage() {
   const ultraConnected = ultraWorkers.filter((d) => d?.connected).length;
   const readerConnected = status.pullsdk?.connected || ultraConnected > 0;
 
-  const accountName = s.email ? s.email.split("@")[0] : "Compte";
+  // Card P2: the holder's name set in the dashboard; without it, the e-mail's local part.
+  const accountName = s.accountName || (s.email ? s.email.split("@")[0] : "Compte");
   const avatarLetter = (accountName[0] || "?").toUpperCase();
+  const roleLabel = s.accountRole ? ROLE_LABEL[s.accountRole] : undefined;
+
+  // Session row: the token's clock when its window is readable (days, bar and
+  // the 7-day warning all from it), otherwise the server's loginDaysRemaining.
+  const tw = tokenWindow(s.sessionIssuedAt, s.sessionExpiresAt);
+  const sessionDays = tw ? tw.daysLeft : s.loginDaysRemaining;
+  const sessionWarning = tw ? tw.daysLeft <= 7 : s.loginWarning;
 
   const handleLogout = async () => {
     setLogoutConfirm(false);
@@ -122,11 +140,15 @@ export default function ProfilePage() {
           <Avatar initials={avatarLetter} tone="primary" size={56} />
           <div className="min-w-0 flex-1">
             <h2 className="m-0 truncate text-[17px] font-bold">{accountName}</h2>
+            {s.gymName && (
+              <div className="truncate text-[13px] font-semibold">{s.gymName}</div>
+            )}
             <div className="truncate text-[13px] text-muted-foreground">
               {s.email ?? "—"} · dernière connexion {frDateTime(s.lastLoginAt)}
             </div>
           </div>
           <div className="flex flex-wrap justify-end gap-1.5">
+            {roleLabel && <Chip tone="grey">{roleLabel}</Chip>}
             {s.restricted ? (
               <>
                 <Chip tone="error">Accès restreint</Chip>
@@ -189,13 +211,15 @@ export default function ProfilePage() {
         <PanelList>
           <ListRow
             icon={Clock}
-            tone={s.loginWarning ? "warning" : "primary"}
+            tone={sessionWarning ? "warning" : "primary"}
             title="Session"
-            sub={s.loginDaysRemaining != null
-              ? `${plural(s.loginDaysRemaining, "jour", "jours")} avant expiration`
+            sub={sessionDays != null
+              ? `${plural(sessionDays, "jour", "jours")} avant expiration`
               : "durée restante inconnue"}
-            subTone={s.loginWarning ? "warning" : undefined}
-            trailing={s.loginWarning ? <Chip tone="warning">Expire bientôt</Chip> : undefined}
+            subTone={sessionWarning ? "warning" : undefined}
+            trailing={sessionWarning ? <Chip tone="warning">Expire bientôt</Chip> : undefined}
+            bar={tw ? tw.pctLeft : undefined}
+            barTone={sessionWarning ? "warning" : "primary"}
             actions={
               <ActionButton kind="outline" size="sm" icon={LogIn} onClick={() => setLogoutConfirm(true)}>
                 Renouveler maintenant
