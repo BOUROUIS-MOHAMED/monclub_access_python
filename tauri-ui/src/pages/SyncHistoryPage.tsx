@@ -106,7 +106,7 @@ export default function SyncHistoryPage() {
   }, []);
 
   usePageChrome(() => ({
-    subtitle: `Serveur → ce poste · ${total} run${total > 1 ? "s" : ""} conservé${total > 1 ? "s" : ""} (30 jours)`,
+    subtitle: `Serveur → ce poste · historique gardé 30 jours · ${total} run${total > 1 ? "s" : ""}${statusFilter !== "__all" || runTypeFilter !== "__all" ? " pour ces filtres" : ""}`,
     actions: (
       <>
         <FilterSelect label="Statut" value={statusFilter} options={STATUS_FILTER_OPTIONS} onChange={setStatusFilter} />
@@ -184,7 +184,8 @@ export default function SyncHistoryPage() {
           </FlexTable>
         </Panel>
 
-        <Panel className="col-span-4">
+        {/* Sticky: the page scrolls, the detail of a run picked low in the list stays in view. */}
+        <Panel className="sticky top-0 col-span-4">
           {detailLoading && !sel ? (
             <div className="flex justify-center py-10"><Loader2 className="h-6 w-6 animate-spin text-primary" /></div>
           ) : sel && selStatus ? (
@@ -192,7 +193,9 @@ export default function SyncHistoryPage() {
               <PanelHeader
                 title={`Run du ${formatDate(sel.created_at)}`}
                 sub={`${typeLabel(sel.run_type)} · ${selStatus.l} · ${formatDuration(sel.duration_ms)}`}
-              />
+              >
+                {detailLoading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
+              </PanelHeader>
               <PanelList>
                 <ListRow icon={Play} tone="primary" wrap title="Déclenchement" sub={`${sourceLabel(sel.trigger_source)} (${sel.trigger_source})`} />
                 <ListRow
@@ -209,7 +212,7 @@ export default function SyncHistoryPage() {
                   tone="grey"
                   wrap
                   title="Appareils lancés"
-                  sub={`${sel.devices_synced} envoi${sel.devices_synced > 1 ? "s" : ""} démarré${sel.devices_synced > 1 ? "s" : ""} (lancés, pas confirmés) · le résultat de chaque appareil est dans Historique push`}
+                  sub={`${sel.devices_synced} envoi${sel.devices_synced > 1 ? "s" : ""} démarré${sel.devices_synced > 1 ? "s" : ""} (lancés, pas confirmés). Le résultat de chaque appareil est dans Historique push, sans lien vers ce run : retrouvez-le par l'heure.`}
                   actions={<ActionButton kind="outline" size="sm" onClick={() => navigate("/push-history")}>Historique push</ActionButton>}
                 />
                 <ListRow

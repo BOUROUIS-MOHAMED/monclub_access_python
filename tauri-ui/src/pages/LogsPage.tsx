@@ -145,7 +145,7 @@ export default function LogsPage() {
 
   usePageChrome(() => ({
     fill: true,
-    subtitle: `${logs.length} ligne${logs.length > 1 ? "s" : ""} chargée${logs.length > 1 ? "s" : ""}${follow ? " · suivi automatique" : " · figé"}`,
+    subtitle: `${logs.length} ligne${logs.length > 1 ? "s" : ""} chargée${logs.length > 1 ? "s" : ""}${follow ? " · suivi automatique" : " · défilement figé"}`,
     actions: (
       <>
         <ActionButton kind="outline" icon={FolderOpen} onClick={handleOpenFolder}>Dossier</ActionButton>

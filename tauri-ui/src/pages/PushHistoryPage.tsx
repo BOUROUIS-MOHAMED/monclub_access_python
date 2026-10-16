@@ -85,29 +85,21 @@ export default function PushHistoryPage() {
     }
   }, []);
 
+  const filteredFlag = statusFilter !== "__all" || !!deviceIdFilter.trim();
+
   usePageChrome(() => ({
-    subtitle: `Ce poste → appareils · ${total} envoi${total > 1 ? "s" : ""} conservé${total > 1 ? "s" : ""} (30 jours)`,
+    subtitle: `Ce poste → appareils · historique gardé 30 jours · ${total} envoi${total > 1 ? "s" : ""}${filteredFlag ? " pour ces filtres" : ""}`,
     actions: (
       <>
-        <div className="flex h-9 items-center gap-[7px] rounded-lg border border-grey/32 bg-card px-3 focus-within:border-primary">
-          <Hash className="h-[17px] w-[17px] shrink-0 text-muted-foreground" aria-hidden="true" />
-          <input
-            value={deviceIdFilter}
-            onChange={(event) => setDeviceIdFilter(event.target.value)}
-            placeholder="N° d'appareil"
-            aria-label="Filtrer par numéro d'appareil"
-            className="w-[110px] bg-transparent text-[14px] font-bold text-foreground outline-none placeholder:font-semibold placeholder:text-muted-foreground"
-          />
-        </div>
         <FilterSelect label="Statut" value={statusFilter} options={STATUS_FILTER_OPTIONS} onChange={setStatusFilter} />
         <ActionButton kind="outline" icon={RefreshCw} spin={loading} onClick={() => void load()} disabled={loading}>
           Recharger
         </ActionButton>
       </>
     ),
-  }), [total, deviceIdFilter, statusFilter, loading, load]);
+  }), [total, filteredFlag, statusFilter, loading, load]);
 
-  const filtered = statusFilter !== "__all" || !!deviceIdFilter.trim();
+  const filtered = filteredFlag;
   const sel = selectedBatch;
   const selStatus = sel ? runStatus(sel.status) : null;
 
@@ -118,13 +110,24 @@ export default function PushHistoryPage() {
       <KpiRow cols={4}>
         <KpiCard label="Envois chargés" value={rows.length} sub="les plus récents" icon={Send} tone="primary" />
         <KpiCard label="Réussis" value={stats.success} sub="sur les envois chargés" icon={CircleCheck} tone="success" />
-        <KpiCard label="Partiels" value={stats.partial} sub="au moins un PIN en échec" icon={TriangleAlert} tone="warning" subTone={stats.partial > 0 ? "warning" : undefined} />
+        <KpiCard label="Partiels" value={stats.partial} sub="envoi partiel ou en erreur" icon={TriangleAlert} tone="warning" subTone={stats.partial > 0 ? "warning" : undefined} />
         <KpiCard label="PIN en échec" value={pinsFailed} sub="sur les envois chargés" icon={CircleX} tone="error" subTone={pinsFailed > 0 ? "error" : undefined} />
       </KpiRow>
 
       <PageGrid>
         <Panel className="col-span-7">
-          <PanelHeader title="Envois récents vers les appareils" sub="Les 100 plus récents pour les filtres choisis" />
+          <PanelHeader title="Envois récents vers les appareils" sub="Les 100 plus récents pour les filtres choisis">
+            <div className="flex h-8 items-center gap-[7px] rounded-lg border border-grey/32 bg-card px-2.5 focus-within:border-primary">
+              <Hash className="h-[15px] w-[15px] shrink-0 text-muted-foreground" aria-hidden="true" />
+              <input
+                value={deviceIdFilter}
+                onChange={(event) => setDeviceIdFilter(event.target.value)}
+                placeholder="N° d'appareil"
+                aria-label="Filtrer par numéro d'appareil"
+                className="w-[100px] bg-transparent font-mono text-[13px] text-foreground outline-none placeholder:font-sans placeholder:text-muted-foreground"
+              />
+            </div>
+          </PanelHeader>
           <FlexTable
             label="Envois récents vers les appareils"
             columns={[
@@ -176,7 +179,8 @@ export default function PushHistoryPage() {
           </FlexTable>
         </Panel>
 
-        <Panel className="col-span-5">
+        {/* Sticky: the page scrolls, the detail of a batch picked low in the list stays in view. */}
+        <Panel className="sticky top-0 col-span-5">
           {detailLoading && !sel ? (
             <div className="flex justify-center py-10"><Loader2 className="h-6 w-6 animate-spin text-primary" /></div>
           ) : sel && selStatus ? (
@@ -189,7 +193,9 @@ export default function PushHistoryPage() {
                   policyLabel(sel.policy),
                   sel.sync_run_id != null ? `run #${sel.sync_run_id}` : "",
                 ].filter(Boolean).join(" · ")}
-              />
+              >
+                {detailLoading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
+              </PanelHeader>
               <div className="flex flex-wrap gap-1.5 px-[18px] pt-3">
                 <Chip tone="grey">{sel.pins_attempted} tentés</Chip>
                 <Chip tone="success">{sel.pins_success} OK</Chip>
@@ -203,7 +209,7 @@ export default function PushHistoryPage() {
                   { label: "Membre", flex: 1.6 },
                   { label: "Statut", flex: 0.8, align: "right" },
                 ]}
-                empty="Aucun détail par PIN pour cet envoi. Les terminaux autonomes n'enregistrent que le total."
+                empty="Aucun détail par PIN enregistré pour cet envoi (un terminal autonome n'enregistre jamais que le total)."
               >
                 {selectedPins.map((pin) => {
                   const ps = runStatus(pin.status);

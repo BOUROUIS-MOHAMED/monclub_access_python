@@ -555,7 +555,7 @@ export default function EnrollPage() {
           <PanelHeader
             title="Doigt et capture"
             sub={selectedUser
-              ? `${selectedUser.fullName || "Ce membre"} a déjà ${existingSlots.size} empreinte${existingSlots.size > 1 ? "s" : ""} (copie locale du serveur)`
+              ? `${selectedUser.fullName || "Ce membre"} : ${existingSlots.size} doigt${existingSlots.size > 1 ? "s" : ""} déjà enregistré${existingSlots.size > 1 ? "s" : ""} (copie locale du serveur)`
               : "Choisissez un membre dans « Nouvelle capture »"}
           />
           {/* Slot picker: the same fingerId as the « Doigt » field (numbers only — Access names no finger). */}
@@ -575,6 +575,7 @@ export default function EnrollPage() {
                     className={cn(
                       "grid h-10 w-10 cursor-pointer place-items-center rounded-lg border font-mono text-[15px] font-bold transition-colors disabled:cursor-not-allowed disabled:opacity-60",
                       i === 5 && "ml-3",
+                      on && has && "ring-2 ring-success ring-offset-2 ring-offset-card",
                       on
                         ? "border-primary bg-primary text-primary-foreground"
                         : has
@@ -590,6 +591,11 @@ export default function EnrollPage() {
             <div className="mt-2 text-[12.5px] text-muted-foreground">
               Vert = déjà enregistré pour ce membre · numéros 0 à 9 comme dans le tableau de bord
             </div>
+            {existingSlots.has(fingerNum) && (
+              <div className="mt-1 text-[12.5px] font-semibold text-success-ink">
+                Le doigt {fingerNum} est déjà enregistré pour ce membre.
+              </div>
+            )}
           </div>
 
           {/* The live capture panel — phase + sample counter are both real. */}
