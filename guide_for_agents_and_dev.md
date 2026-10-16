@@ -4444,8 +4444,12 @@ drive while v2 is ON (`local_api_routes.py::_door_request_via_driver`: the desk'
 `{ok, requested, notDriver, targetConnected}`), so every caller — the Devices page, the favourites overlay, the
 tray panel, the tray menu and the global favourite shortcuts (`src-tauri/src/lib.rs`) — reaches the driver
 (review round 5: before, only the Devices page did); every caller shows it as "demandé au PC pilote", never
-as an opened door (review round 6: `lib.rs` shortcut → red flash with that text, tray menu → log line, overlay
-→ red flash, tray panel → info/destructive notice); a request filed by the local route itself (a remote command
+as an opened door (review round 6; v5: the tray panel and a click in the favourites dock show info when
+`targetConnected`, warning when not; the `lib.rs` shortcut event `favorite-shortcut-triggered` carries
+`status` = `opened` (2xx accepted) / `requested` / `requested_offline` / `failed`, and the dock flashes
+success / info / warning / red from it — `ok` + the French `error` text stay, matched only when `status` is
+missing, for an older shell `[CODE: lib.rs FavoriteShortcutEvent, FavoritesOverlayPage.tsx]`; tray menu → log
+line); a request filed by the local route itself (a remote command
 run in process, `LocalCtx.in_process`) is never re-filed. The server's DOOR_OPEN payload is `{doorNumber}`
 only (`AccessPcCommandPayloads.doorOpen`), so a favourite's own pulse time is lost: the driver pulses 3 s
 (`handlers.py::door_open`) — a contract limit (P3c-2). With v2 not ON it answers 409 `notDriver` as before;

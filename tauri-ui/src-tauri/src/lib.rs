@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::{
     image::Image,
-    menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder},
+    menu::{IconMenuItem, Menu, MenuBuilder, MenuItemBuilder, Submenu, SubmenuBuilder},
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager,
 };
@@ -141,6 +141,35 @@ fn desktop_window_icon(role: &str) -> Result<Image<'static>, Box<dyn std::error:
     }
 }
 
+// ─── Access tray menu icons ───
+// Lucide shapes from the v5 design (win.logic.js tray menu), stroked in the design's
+// icon grey #637381 so they read on a light and a dark menu. 16×16 because muda draws
+// every Windows menu bitmap into a fixed 16×16 rect (muda platform_impl/windows/icon.rs
+// `to_hbitmap`). The TV tray has no icons.
+const MENU_ICON_MONITOR: &[u8] = include_bytes!("../icons/menu/monitor.png");
+const MENU_ICON_PANEL: &[u8] = include_bytes!("../icons/menu/panel-left-close.png");
+const MENU_ICON_STAR: &[u8] = include_bytes!("../icons/menu/star.png");
+const MENU_ICON_MONITOR_PLAY: &[u8] = include_bytes!("../icons/menu/monitor-play.png");
+const MENU_ICON_DOOR_OPEN: &[u8] = include_bytes!("../icons/menu/door-open.png");
+const MENU_ICON_REFRESH: &[u8] = include_bytes!("../icons/menu/refresh-cw.png");
+const MENU_ICON_SCAN: &[u8] = include_bytes!("../icons/menu/scan-line.png");
+const MENU_ICON_POWER: &[u8] = include_bytes!("../icons/menu/power.png");
+
+/// Decode one embedded menu icon. A PNG that does not decode leaves the entry without
+/// an icon; it never fails the tray menu.
+fn menu_icon(png: &[u8]) -> Option<Image<'static>> {
+    Image::from_bytes(png).ok()
+}
+
+fn tray_icon_item(
+    app: &AppHandle,
+    id: &str,
+    text: &str,
+    png: &[u8],
+) -> tauri::Result<IconMenuItem<tauri::Wry>> {
+    IconMenuItem::with_id(app, id, text, true, menu_icon(png), None::<&str>)
+}
+
 fn api_base(port: u16) -> String {
     format!("http://127.0.0.1:{}/api/v2", port)
 }
@@ -151,7 +180,9 @@ fn local_api_token() -> String {
     env::var("MONCLUB_LOCAL_API_TOKEN").unwrap_or_default()
 }
 
-fn fetch_devices(port: u16) -> Vec<DeviceInfo> {
+/// `None` when the list could not be read (local API not up yet, error answer), so the
+/// tray menu does not claim « Aucun appareil » for a failed read.
+fn fetch_devices(port: u16) -> Option<Vec<DeviceInfo>> {
     let url = format!("{}/sync/cache/devices", api_base(port));
     reqwest::blocking::Client::new()
         .get(&url)
@@ -160,10 +191,11 @@ fn fetch_devices(port: u16) -> Vec<DeviceInfo> {
         .ok()
         .and_then(|r| r.json::<DevicesResponse>().ok())
         .map(|r| r.devices)
-        .unwrap_or_default()
 }
 
-fn fetch_presets(port: u16, device_id: i64) -> Vec<DoorPreset> {
+/// `None` when the presets could not be read, like `fetch_devices`: a failed read is not
+/// « aucun preset de porte ».
+fn fetch_presets(port: u16, device_id: i64) -> Option<Vec<DoorPreset>> {
     let url = format!("{}/devices/{}/door-presets", api_base(port), device_id);
     reqwest::blocking::Client::new()
         .get(&url)
@@ -172,7 +204,6 @@ fn fetch_presets(port: u16, device_id: i64) -> Vec<DoorPreset> {
         .ok()
         .and_then(|r| r.json::<PresetsResponse>().ok())
         .map(|r| r.presets)
-        .unwrap_or_default()
 }
 
 /// Fire a door open from the native tray. Returns whether the door actually opened.
@@ -202,8 +233,9 @@ fn post_open_door(port: u16, device_id: i64, door_number: i64, pulse_seconds: i6
         Ok(resp) => {
             let status = resp.status();
             let payload = resp.json::<serde_json::Value>().unwrap_or(serde_json::Value::Null);
-            // The endpoint answers 200 {"ok":false} for a driver-level refusal, so
-            // HTTP success alone is NOT proof the door opened.
+            // Every 2xx the door route sends today carries ok:true; refusals and failures
+            // are 4xx/5xx (local_access_api_v2.py::_handle_device_door_open, 202 from
+            // v2_routes.py::_file_request). The `ok` read is kept as a guard only.
             let ok = status.is_success()
                 && payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(status.is_success());
             if payload.get("requested").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -398,96 +430,103 @@ fn refresh_tray_menu(app: AppHandle, state: tauri::State<'_, ApiPort>) -> Result
     // Fetch data on a thread to not block the main thread
     std::thread::spawn(move || {
         let devices = fetch_devices(port);
-        let _ = rebuild_tray_menu(&app_clone, port, &devices);
+        let _ = rebuild_tray_menu(&app_clone, port, devices.as_deref());
     });
 
     Ok(())
 }
 
+/// Tray label of a device: its name (« Appareil #id » when it has none), then its address.
+fn tray_device_label(dev: &DeviceInfo) -> String {
+    let name = dev
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Appareil #{}", dev.id));
+    match dev.ip_address.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(ip) => format!("{} · {}", name, ip),
+        None => name,
+    }
+}
+
+/// Tray label of a door preset, as the design writes it: « Entrée · porte 1 · 3 s »
+/// (« Porte 1 · 3 s » when the preset has no door name, like `TrayPanelPage.tsx`).
+fn tray_preset_label(preset: &DoorPreset) -> String {
+    let door = preset.door_name.trim();
+    if door.is_empty() {
+        format!("Porte {} · {} s", preset.door_number, preset.pulse_seconds)
+    } else {
+        format!("{} · porte {} · {} s", door, preset.door_number, preset.pulse_seconds)
+    }
+}
+
 fn rebuild_tray_menu(
     app: &AppHandle,
     port: u16,
-    devices: &[DeviceInfo],
+    devices: Option<&[DeviceInfo]>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // ── Show ──
-    let show_item = MenuItemBuilder::with_id("tray_show", "Afficher MonClub Access").build(app)?;
-    // ── Sync Now ──
-    let sync_item = MenuItemBuilder::with_id("tray_sync", "Synchroniser").build(app)?;
-    // ── Scan Card ──
-    let scan_item = MenuItemBuilder::with_id("tray_scan", "Scanner une carte").build(app)?;
-
     // ── Open submenu (devices → presets) ──
     let mut open_sub = SubmenuBuilder::with_id(app, "tray_open", "Ouvrir une porte");
+    if let Some(icon) = menu_icon(MENU_ICON_DOOR_OPEN) {
+        open_sub = open_sub.submenu_icon(icon);
+    }
 
-    if devices.is_empty() {
-        let no_dev = MenuItemBuilder::with_id("tray_no_devices", "Aucun appareil")
-            .enabled(false)
-            .build(app)?;
-        open_sub = open_sub.item(&no_dev);
-    } else {
-        for dev in devices {
-            let dev_name = dev.name.as_deref().unwrap_or("Appareil");
-            let dev_label = format!(
-                "[{}] {}{}",
-                dev.id,
-                dev_name,
-                dev.ip_address
-                    .as_deref()
-                    .map(|ip| format!(" ({})", ip))
-                    .unwrap_or_default()
-            );
+    match devices {
+        Some(list) if !list.is_empty() => {
+            for dev in list {
+                let dev_label = tray_device_label(dev);
+                let presets = fetch_presets(port, dev.id);
 
-            let presets = fetch_presets(port, dev.id);
-
-            if presets.is_empty() {
-                // No presets → single disabled item
-                let item_id = format!("tray_dev_{}_nopreset", dev.id);
-                let item =
-                    MenuItemBuilder::with_id(item_id, format!("{} — aucun preset", dev_label))
+                if presets.as_ref().map_or(true, |p| p.is_empty()) {
+                    // No presets, or they could not be read → single disabled item
+                    let text = if presets.is_none() {
+                        format!("{} · portes non chargées", dev_label)
+                    } else {
+                        format!("{} · aucun preset de porte", dev_label)
+                    };
+                    let item_id = format!("tray_dev_{}_nopreset", dev.id);
+                    let item = MenuItemBuilder::with_id(item_id, text)
                         .enabled(false)
                         .build(app)?;
-                open_sub = open_sub.item(&item);
-            } else {
-                // Device submenu with presets
-                let mut dev_sub =
-                    SubmenuBuilder::with_id(app, format!("tray_dev_{}", dev.id), &dev_label);
-                for preset in &presets {
-                    let preset_label = format!(
-                        "{} (porte #{}, {}s)",
-                        preset.door_name, preset.door_number, preset.pulse_seconds
-                    );
-                    let item_id = format!(
-                        "tray_open_{}_{}_{}",
-                        dev.id, preset.door_number, preset.pulse_seconds
-                    );
-                    let item = MenuItemBuilder::with_id(item_id, preset_label).build(app)?;
-                    dev_sub = dev_sub.item(&item);
+                    open_sub = open_sub.item(&item);
+                } else {
+                    let presets = presets.unwrap_or_default();
+                    // Device submenu with presets
+                    let mut dev_sub =
+                        SubmenuBuilder::with_id(app, format!("tray_dev_{}", dev.id), &dev_label);
+                    for preset in &presets {
+                        let item_id = format!(
+                            "tray_open_{}_{}_{}",
+                            dev.id, preset.door_number, preset.pulse_seconds
+                        );
+                        let item = MenuItemBuilder::with_id(item_id, tray_preset_label(preset))
+                            .build(app)?;
+                        dev_sub = dev_sub.item(&item);
+                    }
+                    let dev_menu = dev_sub.build()?;
+                    open_sub = open_sub.item(&dev_menu);
                 }
-                let dev_menu = dev_sub.build()?;
-                open_sub = open_sub.item(&dev_menu);
             }
+        }
+        other => {
+            // A list that could not be read (local API not up yet, error answer) is not
+            // "no device": say so; the next refresh (5 min, or a sync) retries.
+            let label = if other.is_none() {
+                "Liste des appareils non chargée"
+            } else {
+                "Aucun appareil"
+            };
+            let no_dev = MenuItemBuilder::with_id("tray_no_devices", label)
+                .enabled(false)
+                .build(app)?;
+            open_sub = open_sub.item(&no_dev);
         }
     }
 
     let open_menu = open_sub.build()?;
-
-    // ── Separator + Quit ──
-    let quit_item = MenuItemBuilder::with_id("tray_quit", "Quitter").build(app)?;
-    let panel_item = MenuItemBuilder::with_id("tray_panel", "Panneau rapide").build(app)?;
-    let favorites_item = MenuItemBuilder::with_id("tray_favorites", "Accès rapide (favoris)").build(app)?;
-    let popup_item = MenuItemBuilder::with_id("tray_popup", "Écran d’entrée").build(app)?;
-
-    let menu = MenuBuilder::new(app)
-        .item(&show_item)
-        .item(&panel_item)
-        .item(&favorites_item)
-        .item(&popup_item)
-        .item(&open_menu)
-        .item(&sync_item)
-        .item(&scan_item)
-        .separator()
-        .item(&quit_item)
-        .build()?;
+    let menu = build_access_tray_menu(app, &open_menu)?;
 
     // Update existing tray or ignore if not found
     if let Some(tray) = app.tray_by_id("main_tray") {
@@ -495,6 +534,36 @@ fn rebuild_tray_menu(
     }
 
     Ok(())
+}
+
+/// The access tray's right-click menu, built the same way at start-up
+/// (`setup_access_tray`) and on every refresh (`rebuild_tray_menu`) so the two never
+/// drift. `open_menu` is the « Ouvrir une porte » submenu. The ids are the ones the
+/// tray's `on_menu_event` matches.
+fn build_access_tray_menu(
+    app: &AppHandle,
+    open_menu: &Submenu<tauri::Wry>,
+) -> tauri::Result<Menu<tauri::Wry>> {
+    let show_item = tray_icon_item(app, "tray_show", "Afficher MonClub Access", MENU_ICON_MONITOR)?;
+    let panel_item = tray_icon_item(app, "tray_panel", "Panneau rapide", MENU_ICON_PANEL)?;
+    let favorites_item =
+        tray_icon_item(app, "tray_favorites", "Accès rapide (favoris)", MENU_ICON_STAR)?;
+    let popup_item = tray_icon_item(app, "tray_popup", "Écran d’entrée", MENU_ICON_MONITOR_PLAY)?;
+    let sync_item = tray_icon_item(app, "tray_sync", "Synchroniser", MENU_ICON_REFRESH)?;
+    let scan_item = tray_icon_item(app, "tray_scan", "Scanner une carte", MENU_ICON_SCAN)?;
+    let quit_item = tray_icon_item(app, "tray_quit", "Quitter", MENU_ICON_POWER)?;
+
+    MenuBuilder::new(app)
+        .item(&show_item)
+        .item(&panel_item)
+        .item(&favorites_item)
+        .item(&popup_item)
+        .item(open_menu)
+        .item(&sync_item)
+        .item(&scan_item)
+        .separator()
+        .item(&quit_item)
+        .build()
 }
 
 // ─── Setup tray on app start ───
@@ -583,7 +652,7 @@ fn show_popup_window(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> 
         POPUP_LABEL,
         tauri::WebviewUrl::App("/popup".into()),
     )
-    .title("MonClub Access — Écran Notification")
+    .title("MonClub Access — Écran d’entrée")
     .inner_size(1024.0, 600.0)
     .resizable(true)
     .decorations(true)
@@ -1055,6 +1124,11 @@ struct FavoriteShortcutEvent {
     door_name: String,
     device_name: String,
     shortcut: String,
+    /// What happened, for the dock (`FavoritesOverlayPage.tsx`): "opened" (2xx: the
+    /// controller accepted the open command), "requested" (202 filed for the PC pilote,
+    /// which is connected), "requested_offline" (filed, PC pilote not connected) or
+    /// "failed". `ok` and `error` keep their old meaning for a dock built before `status`.
+    status: &'static str,
     ok: bool,
     error: Option<String>,
 }
@@ -1231,7 +1305,7 @@ fn do_register_shortcuts(app: &AppHandle, shortcuts: Vec<FavoriteShortcutEntry>)
                         "doorNumber":   e.door_number,
                         "pulseSeconds": e.pulse_seconds,
                     });
-                    let (ok, err) = match reqwest::blocking::Client::new()
+                    let (status, ok, err) = match reqwest::blocking::Client::new()
                         .post(&url)
                         .header("X-Local-Token", local_api_token())
                         .json(&body)
@@ -1244,23 +1318,24 @@ fn do_register_shortcuts(app: &AppHandle, shortcuts: Vec<FavoriteShortcutEntry>)
                             let v = r.json::<serde_json::Value>().unwrap_or(serde_json::Value::Null);
                             if v.get("requested").and_then(|x| x.as_bool()).unwrap_or(false) {
                                 let connected = v.get("targetConnected").and_then(|x| x.as_bool()).unwrap_or(false);
-                                (false, Some(if connected {
-                                    "demandé au PC pilote (résultat non visible ici)".to_string()
+                                if connected {
+                                    ("requested", false, Some("demandé au PC pilote (résultat non visible ici)".to_string()))
                                 } else {
-                                    "PC pilote non connecté : la demande expirera sans ouvrir".to_string()
-                                }))
+                                    ("requested_offline", false, Some("PC pilote non connecté : la demande expirera sans ouvrir".to_string()))
+                                }
                             } else {
-                                (true, None)
+                                ("opened", true, None)
                             }
                         }
-                        Ok(r) => (false, Some(format!("HTTP {}", r.status()))),
-                        Err(e) => (false, Some(e.to_string())),
+                        Ok(r) => ("failed", false, Some(format!("HTTP {}", r.status()))),
+                        Err(e) => ("failed", false, Some(e.to_string())),
                     };
                     let payload = FavoriteShortcutEvent {
                         favorite_id: e.favorite_id,
                         door_name: e.door_name.clone(),
                         device_name: e.device_name.clone(),
                         shortcut: e.shortcut.clone(),
+                        status,
                         ok,
                         error: err,
                     };
@@ -1468,32 +1543,18 @@ fn unregister_favorite_shortcuts(app: AppHandle) -> Result<(), String> {
 fn setup_access_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::error::Error>> {
     let icon = desktop_window_icon("access")?;
 
-    let show_item = MenuItemBuilder::with_id("tray_show", "Afficher MonClub Access").build(app)?;
-    let panel_item = MenuItemBuilder::with_id("tray_panel", "Panneau rapide").build(app)?;
-    let favorites_item = MenuItemBuilder::with_id("tray_favorites", "Accès rapide (favoris)").build(app)?;
-    let popup_item = MenuItemBuilder::with_id("tray_popup", "Écran d’entrée").build(app)?;
-    let sync_item = MenuItemBuilder::with_id("tray_sync", "Synchroniser").build(app)?;
-    let scan_item = MenuItemBuilder::with_id("tray_scan", "Scanner une carte").build(app)?;
-    let open_sub = SubmenuBuilder::with_id(app, "tray_open", "Ouvrir une porte")
+    let mut open_sub = SubmenuBuilder::with_id(app, "tray_open", "Ouvrir une porte");
+    if let Some(icon) = menu_icon(MENU_ICON_DOOR_OPEN) {
+        open_sub = open_sub.submenu_icon(icon);
+    }
+    let open_sub = open_sub
         .item(
-            &MenuItemBuilder::with_id("tray_no_devices", "Chargement…")
+            &MenuItemBuilder::with_id("tray_no_devices", "Chargement des appareils…")
                 .enabled(false)
                 .build(app)?,
         )
         .build()?;
-    let quit_item = MenuItemBuilder::with_id("tray_quit", "Quitter").build(app)?;
-
-    let menu = MenuBuilder::new(app)
-        .item(&show_item)
-        .item(&panel_item)
-        .item(&favorites_item)
-        .item(&popup_item)
-        .item(&open_sub)
-        .item(&sync_item)
-        .item(&scan_item)
-        .separator()
-        .item(&quit_item)
-        .build()?;
+    let menu = build_access_tray_menu(app, &open_sub)?;
 
     let app_handle = app.clone();
 
