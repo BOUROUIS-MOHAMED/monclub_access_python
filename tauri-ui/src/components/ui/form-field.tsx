@@ -29,8 +29,9 @@ export function FormField({ label, full, addon, className, children }: {
   addon?: React.ReactNode;
   className?: string; children: React.ReactNode;
 }) {
+  // A <label>: names the control inside it and focuses it on a click in the box.
   return (
-    <div
+    <label
       className={cn(
         "relative mt-3 flex h-[46px] items-center gap-2 rounded-lg border border-grey/32 px-3 transition-colors focus-within:border-primary",
         full && "col-span-full",
@@ -42,7 +43,7 @@ export function FormField({ label, full, addon, className, children }: {
       </span>
       <div className="min-w-0 flex-1">{children}</div>
       {addon}
-    </div>
+    </label>
   );
 }
 

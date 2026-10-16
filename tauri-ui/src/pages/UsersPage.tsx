@@ -649,7 +649,7 @@ export default function UsersPage() {
         expectedVersion: m.version ?? undefined,
       }, 30000);
       if (res.ok) setMessage(`Changement appliqué en ligne : ${opLabel(opKind)}.`);
-      else if (res.conflict) setQueueError("Cet abonnement a changé sur le serveur. Ouvrez l'onglet « Modifications d'abonnement » pour abandonner votre modification.");
+      else if (res.conflict) setQueueError("Cet abonnement a changé sur le serveur entre-temps : rien n'a été envoyé. Rechargez puis recommencez la modification.");
       else if (res.queued) setMessage(res.gated ? `Changement mis en file : ${opLabel(opKind)}. Il s'appliquera quand le serveur acceptera les opérations d'argent.` : `Changement mis en file (hors ligne) : ${opLabel(opKind)}. Il sera synchronisé automatiquement.`);
       else if (res.needsFix) setQueueError(res.error || `Changement refusé : ${opLabel(opKind)}. Corrigez les valeurs et réessayez.`);
       else setQueueError(res.error || `Échec du changement : ${opLabel(opKind)}.`);
@@ -944,6 +944,7 @@ export default function UsersPage() {
       await patch(`/offline-creations/${editing.local_id}`, { payload, tryToCreate: true });
       setEditing(null);
       setMemberOpen(false);
+      setMembershipForm({ ...MEMBERSHIP_FORM_INIT });
       setMessage("Création en attente mise à jour.");
       await Promise.all([refreshQueue(), loadRoster()]);
       return;
@@ -980,6 +981,7 @@ export default function UsersPage() {
       await patch(`/offline-creations/${editing.local_id}`, { payload, tryToCreate: true });
       setEditing(null);
       setMemberOpen(false);
+      setAccountForm({ ...ACCOUNT_FORM_INIT });
       setMessage("Création en attente mise à jour.");
       await Promise.all([refreshQueue(), loadRoster()]);
       return;
@@ -1137,7 +1139,10 @@ export default function UsersPage() {
     // call (reloadUsers / loadMemberships / refreshQueue / loadRoster) are
     // stable useCallbacks, so capturing them from the last committed render is
     // correct.
-  }), [allCount, loading, queueLoading, tab]);
+    // rosterQ / rosterStatus / rosterPage: « Recharger » calls loadRoster,
+    // which is rebuilt when they change — re-publish so it never reloads a
+    // previous page, filter or search.
+  }), [allCount, loading, queueLoading, tab, rosterQ, rosterStatus, rosterPage]);
   const rosterTotalPages = Math.max(1, Math.ceil(rosterTotal / ROSTER_SIZE));
 
   const canMutate = (m: MemberRosterRow) => !m.offlinePending && Number(m.activeMembershipId) > 0;
@@ -1613,7 +1618,7 @@ export default function UsersPage() {
         footer={(
           <>
             <ActionButton kind="outline" className="px-4" onClick={() => onMemberOpenChange(false)}>
-              {editingKind ? "Annuler la modification" : "Annuler"}
+              {editingKind ? "Annuler la modification" : "Fermer"}
             </ActionButton>
             {formKind === "account_plus_membership" ? (
               <ActionButton kind="primary" className="px-4" onClick={submitAccount}>
@@ -1727,16 +1732,21 @@ export default function UsersPage() {
             return;
           }
           void runAction(
-            () => post("/offline-creations/queue", {
-              creationKind: d.creationKind,
-              payload: d.payload,
-              failure: {
-                failureType: d.attempt.failureType,
-                failureCode: d.attempt.failureCode,
-                lastHttpStatus: d.attempt.lastHttpStatus,
-                error: d.attempt.error,
-              },
-            }),
+            async () => {
+              await post("/offline-creations/queue", {
+                creationKind: d.creationKind,
+                payload: d.payload,
+                failure: {
+                  failureType: d.attempt.failureType,
+                  failureCode: d.attempt.failureCode,
+                  lastHttpStatus: d.attempt.lastHttpStatus,
+                  error: d.attempt.error,
+                },
+              });
+              // Queued: clear that form so a later « Nouveau membre » does not resend it.
+              if (d.creationKind === "membership_only") setMembershipForm({ ...MEMBERSHIP_FORM_INIT });
+              else setAccountForm({ ...ACCOUNT_FORM_INIT });
+            },
             "Création enregistrée dans la file hors ligne.",
           );
           setDecisionOpen(false);
