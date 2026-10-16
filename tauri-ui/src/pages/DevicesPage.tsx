@@ -556,13 +556,10 @@ export default function DevicesPage() {
   // knows: an erase hold (or holds not read yet), the erase wizard open on this device,
   // or a user push running on it. null = free to read.
   const infoDeviceId = infoDialog?.deviceId ?? null;
-  // A turnstile accepts ONE connection at a time (owner, 10-16) and the ULTRA worker of
-  // this PC already holds it; /devices/{id}/info opens its own connection
-  // (local_access_api_v2.py::_handle_device_info -> _connect_device), so it is never
-  // started by itself while a worker holds the device.
+  // A worker-held turnstile is read too: /devices/{id}/info runs on the ULTRA worker's own
+  // connection (local_access_api_v2.py::_handle_device_info -> _run_on_device_sdk), never a
+  // second one -- one parameter read and six row counts, no table read (guide §3.1a).
   const countsBlockedReason: string | null = infoDeviceId == null ? null
-    : status?.ultra?.devices?.[String(infoDeviceId)]
-      ? "Le tourniquet n'accepte qu'une connexion à la fois, déjà tenue par ce PC : pas de lecture en direct automatique."
     : holdsRead === "pending" ? "Lecture des retenues d'effacement en cours…"
     : holdsRead === "failed" ? "Les retenues d'effacement n'ont pas pu être lues : pas de lecture en direct automatique."
     : holdsUnknown ?"Les retenues d'effacement n'ont pas pu être lues : aucune lecture en direct tant qu'elles ne le sont pas."
