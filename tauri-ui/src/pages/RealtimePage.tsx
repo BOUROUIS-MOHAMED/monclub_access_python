@@ -155,8 +155,7 @@ export default function RealtimePage() {
             ]}
             empty={loadingHistory
               ? <Loader2 className="mx-auto h-5 w-5 animate-spin text-primary" />
-              : error ? "Historique non chargé : voir le message en bas de page."
-              : "Aucun passage reçu du serveur pour l'instant."}
+              : "Aucun passage à afficher."}
             footer={
               <>
                 {nextBefore && (
