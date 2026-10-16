@@ -1,3 +1,12 @@
+// Mise à jour — Access v5 redesign (docs/access-redesign-v5: `tp === 'update'`
+// in main.logic.js, board S25), translated to French.
+//
+// Same calls and polling as before: /update/status every 3 s, /update/version
+// once, and the check / download / install / cancel actions. The design's
+// "Revenir à une version précédente" button is NOT built: no rollback endpoint
+// exists — a rollback only arrives as an offer (`status.rollback`), which this
+// page titles "Retour à une version précédente".
+
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   getAccessUpdateStatus,
@@ -8,39 +17,34 @@ import {
   getAccessVersionInfo,
 } from "@/api/accessUpdate";
 import type { UpdateStatusResponse, UpdateVersionInfoResponse } from "@/api/types";
-import { Button } from "@/components/ui/button";
-import { Progress } from "@/components/ui/progress";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { Separator } from "@/components/ui/separator";
-import { cn } from "@/lib/utils";
+import { usePageChrome } from "@/context/PageChromeContext";
+import { ActionButton } from "@/components/ui/action-button";
+import { ToneIcon } from "@/components/ui/chip";
+import { KpiCard, KpiRow } from "@/components/ui/kpi-card";
+import { DashedRule, ListRow, PageGrid, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
 import {
+  CircleCheck,
   Download,
-  Zap,
-  CheckCircle2,
-  RefreshCw,
-  Trash2,
-  AlertCircle,
-  Calendar,
-  CalendarClock,
-  HardDrive,
-  Tag,
   Info,
-  Shield,
   Loader2,
+  Power,
+  RefreshCw,
+  ScrollText,
+  Trash2,
 } from "lucide-react";
 import ReleaseNotes from "@/components/update/ReleaseNotes";
-import UpdateNotices from "@/components/update/UpdateNotices";
+import UpdateNoticesFr from "@/components/update/UpdateNoticesFr";
 
 function formatBytes(bytes: number | null | undefined): string {
   if (!bytes) return "—";
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1).replace(".", ",")} Ko`;
+  return `${(bytes / (1024 * 1024)).toFixed(1).replace(".", ",")} Mo`;
 }
 
 function formatDate(iso: string | null | undefined): string {
   if (!iso) return "—";
   try {
-    return new Date(iso).toLocaleDateString(undefined, {
+    return new Date(iso).toLocaleDateString("fr-FR", {
       year: "numeric",
       month: "long",
       day: "numeric",
@@ -50,30 +54,8 @@ function formatDate(iso: string | null | undefined): string {
   }
 }
 
-function VersionBadge({ version, codename, variant = "latest" }: { version: string; codename?: string | null; variant?: "current" | "latest" }) {
-  return (
-    <span
-      className={cn(
-        "inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[12px] font-semibold tracking-wide",
-        variant === "latest"
-          ? "bg-gradient-to-r from-primary/20 to-primary/10 text-primary border border-primary/20"
-          : "bg-muted text-muted-foreground border border-border",
-      )}
-    >
-      <Tag className="h-3 w-3" />
-      {version}{codename ? ` ${codename}` : ""}
-    </span>
-  );
-}
-
-function MetaRow({ icon: Icon, label, value }: { icon: React.ElementType; label: string; value: string }) {
-  return (
-    <div className="flex items-center gap-2.5 text-[13px]">
-      <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-      <span className="text-muted-foreground">{label}</span>
-      <span className="font-medium text-foreground ml-auto">{value}</span>
-    </div>
-  );
+function withCodename(version: string, codename?: string | null): string {
+  return codename ? `${version} « ${codename} »` : version;
 }
 
 export default function UpdatePage() {
@@ -104,7 +86,7 @@ export default function UpdatePage() {
     };
   }, [fetchStatus]);
 
-  const handleCheck = async () => {
+  const handleCheck = useCallback(async () => {
     setChecking(true);
     try {
       await checkAccessUpdate();
@@ -114,7 +96,7 @@ export default function UpdatePage() {
     } finally {
       setChecking(false);
     }
-  };
+  }, [fetchStatus]);
 
   const handleDownload = async () => {
     setDownloading(true);
@@ -135,7 +117,7 @@ export default function UpdatePage() {
       await installAccessUpdate();
     } catch (e) {
       // The app keeps running: show why (updater v2, D1).
-      setInstallError(e instanceof Error && e.message ? e.message : "unknown error");
+      setInstallError(e instanceof Error && e.message ? e.message : "erreur inconnue");
       setInstalling(false);
       await fetchStatus();
     }
@@ -153,201 +135,146 @@ export default function UpdatePage() {
     }
   };
 
+  usePageChrome(() => ({
+    subtitle: "Logiciel et notes de version",
+    actions: (
+      <ActionButton kind="outline" icon={checking ? Loader2 : RefreshCw} spin={checking} onClick={() => { void handleCheck(); }} disabled={checking}>
+        Rechercher une mise à jour
+      </ActionButton>
+    ),
+  }), [checking, handleCheck]);
+
   const curVersion = status?.currentVersion ?? versionInfo?.currentVersion ?? "0.0.0";
   const curCodename = status?.currentCodename ?? versionInfo?.currentCodename ?? "";
   const isDownloading = status?.downloading ?? false;
   const progress = status?.progressPercent ?? null;
   const updateAvailable = status?.updateAvailable ?? false;
+  const channelPlatform = [
+    status?.channel ? `canal ${status.channel}` : "",
+    status?.platform ? status.platform : "",
+  ].filter(Boolean).join(" · ");
+  const lastCheck = status?.lastCheckAt ? new Date(status.lastCheckAt * 1000).toLocaleTimeString("fr-FR") : null;
+
+  // Third KPI: the download state of the offered version.
+  const dl = !updateAvailable
+    ? { value: "—", sub: "aucune mise à jour", tone: "grey" as const, subTone: undefined }
+    : isDownloading
+      ? { value: progress != null ? `${progress} %` : "…", sub: "en cours", tone: "primary" as const, subTone: "primary" as const }
+      : status?.downloaded
+        ? { value: "100 %", sub: "prête à installer", tone: "success" as const, subTone: "success" as const }
+        : { value: "—", sub: "pas encore téléchargée", tone: "grey" as const, subTone: undefined };
+
+  const publishedBits = [
+    status?.releaseDate ? `Publiée le ${formatDate(status.releaseDate)}` : "",
+    status?.sizeBytes ? `taille ${formatBytes(status.sizeBytes)}` : "",
+    status?.availableUntil ? `disponible jusqu'au ${formatDate(status.availableUntil)}` : "",
+  ].filter(Boolean).join(" · ");
 
   return (
-    <ScrollArea className="h-full">
-      <div className="max-w-2xl mx-auto px-6 py-8 space-y-6">
+    <div className="flex flex-col gap-[18px]">
+      <KpiRow cols={3}>
+        <KpiCard
+          label="Version installée"
+          value={withCodename(curVersion, curCodename)}
+          sub={channelPlatform || undefined}
+          icon={Info}
+          tone="grey"
+        />
+        <KpiCard
+          label="Dernière version"
+          value={updateAvailable && status?.latestVersion ? withCodename(status.latestVersion, status.latestCodename) : withCodename(curVersion, curCodename)}
+          sub={updateAvailable ? (status?.rollback ? "retour à une version précédente" : "mise à jour disponible") : "à jour"}
+          subTone={updateAvailable ? "primary" : "success"}
+          icon={Download}
+          tone="primary"
+        />
+        <KpiCard label="Téléchargement" value={dl.value} sub={dl.sub} subTone={dl.subTone} icon={CircleCheck} tone={dl.tone} />
+      </KpiRow>
 
-        {/* Header */}
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <h1 className="text-xl font-semibold text-foreground">MonClub Access</h1>
-            <p className="text-[13px] text-muted-foreground mt-0.5">Software updates & release notes</p>
-          </div>
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-2 text-[13px] shrink-0"
-            onClick={handleCheck}
-            disabled={checking}
-          >
-            {checking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-            Check for updates
-          </Button>
-        </div>
+      <UpdateNoticesFr status={status} installError={installError} />
 
-        <UpdateNotices status={status} installError={installError} />
-
-        {/* Current Version Card */}
-        <div className="rounded-xl border border-border bg-card p-4 space-y-3">
-          <div className="flex items-center gap-2">
-            <div className="h-7 w-7 rounded-lg bg-primary/10 flex items-center justify-center">
-              <Shield className="h-4 w-4 text-primary" />
-            </div>
-            <span className="text-[13px] font-medium text-foreground">Installed version</span>
-          </div>
-          <div className="flex items-center gap-3">
-            <VersionBadge version={curVersion} codename={curCodename} variant="current" />
-            {!updateAvailable && (
-              <span className="flex items-center gap-1.5 text-[12px] text-emerald-500 font-medium">
-                <CheckCircle2 className="h-3.5 w-3.5" />
-                Up to date
-              </span>
-            )}
-          </div>
-        </div>
-
-        {/* Update Available Card */}
-        {updateAvailable && status && (
-          <div className="rounded-xl border border-primary/20 bg-gradient-to-b from-primary/5 to-transparent overflow-hidden">
-            {/* Top accent bar */}
-            <div className="h-1 bg-gradient-to-r from-primary via-primary/70 to-primary/30" />
-
-            <div className="p-5 space-y-5">
-              {/* Version header */}
-              <div className="flex items-start justify-between gap-3">
-                <div className="space-y-1.5">
-                  <div className="flex items-center gap-2">
-                    <Zap className="h-4 w-4 text-primary" />
-                    <span className="text-[13px] font-semibold text-foreground">
-                      {status.rollback ? "Return to a previous version" : "Update available"}
-                    </span>
-                  </div>
-                  {status.latestVersion && (
-                    <VersionBadge version={status.latestVersion} codename={status.latestCodename} variant="latest" />
-                  )}
-                </div>
-              </div>
-
-              <Separator className="opacity-50" />
-
-              {/* Metadata */}
-              <div className="space-y-2.5">
-                {status.releaseDate && (
-                  <MetaRow icon={Calendar} label="Released" value={formatDate(status.releaseDate)} />
-                )}
-                {status.availableUntil && (
-                  <MetaRow icon={CalendarClock} label="Available until" value={formatDate(status.availableUntil)} />
-                )}
-                {status.sizeBytes && (
-                  <MetaRow icon={HardDrive} label="Size" value={formatBytes(status.sizeBytes)} />
-                )}
-              </div>
-
-              {/* Release notes */}
+      <PageGrid>
+        {updateAvailable && status ? (
+          <Panel className="col-span-8" aria-label="Mise à jour disponible">
+            <PanelHeader
+              title={`${status.rollback ? "Retour à une version précédente — " : ""}MonClub Access ${status.latestVersion ? withCodename(status.latestVersion, status.latestCodename) : ""}`.trim()}
+              sub={publishedBits || undefined}
+            />
+            <PanelList>
               {status.releaseNotes && (
-                <>
-                  <Separator className="opacity-50" />
-                  <div>
-                    <div className="flex items-center gap-1.5 mb-3">
-                      <Info className="h-3.5 w-3.5 text-muted-foreground" />
-                      <span className="text-[12px] font-medium text-muted-foreground uppercase tracking-wider">Release notes</span>
-                    </div>
+                <div className="-mx-2.5 flex gap-3 rounded-xl p-2.5">
+                  <ToneIcon icon={ScrollText} tone="grey" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[13.5px] font-semibold">Notes de version</div>
                     <ReleaseNotes
-                      className="prose prose-sm dark:prose-invert max-w-none text-[13px] leading-relaxed [&_h1]:text-base [&_h2]:text-[13px] [&_h3]:text-[13px] [&_ul]:pl-4 [&_li]:my-0.5 [&_p]:my-1"
+                      className="mt-1 text-[12.5px] leading-[1.55] text-muted-foreground [&_h1]:text-[13.5px] [&_h1]:font-semibold [&_h2]:text-[13px] [&_h2]:font-semibold [&_h3]:text-[13px] [&_h3]:font-semibold [&_li]:my-0.5 [&_p]:my-1 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:list-decimal [&_ol]:pl-4"
                       html={status.releaseNotes}
                     />
                   </div>
-                </>
+                </div>
               )}
-
-              <Separator className="opacity-50" />
-
-              {/* Download / Install actions */}
-              <div className="space-y-3">
-                {/* Progress bar */}
-                {isDownloading && progress !== null && (
-                  <div className="space-y-1.5">
-                    <div className="flex justify-between text-[12px] text-muted-foreground">
-                      <span>Downloading update…</span>
-                      <span>{progress}%</span>
-                    </div>
-                    <Progress value={progress} className="h-2" />
-                  </div>
-                )}
-                {isDownloading && progress === null && (
-                  <div className="flex items-center gap-2 text-[13px] text-muted-foreground">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    <span>Downloading…</span>
-                  </div>
-                )}
-
-                {/* Action buttons */}
-                <div className="flex items-center gap-2">
-                  {!status.downloaded && !isDownloading && (
-                    <Button
-                      className="gap-2 flex-1"
-                      onClick={handleDownload}
-                      disabled={downloading}
-                    >
-                      {downloading
-                        ? <Loader2 className="h-4 w-4 animate-spin" />
-                        : <Download className="h-4 w-4" />
-                      }
-                      Download update
-                    </Button>
-                  )}
-
-                  {status.downloaded && !isDownloading && (
+              <ListRow
+                icon={Power}
+                tone="primary"
+                title="Installer"
+                sub="L'application redémarre : à faire quand le club est fermé."
+                wrap
+                bar={isDownloading && progress !== null ? progress : undefined}
+                actions={
+                  isDownloading ? (
+                    <span className="inline-flex items-center gap-2 text-[12.5px] text-muted-foreground">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      {progress !== null ? `Téléchargement de la mise à jour… ${progress} %` : "Téléchargement…"}
+                    </span>
+                  ) : !status.downloaded ? (
+                    <ActionButton kind="primary" size="sm" icon={downloading ? Loader2 : Download} spin={downloading} onClick={handleDownload} disabled={downloading}>
+                      Télécharger la mise à jour
+                    </ActionButton>
+                  ) : (
                     <>
-                      <Button
-                        className="gap-2 flex-1 bg-emerald-600 hover:bg-emerald-700 text-white"
-                        onClick={handleInstall}
-                        disabled={installing}
-                      >
-                        {installing
-                          ? <Loader2 className="h-4 w-4 animate-spin" />
-                          : <Zap className="h-4 w-4" />
-                        }
-                        Restart to update
-                      </Button>
-                      <Button
-                        variant="outline"
-                        size="icon"
-                        className="h-9 w-9 text-muted-foreground hover:text-destructive hover:border-destructive/50"
-                        onClick={handleCancel}
-                        disabled={cancelling}
-                        title="Delete downloaded file"
-                      >
-                        {cancelling
-                          ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          : <Trash2 className="h-3.5 w-3.5" />
-                        }
-                      </Button>
+                      <ActionButton kind="primary" size="sm" icon={installing ? Loader2 : Download} spin={installing} onClick={handleInstall} disabled={installing}>
+                        Redémarrer et installer
+                      </ActionButton>
+                      <ActionButton kind="ghost" size="sm" icon={cancelling ? Loader2 : Trash2} spin={cancelling} onClick={handleCancel} disabled={cancelling}>
+                        Supprimer le fichier téléchargé
+                      </ActionButton>
                     </>
-                  )}
+                  )
+                }
+              />
+            </PanelList>
+          </Panel>
+        ) : status ? (
+          <Panel className="col-span-8" aria-label="Vous êtes à jour">
+            <div className="flex items-center gap-3.5 px-[18px] py-5">
+              <ToneIcon icon={CircleCheck} tone="success" size={44} />
+              <div className="min-w-0">
+                <div className="text-[16px] font-bold">Vous êtes à jour</div>
+                <div className="text-[13px] text-muted-foreground">
+                  MonClub Access {withCodename(curVersion, curCodename)} est la dernière version.
                 </div>
               </div>
             </div>
-          </div>
+          </Panel>
+        ) : (
+          <Panel className="col-span-8" aria-label="Chargement">
+            <div className="px-[18px] py-5 text-[13px] text-muted-foreground">Chargement…</div>
+          </Panel>
         )}
 
-        {/* No update state */}
-        {!updateAvailable && status && (
-          <div className="rounded-xl border border-border bg-card/50 p-6 text-center space-y-2">
-            <div className="flex justify-center">
-              <div className="h-10 w-10 rounded-full bg-emerald-500/10 flex items-center justify-center">
-                <CheckCircle2 className="h-5 w-5 text-emerald-500" />
-              </div>
-            </div>
-            <p className="text-[14px] font-medium text-foreground">You're up to date</p>
-            <p className="text-[12px] text-muted-foreground">
-              MonClub Access {curVersion}{curCodename ? ` "${curCodename}"` : ""} is the latest version.
-            </p>
-            {status.lastCheckAt && (
-              <p className="text-[11px] text-muted-foreground/60">
-                Last checked {new Date(status.lastCheckAt * 1000).toLocaleTimeString()}
-              </p>
-            )}
-          </div>
-        )}
-
-      </div>
-    </ScrollArea>
+        <Panel className="col-span-4" aria-label="Ce poste">
+          <PanelHeader title="Ce poste" />
+          <PanelList>
+            <ListRow title="Composant" value={status?.componentDisplayName || versionInfo?.componentDisplayName || "MonClub Access"} />
+            <DashedRule />
+            <ListRow title="Canal" value={status?.channel || "—"} />
+            <DashedRule />
+            <ListRow title="Plateforme" value={status?.platform || "—"} />
+            <DashedRule />
+            <ListRow title="Dernière vérification" value={lastCheck ?? "—"} />
+          </PanelList>
+        </Panel>
+      </PageGrid>
+    </div>
   );
 }

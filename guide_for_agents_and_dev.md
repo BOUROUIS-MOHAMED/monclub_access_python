@@ -5852,7 +5852,9 @@ reported (it made the dashboard count a healthy PC as failed, L4 E2E (g)); `::te
 notes through `src/lib/releaseNotes.ts` (allowlist p/br/ul/ol/li/strong/b/em/i/h1-h4/code,
 no attributes, links as text, script/style/iframe dropped) — never `dangerouslySetInnerHTML`
 (D33) — and show the last result, a refused offer, the loop-guard warning and an install
-error (`src/components/update/UpdateNotices.tsx`). `[TEST: tauri-ui src/lib/releaseNotes.test.ts; tests/test_updater_v2_app_wiring.py::test_release_notes_are_never_injected_as_raw_html]`
+error: `src/components/update/UpdateNotices.tsx` (English) on TV, its French twin
+`src/components/update/UpdateNoticesFr.tsx` on Access since the v5 redesign — same conditions,
+keep the two in step. `[TEST: tauri-ui src/lib/releaseNotes.test.ts; tests/test_updater_v2_app_wiring.py::test_release_notes_are_never_injected_as_raw_html]`
 
 ### 11.8 The installer — safe swap, health wait, results (D21-D24)
 
