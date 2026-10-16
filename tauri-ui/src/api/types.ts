@@ -738,6 +738,8 @@ export interface SyncRunHistoryResponse {
 export interface PushBatchHistoryRow {
   id: number;
   sync_run_id?: number | null;
+  /** Every sync run this batch answers: the DEVICE-mode column and the ULTRA link rows. */
+  sync_run_ids?: number[];
   device_id: number;
   device_name: string;
   policy: string;
@@ -750,12 +752,64 @@ export interface PushBatchHistoryRow {
   created_at: string;
 }
 
+/** GET /sync-history/{id}: the run and the push batches recorded as answering it. */
+export interface SyncRunDetailResponse {
+  ok: boolean;
+  item: SyncRunHistoryRow;
+  pushBatches?: PushBatchHistoryRow[];
+}
+
 export interface PushBatchHistoryResponse {
   ok: boolean;
   items: PushBatchHistoryRow[];
   total: number;
   page: number;
   size: number;
+}
+
+/** GET /db/kpis — Base locale tiles (counted per person for cards, see guide §3.13). */
+export interface LocalDbKpisResponse {
+  ok: boolean;
+  memberships: number;
+  people: number;
+  cards: {
+    distinct: number;
+    duplicated: number;
+    peopleInvolved: number;
+    /** At most 50, most-shared first. */
+    duplicates: { card: string; people: { fullName: string; userId: number | null; mainAccountId: number | null }[] }[];
+  };
+  historyToSend: { total: number; pending: number; retrying: number; oldestCreatedAt: string | null };
+}
+
+/** GET /push-history/hourly?date=YYYY-MM-DD — one local day, per device × local hour. */
+export interface PushHourlyCell {
+  hour: number;
+  batches: number;
+  success: number;
+  partial: number;
+  failed: number;
+  inProgress: number;
+  other: number;
+  pinsAttempted: number;
+  pinsSuccess: number;
+  pinsFailed: number;
+}
+
+export interface PushHourlyDevice {
+  deviceId: number;
+  deviceName: string;
+  /** Only the hours that have at least one batch. */
+  hours: PushHourlyCell[];
+}
+
+export interface PushHourlyResponse {
+  ok: boolean;
+  date: string;
+  fromUtc: string;
+  toUtc: string;
+  devices: PushHourlyDevice[];
+  totals: { batches: number; pinsAttempted: number; pinsSuccess: number; pinsFailed: number };
 }
 
 export interface PushPinHistoryRow {

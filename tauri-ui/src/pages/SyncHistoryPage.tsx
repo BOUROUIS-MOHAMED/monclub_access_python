@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Activity, CircleCheck, CircleX, Eye, ListChecks, Loader2, Play, RefreshCw, Router, ScrollText, TriangleAlert, Users,
 } from "lucide-react";
 
 import { get } from "@/api/client";
-import type { SyncRunHistoryResponse, SyncRunHistoryRow } from "@/api/types";
+import type { PushBatchHistoryRow, SyncRunDetailResponse, SyncRunHistoryResponse, SyncRunHistoryRow } from "@/api/types";
 import { usePageChrome } from "@/context/PageChromeContext";
 import { ActionButton } from "@/components/ui/action-button";
 import { Chip } from "@/components/ui/chip";
@@ -13,9 +13,10 @@ import { DialogFrame, DialogSection } from "@/components/ui/dialog-frame";
 import { FilterSelect } from "@/components/ui/filter-select";
 import { CellText, FlexCell, FlexRow, FlexTable } from "@/components/ui/flex-table";
 import { KpiCard, KpiRow } from "@/components/ui/kpi-card";
-import { ListRow, Note, PageGrid, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
+import { DashedRule, ListRow, Note, PageGrid, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
+import { INK } from "@/components/ui/tone";
 import {
-  RUN_TYPE, STATUS_FILTER_OPTIONS, TRIGGER_SOURCE, formatDate, formatDuration, relativeTimeFr, runStatus,
+  PUSH_POLICY, RUN_TYPE, STATUS_FILTER_OPTIONS, TRIGGER_SOURCE, formatDate, formatDuration, relativeTimeFr, runStatus,
 } from "@/lib/historyCopy";
 import { useNowTick } from "@/hooks/useNowTick";
 
@@ -56,6 +57,8 @@ export default function SyncHistoryPage() {
   const [runTypeFilter, setRunTypeFilter] = useState("__all");
   const [detailLoading, setDetailLoading] = useState(false);
   const [selectedRun, setSelectedRun] = useState<SyncRunHistoryRow | null>(null);
+  // The push batches recorded as answering the selected run (a real link, never a time match).
+  const [runBatches, setRunBatches] = useState<PushBatchHistoryRow[]>([]);
   const [rawOpen, setRawOpen] = useState(false);
 
   const load = useCallback(async () => {
@@ -96,15 +99,20 @@ export default function SyncHistoryPage() {
   const lastOk = useMemo(() => rows.find((r) => String(r.status || "").toUpperCase() === "SUCCESS") ?? null, [rows]);
   const lastFailed = useMemo(() => rows.find((r) => String(r.status || "").toUpperCase() === "FAILED") ?? null, [rows]);
 
+  // Only the last run clicked may fill the detail (a slow answer for an earlier click is dropped).
+  const detailReqRef = useRef(0);
   const openDetail = useCallback(async (id: number) => {
+    const req = ++detailReqRef.current;
     setDetailLoading(true);
     try {
-      const res = await get<{ ok: boolean; item: SyncRunHistoryRow }>(`/sync-history/${id}`);
+      const res = await get<SyncRunDetailResponse>(`/sync-history/${id}`);
+      if (req !== detailReqRef.current) return;
       setSelectedRun(res.item);
+      setRunBatches(Array.isArray(res.pushBatches) ? res.pushBatches : []);
     } catch (err) {
-      setError(String(err));
+      if (req === detailReqRef.current) setError(String(err));
     } finally {
-      setDetailLoading(false);
+      if (req === detailReqRef.current) setDetailLoading(false);
     }
   }, []);
 
@@ -217,9 +225,37 @@ export default function SyncHistoryPage() {
                   tone="grey"
                   wrap
                   title="Appareils lancés"
-                  sub={`${sel.devices_synced} envoi${sel.devices_synced > 1 ? "s" : ""} démarré${sel.devices_synced > 1 ? "s" : ""} (lancés, pas confirmés). Le résultat de chaque appareil est dans Historique push, sans lien vers ce run : retrouvez-le par l'heure.`}
+                  sub={`${sel.devices_synced} envoi${sel.devices_synced > 1 ? "s" : ""} démarré${sel.devices_synced > 1 ? "s" : ""} (lancés, pas confirmés).${runBatches.length ? " Résultat de chaque appareil ci-dessous." : ""}`}
                   actions={<ActionButton kind="outline" size="sm" onClick={() => navigate("/push-history")}>Historique push</ActionButton>}
                 />
+                <DashedRule className="my-1.5" />
+                <div className="py-1.5 text-[12px] font-bold uppercase tracking-[0.06em] text-muted-foreground">Résultat par appareil</div>
+                {runBatches.length === 0 ? (
+                  <div className="pb-1.5 text-[13px] text-muted-foreground">
+                    <div className="font-semibold text-foreground">Pas de détail par appareil pour ce passage.</div>
+                    Seuls les envois lancés par ce passage y sont reliés. Sur un tourniquet ULTRA, une mise à jour de
+                    quelques membres n'écrit pas d'envoi, et un envoi encore en file n'apparaît qu'une fois commencé.
+                  </div>
+                ) : runBatches.map((b) => {
+                  const bs = runStatus(b.status);
+                  return (
+                    <ListRow
+                      key={b.id}
+                      icon={Router}
+                      tone={bs.tone}
+                      wrap
+                      title={b.device_name || `Appareil #${b.device_id}`}
+                      sub={
+                        <>
+                          {`PIN : ${b.pins_attempted} tenté${b.pins_attempted > 1 ? "s" : ""} · ${b.pins_success} réussi${b.pins_success > 1 ? "s" : ""} · `}
+                          <span className={b.pins_failed > 0 ? INK.error : undefined}>{`${b.pins_failed} en échec`}</span>
+                          {` · ${PUSH_POLICY[b.policy] ?? b.policy} · ${formatDuration(b.duration_ms)}`}
+                        </>
+                      }
+                      trailing={<Chip tone={bs.tone}>{bs.l}</Chip>}
+                    />
+                  );
+                })}
                 <ListRow
                   icon={ScrollText}
                   tone="grey"

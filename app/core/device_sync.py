@@ -1130,8 +1130,15 @@ class DeviceSyncEngine:
         source: str = "timer",
         changed_ids: set | None = None,
         sync_run_id: int | None = None,
+        sync_run_ids: set[int] | None = None,
     ) -> bool:
-        """Synchronously push a single device using an already-connected SDK."""
+        """Synchronously push a single device using an already-connected SDK.
+
+        ``sync_run_ids``: the sync runs an ULTRA pass answers (guide §3.13), written as
+        push_batch_sync_run rows with the batch."""
+        kwargs: Dict[str, Any] = {}
+        if sync_run_ids:
+            kwargs["sync_run_ids"] = set(sync_run_ids)
         return self._run_single_device_sync(
             cache=cache,
             device=device,
@@ -1139,6 +1146,7 @@ class DeviceSyncEngine:
             changed_ids=changed_ids,
             sync_run_id=sync_run_id,
             sdk=sdk,
+            **kwargs,
         )
 
     def _maybe_yield_doors(self) -> None:
@@ -1175,6 +1183,7 @@ class DeviceSyncEngine:
         changed_ids: set | None,
         sync_run_id: int | None,
         sdk: PullSDK | None,
+        sync_run_ids: set[int] | None = None,
     ) -> bool:
         if not _lease_gate.device_allowed((device or {}).get("id")):
             # P3b-2: a turnstile this PC does not drive (driver/reader assignment) is never
@@ -1243,6 +1252,8 @@ class DeviceSyncEngine:
             }
             if sdk is not None:
                 sync_kwargs["sdk"] = sdk
+            if sync_run_ids:
+                sync_kwargs["sync_run_ids"] = set(sync_run_ids)
             # Push to device runs over the single device TCP connection. When it
             # is invoked on the live ULTRA worker (sdk is not None) it blocks
             # RTLog polling for its full duration — trace start/duration/result.
@@ -3079,6 +3090,7 @@ class DeviceSyncEngine:
         sync_run_id: int | None = None,
         sdk: PullSDK | None = None,
         report_progress: bool = True,
+        sync_run_ids: set[int] | None = None,
     ) -> None:
         dev_id = device.get("id")
         # How many roster pins still wait to be written after THIS pass (count_waiting_pins);
@@ -3356,6 +3368,7 @@ class DeviceSyncEngine:
             policy=policy,
             status="IN_PROGRESS",
             created_at=batch_started_iso,
+            sync_run_ids=sync_run_ids,
         )
 
         disconnect_when_done = sdk is None

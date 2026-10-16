@@ -9,6 +9,7 @@ import type {
   PushPinHistoryRow,
 } from "@/api/types";
 import { usePageChrome } from "@/context/PageChromeContext";
+import { PushHourlyMatrix } from "@/components/PushHourlyMatrix";
 import { ActionButton } from "@/components/ui/action-button";
 import { Chip } from "@/components/ui/chip";
 import { FilterSelect } from "@/components/ui/filter-select";
@@ -32,6 +33,8 @@ export default function PushHistoryPage() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [selectedBatch, setSelectedBatch] = useState<PushBatchHistoryRow | null>(null);
   const [selectedPins, setSelectedPins] = useState<PushPinHistoryRow[]>([]);
+  // « Recharger » also reloads the hour chart (it keeps its own day, loading and error).
+  const [hourlyToken, setHourlyToken] = useState(0);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -92,7 +95,7 @@ export default function PushHistoryPage() {
     actions: (
       <>
         <FilterSelect label="Statut" value={statusFilter} options={STATUS_FILTER_OPTIONS} onChange={setStatusFilter} />
-        <ActionButton kind="outline" icon={RefreshCw} spin={loading} onClick={() => void load()} disabled={loading}>
+        <ActionButton kind="outline" icon={RefreshCw} spin={loading} onClick={() => { void load(); setHourlyToken((t) => t + 1); }} disabled={loading}>
           Recharger
         </ActionButton>
       </>
@@ -113,6 +116,8 @@ export default function PushHistoryPage() {
         <KpiCard label="Partiels" value={stats.partial} sub="envoi partiel ou en erreur" icon={TriangleAlert} tone="warning" subTone={stats.partial > 0 ? "warning" : undefined} />
         <KpiCard label="PIN en échec" value={pinsFailed} sub="sur les envois chargés" icon={CircleX} tone="error" subTone={pinsFailed > 0 ? "error" : undefined} />
       </KpiRow>
+
+      <PushHourlyMatrix refreshToken={hourlyToken} />
 
       <PageGrid>
         <Panel className="col-span-7">
@@ -191,7 +196,9 @@ export default function PushHistoryPage() {
                   formatDate(sel.created_at),
                   formatDuration(sel.duration_ms),
                   policyLabel(sel.policy),
-                  sel.sync_run_id != null ? `run #${sel.sync_run_id}` : "",
+                  (sel.sync_run_ids?.length
+                    ? `run${sel.sync_run_ids.length > 1 ? "s" : ""} #${sel.sync_run_ids.join(", #")}`
+                    : sel.sync_run_id != null ? `run #${sel.sync_run_id}` : ""),
                 ].filter(Boolean).join(" · ")}
               >
                 {detailLoading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}

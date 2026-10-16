@@ -65,6 +65,7 @@ This file is only useful while it is true. If you change any of the following, y
 | What a turnstile's heartbeat line reports as waiting (`device_sync.py::count_waiting_pins`, `ultra_engine.py::_count_waiting_pins` and the snapshot's `failed_pins`, `_sync_one_device`'s `_last_waiting_pins`, `realtime_agent.py::get_status_snapshot`'s `failedPins`, `pc_identity.py::build_heartbeat_payload`, `::_report_held_turnstiles` and its `held` key, `erase_wizard.py::held_waiting_count`, the wizard's `_set_waiting`) | §3.10 |
 | Who writes to `access.db` — the DbWriter, `_run_db_write_sync` (its lanes, `priority=`, the inline nested call, the 60 s wait), a write outside it, the tripwire's allowlist (`tests/test_db_single_writer.py::ALLOWED_DIRECT`), which writes are in the door lane (`db.py::insert_access_history`, `::save_agent_rtlog_state`), the AGENT history claim (`realtime_agent.py::DecisionService.run`'s `F-013` block) | §3.11 |
 | The member fee lines of the entry screen -- what is stored, how it reaches the popup, how the screen judges and draws it (`db.py::_member_fees_json`, `::_member_fees_list`, `::_ensure_column_forcing_refresh`, `sync_users.fees_json` in `_SYNC_USER_COLUMNS` and the five member writers, `sync_access_software_settings.fee_due_soon_days`, `settings_reader.py::normalize_global_settings`'s `fee_due_soon_days`, `access_types.py::NotificationRequest.fees`, `ultra_engine.py::_enqueue_notification(user_fees=)`, `ultra_pc_entry.py::member_popup_fields`, `realtime_agent.py::_popup_payload_from_request`, `tauri-ui/src/lib/feeAlerts.ts`, `PopupWindow.tsx` `AFeeLine` / `AFeeMark`) | §3.12 |
+| Which sync run a push batch answers -- the `push_batch_sync_run` link and what carries its ids (`db.py::insert_push_batch(sync_run_ids=)`, `::list_push_batches_for_sync_run`; `app.py::_request_running_ultra_sync(sync_run_id=)` and its two calls in the sync tick; `ultra_engine.py::UltraEngine.request_sync_now(sync_run_ids=)`, `::_worker_full_sync_accepted_or_pending`, `UltraDeviceWorker.request_full_sync(sync_run_ids=)`, `::_drain_full_sync_commands`'s `run_kw`, `::_run_standalone_full_sync`, `::_maybe_mirror_reconcile`; `device_sync.py::run_one_device_on_connected_sdk` / `::_run_single_device_sync` / `::_sync_one_device`) -- or the history and Base locale figures (`db.py::push_batch_hourly`, `::local_db_kpis`) | §3.13 |
 | The Utilisateurs member card data and the mutation-queue names (`db.py::get_member_card_details`, `::_member_row_for_card`, `::_member_freeze_facts`, `::_list_held_users_for_roster` and its call in `::list_members_roster`, `::list_member_access_history`, `::annotate_offline_mutation_targets`, `local_access_api_v2.py::_handle_member_card`, `::_handle_mutations_list`'s names, `::_handle_member_history`, `tauri-ui/src/pages/UsersPage.tsx` `cardDetailLine`) | §3.14 |
 | The test / verification commands | §9 Verifying this guide |
 
@@ -4797,6 +4798,71 @@ renouveler. », the last line ending « +N autre(s) »; `AMulti` puts one small 
 tile's photo (red when a fee is unpaid, else gold). `[TEST: tauri-ui src/lib/feeAlerts.test.ts
 (npm test)]` The layout on a real entry TV with two fee lines and the gold expiry footer together
 is `[UNVERIFIED]`: checked by type-check and by reading the 1280×720 stage sizes only.
+
+### 3.13 History pages and Base locale figures (Access v5 Card H, 2026-10-16)
+
+Read-only figures the Access UI shows on Historique push, Historique sync and Base locale. No
+handler here carries a member or a pin (so none belongs in §3.2f).
+
+- **`GET /api/v2/push-history/hourly?date=YYYY-MM-DD`** → `_handle_push_history_hourly` →
+  `db.py::push_batch_hourly` (tauri-ui `PushHourlyMatrix`, « Envois par heure »). `date` is a day of the
+  PC's local time (default today; anything else is 400). `push_batch_history.created_at` is UTC in two
+  spellings -- `...Z` (`ultra_engine.py` standalone pass and MIRROR, `time.strftime(..., gmtime())`) and
+  `+00:00` (`device_sync.py::_sync_one_device`, `isoformat()`); `_parse_push_batch_utc` reads both (a value
+  without an offset as UTC; an unparsable one is left out). Rows are cut on the local day and grouped by
+  device and local hour of `created_at` -- the moment the batch row was opened, i.e. when the push
+  started. A cell holds the batch count per stored `status` (`other` for anything but SUCCESS / PARTIAL /
+  FAILED / IN_PROGRESS) and the sums of the stored `pins_*`; nothing is inferred. The device name is the
+  latest stored for that device that day. On a day with a daylight-saving change the repeated hour is
+  one cell (grouped by hour number). `[TEST: test_push_history_hourly.py]`
+- **A sync run's result per device -- a recorded link, never a time match** (Historique sync, run
+  detail « Résultat par appareil »; `GET /api/v2/sync-history/{id}` now also answers `pushBatches`,
+  from `db.py::list_push_batches_for_sync_run`). Two sources, both written when the batch row is opened:
+  - DEVICE mode, unchanged: `push_batch_history.sync_run_id`, from the actor dispatch context
+    `_sync_all_devices` sets (`device_sync.py::_DeviceSyncActorAdapter._build_session` reads it when the
+    actor builds its session).
+  - ULTRA: before this change every ULTRA batch had `sync_run_id=None`. Now the sync tick passes its
+    `sync_run_history` id to `app.py::_request_running_ultra_sync(sync_run_id=)` -- only the two calls
+    inside the tick (members-only delta, device refresh); the other callers pass none -- which sends
+    `sync_run_ids={id}` to `UltraEngine.request_sync_now`. It reaches the worker only on the live-worker
+    full-sync route (`_worker_full_sync_accepted_or_pending` → `UltraDeviceWorker.request_full_sync`). The
+    worker merges every request that arrives before its pass starts into one pending request, so the ids
+    are a **set, unioned on merge** (never "last wins"), kept under the `sync_run_ids` key only when
+    non-empty. `_drain_full_sync_commands` hands them to the pass (`_run_standalone_full_sync`, which also
+    hands them to the MIRROR batch, or `run_one_device_on_connected_sdk` → `_sync_one_device`), and its
+    two re-queues of the SAME request (link dead, no raw PullSDK handle) carry them. The worker's own
+    follow-ups (`push-capped`, `revoke-failed`, `intent-promoted`, removal and erase requests) never
+    claim a run. `insert_push_batch(sync_run_ids=)` writes one `push_batch_sync_run (batch_id,
+    sync_run_id)` row per run in the batch's own transaction, linking only run rows that exist; the
+    ULTRA batch's `sync_run_id` column stays NULL. Both FKs cascade (`PRAGMA foreign_keys = ON`), so the
+    30-day prunes of either table remove the link rows. The ids are metadata only: no revoke, exclusion,
+    lease or hash decision reads them. `[CODE]` `[TEST: test_sync_run_push_link.py,
+    test_standalone_incremental_sync.py::TestSyncRunLink]`
+  - **Not linked, on purpose** (the run detail then says « Pas de détail par appareil pour ce
+    passage »): runs before this change; a members-only delta on ULTRA (targeted member syncs write no
+    push batch at all); the scheduler fallback for a worker whose thread is dead
+    (`UltraSyncScheduler.request_sync_now` / `_sync_all` do not carry the ids); a request the worker
+    reports as already covered without queuing a pass; a pass skipped because the roster hash did not
+    change (scheduler path) -- and a pass that has not started yet when the detail is opened (its row
+    appears once it starts). `[CODE]`
+- **`GET /api/v2/db/kpis`** → `_handle_db_kpis` → `db.py::local_db_kpis` (Base locale tiles, loaded once
+  per unlock):
+  - « Abonnements »: `sync_users` rows (one per membership) and the number of persons (key below).
+  - « Cartes en doublon »: a card value (trimmed; an empty string is no card -- what the cache stores
+    for a member without a card) held by **two or more persons**, in either `first_card_id` or
+    `second_card_id`. Counted per person, never per row: a person has one row per membership, each
+    repeating their cards, so counting rows would report false duplicates. The person is
+    `main_account_id`; when a row has none, the `main_account_id` another row of the same `user_id`
+    carries; else the `user_id` (tagged, so an account id and a user id never merge); else the
+    membership; else the row alone (never merged with another). `main_account_id` can be NULL on every row (§3.2d: a backend that does not send it) --
+    then persons are user ids, and two user ids of one account would count as two persons. The answer
+    also lists up to 50 duplicated cards with their persons' names (the page's tooltip).
+  - « Passages à envoyer »: the door-history uploader's own filter (`list_pending_access_history_for_sync`:
+    `PENDING` or `FAILED_RETRYABLE`, blank MB2000 rows excluded), without its due-now retry-time
+    condition; `retrying` is the `FAILED_RETRYABLE` part. `FAILED_TERMINAL` rows are never sent and are
+    not counted.
+  - Not shown (no column backs them without reading every fingerprint blob): the v4 « Empreintes »
+    tile. `[TEST: test_local_db_kpis.py]`
 
 ### 3.14 The Utilisateurs member card data (Access v5 Card M, 2026-10-16)
 

@@ -3669,6 +3669,27 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_push_batch_history_device_id "
             "ON push_batch_history(device_id);"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_push_batch_history_sync_run_id "
+            "ON push_batch_history(sync_run_id);"
+        )
+        # Which sync runs asked for an ULTRA pass (guide §3.13). A worker coalesces the
+        # requests that arrive before its pass starts, so one pass (one batch row) can
+        # answer several runs: one row per (batch, run). DEVICE mode keeps using the
+        # single push_batch_history.sync_run_id column, as before.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS push_batch_sync_run (
+                batch_id    INTEGER NOT NULL REFERENCES push_batch_history(id) ON DELETE CASCADE,
+                sync_run_id INTEGER NOT NULL REFERENCES sync_run_history(id) ON DELETE CASCADE,
+                PRIMARY KEY (batch_id, sync_run_id)
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_push_batch_sync_run_run "
+            "ON push_batch_sync_run(sync_run_id);"
+        )
 
         conn.execute(
             """
@@ -10334,7 +10355,13 @@ def insert_push_batch(
     policy: str,
     status: str = "IN_PROGRESS",
     created_at: str,
+    sync_run_ids: Iterable[int] | None = None,
 ) -> int:
+    """Open a push batch row. ``sync_run_ids``: the sync runs whose request this ULTRA pass
+    answers (push_batch_sync_run, same transaction); a run row that no longer exists is
+    not linked."""
+    link_ids = sorted({int(run_id) for run_id in (sync_run_ids or ()) if run_id is not None})
+
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
         cur = conn.execute(
             """
@@ -10356,9 +10383,50 @@ def insert_push_batch(
                 created_at,
             ),
         )
-        return int(cur.lastrowid)
+        batch_id = int(cur.lastrowid)
+        for run_id in link_ids:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO push_batch_sync_run (batch_id, sync_run_id)
+                SELECT ?, id FROM sync_run_history WHERE id = ?
+                """,
+                (batch_id, run_id),
+            )
+        return batch_id
 
     return int(_run_db_write_sync("insert_push_batch", _write))
+
+
+def list_push_batches_for_sync_run(sync_run_id: int) -> List[Dict[str, Any]]:
+    """Every push batch recorded as answering this sync run: the DEVICE-mode column or an
+    ULTRA link row (push_batch_sync_run). Nothing is matched by time."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT b.id, b.device_id, b.device_name, b.policy, b.pins_attempted,
+                   b.pins_success, b.pins_failed, b.status, b.duration_ms,
+                   b.error_message, b.created_at
+            FROM push_batch_history b
+            WHERE b.sync_run_id = ?
+               OR b.id IN (SELECT batch_id FROM push_batch_sync_run WHERE sync_run_id = ?)
+            ORDER BY b.device_name COLLATE NOCASE ASC, b.id ASC
+            """,
+            (int(sync_run_id), int(sync_run_id)),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _push_batch_run_ids(conn: sqlite3.Connection, batch_ids: List[int]) -> Dict[int, List[int]]:
+    if not batch_ids:
+        return {}
+    placeholders = ",".join("?" for _ in batch_ids)
+    out: Dict[int, set] = {}
+    for row in conn.execute(
+        f"SELECT batch_id, sync_run_id FROM push_batch_sync_run WHERE batch_id IN ({placeholders})",
+        list(batch_ids),
+    ).fetchall():
+        out.setdefault(int(row[0]), set()).add(int(row[1]))
+    return {bid: sorted(ids) for bid, ids in out.items()}
 
 
 def update_push_batch(
@@ -10484,7 +10552,19 @@ def get_push_batch(batch_id: int) -> Dict[str, Any] | None:
             "SELECT * FROM push_batch_history WHERE id = ?",
             (int(batch_id),),
         ).fetchone()
-    return dict(row) if row else None
+        links = _push_batch_run_ids(conn, [int(batch_id)]) if row else {}
+    if not row:
+        return None
+    item = dict(row)
+    item["sync_run_ids"] = _batch_run_ids(item, links)
+    return item
+
+
+def _batch_run_ids(item: Dict[str, Any], links: Dict[int, List[int]]) -> List[int]:
+    ids = set(links.get(int(item["id"]), []))
+    if item.get("sync_run_id") is not None:
+        ids.add(int(item["sync_run_id"]))
+    return sorted(ids)
 
 
 def get_push_batch_pins(batch_id: int) -> List[Dict[str, Any]]:
@@ -10547,8 +10627,12 @@ def list_push_batches(
             """,
             [*params, page_size, page_num * page_size],
         ).fetchall()
+        items = [dict(row) for row in rows]
+        links = _push_batch_run_ids(conn, [int(item["id"]) for item in items])
+    for item in items:
+        item["sync_run_ids"] = _batch_run_ids(item, links)
     return {
-        "items": [dict(row) for row in rows],
+        "items": items,
         "total": total,
         "page": page_num,
         "size": page_size,
@@ -10567,6 +10651,117 @@ def prune_sync_run_history(*, retention_days: int = 30) -> int:
         )
         return int(cur.rowcount or 0)
     return _run_db_write_sync("prune_sync_run_history", _write)
+
+
+def _parse_push_batch_utc(value: Any) -> datetime | None:
+    """push_batch_history.created_at -> aware UTC datetime.
+
+    Every writer stores UTC, in two spellings: ``...Z`` (ULTRA standalone / MIRROR,
+    ``time.strftime(..., gmtime())``) and ``+00:00`` (``device_sync.py``,
+    ``isoformat()``). A value without an offset is read as UTC too (same writers);
+    an unparsable value is None -- left out, never guessed.
+    """
+    from datetime import timezone as _tz
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text.replace(" ", "T", 1))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_tz.utc)
+    return parsed.astimezone(_tz.utc)
+
+
+_PUSH_HOURLY_STATUS_KEY = {
+    "SUCCESS": "success",
+    "PARTIAL": "partial",
+    "FAILED": "failed",
+    "IN_PROGRESS": "inProgress",
+}
+
+
+def push_batch_hourly(*, day: str, tz: Any = None) -> Dict[str, Any]:
+    """Push batches of one LOCAL day, grouped by device and local hour (Historique push).
+
+    ``day`` is ``YYYY-MM-DD`` in the PC's local time (``tz`` overrides the zone, for
+    tests). A batch is placed by its ``created_at`` -- the moment its row was opened,
+    i.e. when that push started. Each cell counts batches by their stored ``status``
+    (an unknown status counts as ``other``) and sums the stored ``pins_*`` columns.
+    """
+    from datetime import timezone as _tz
+
+    start_naive = datetime.strptime(str(day), "%Y-%m-%d")
+    end_naive = start_naive + timedelta(days=1)
+    if tz is None:
+        start_local = start_naive.astimezone()      # the PC's zone at that midnight
+        end_local = end_naive.astimezone()
+    else:
+        start_local = start_naive.replace(tzinfo=tz)
+        end_local = end_naive.replace(tzinfo=tz)
+    start_utc = start_local.astimezone(_tz.utc)
+    end_utc = end_local.astimezone(_tz.utc)
+    # Coarse SQL window on the first 19 characters, which both spellings share, one
+    # day wider on each side; the exact cut is made below on the parsed value.
+    lo = (start_utc - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    hi = (end_utc + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, device_id, device_name, status, pins_attempted, pins_success,
+                   pins_failed, created_at
+            FROM push_batch_history
+            WHERE substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
+              AND substr(replace(created_at, ' ', 'T'), 1, 19) < ?
+            ORDER BY id ASC
+            """,
+            (lo, hi),
+        ).fetchall()
+
+    devices: Dict[int, Dict[str, Any]] = {}
+    totals = {"batches": 0, "pinsAttempted": 0, "pinsSuccess": 0, "pinsFailed": 0}
+    for row in rows:
+        created = _parse_push_batch_utc(row["created_at"])
+        if created is None or not (start_utc <= created < end_utc):
+            continue
+        local = created.astimezone(tz) if tz is not None else created.astimezone()
+        device_id = int(row["device_id"])
+        dev = devices.setdefault(device_id, {"deviceId": device_id, "deviceName": "", "hours": {}})
+        dev["deviceName"] = str(row["device_name"] or "")   # id order: the latest name wins
+        cell = dev["hours"].setdefault(int(local.hour), {
+            "hour": int(local.hour), "batches": 0,
+            "success": 0, "partial": 0, "failed": 0, "inProgress": 0, "other": 0,
+            "pinsAttempted": 0, "pinsSuccess": 0, "pinsFailed": 0,
+        })
+        status = str(row["status"] or "").strip().upper()
+        cell[_PUSH_HOURLY_STATUS_KEY.get(status, "other")] += 1
+        cell["batches"] += 1
+        totals["batches"] += 1
+        for src, dst in (("pins_attempted", "pinsAttempted"),
+                         ("pins_success", "pinsSuccess"),
+                         ("pins_failed", "pinsFailed")):
+            n = int(row[src] or 0)
+            cell[dst] += n
+            totals[dst] += n
+
+    out = []
+    for dev in sorted(devices.values(), key=lambda d: (d["deviceName"].lower(), d["deviceId"])):
+        out.append({
+            "deviceId": dev["deviceId"],
+            "deviceName": dev["deviceName"],
+            "hours": [dev["hours"][h] for h in sorted(dev["hours"])],
+        })
+    return {
+        "date": start_naive.strftime("%Y-%m-%d"),
+        "fromUtc": start_utc.isoformat(timespec="seconds"),
+        "toUtc": end_utc.isoformat(timespec="seconds"),
+        "devices": out,
+        "totals": totals,
+    }
 
 
 def prune_push_batch_history(*, retention_days: int = 30) -> int:
@@ -11065,6 +11260,111 @@ def list_pending_access_history_for_sync(*, limit: int = 200) -> List[AccessHist
             (ACCESS_HISTORY_SYNC_PENDING, ACCESS_HISTORY_SYNC_FAILED_RETRYABLE, now, lim),
         ).fetchall()
         return [AccessHistoryRow(**dict(r)) for r in rows]
+
+
+_LOCAL_DB_DUPLICATE_SAMPLE = 50
+
+
+def local_db_kpis() -> Dict[str, Any]:
+    """Base locale tiles (guide §3.13). Counts only what the tables store.
+
+    Duplicate cards are counted per PERSON, not per row: a person has one sync_users row per
+    membership, each repeating their cards. The person is ``main_account_id``, else -- when
+    no row of that ``user_id`` carries one -- the ``user_id``, else the membership, else the
+    row alone. A card
+    counts as duplicated when two or more persons hold it, in either card column. A card
+    value is trimmed; an empty value is no card.
+
+    « Passages à envoyer » is the door-history uploader's own filter
+    (``list_pending_access_history_for_sync``): PENDING or FAILED_RETRYABLE, blank MB2000
+    rows excluded -- without its due-now time condition (a row waiting for its retry time
+    is still to send).
+    """
+    from app.core.zkem_rtlog_filter import BLANK_HISTORY_SQL
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id, main_account_id, active_membership_id, full_name,
+                   first_card_id, second_card_id
+            FROM sync_users
+            """
+        ).fetchall()
+        waiting = conn.execute(
+            """
+            SELECT backend_sync_state, COUNT(*), MIN(created_at)
+            FROM access_history
+            WHERE backend_sync_state IN (?, ?)
+              AND NOT """ + BLANK_HISTORY_SQL + """
+            GROUP BY backend_sync_state
+            """,
+            (ACCESS_HISTORY_SYNC_PENDING, ACCESS_HISTORY_SYNC_FAILED_RETRYABLE),
+        ).fetchall()
+
+    account_by_user: Dict[int, int] = {}
+    for row in rows:
+        if row["user_id"] is not None and row["main_account_id"] is not None:
+            uid, mid = int(row["user_id"]), int(row["main_account_id"])
+            account_by_user[uid] = min(mid, account_by_user.get(uid, mid))
+
+    def _person(row: Any, index: int) -> str:
+        if row["main_account_id"] is not None:
+            return f"a:{int(row['main_account_id'])}"
+        if row["user_id"] is not None:
+            uid = int(row["user_id"])
+            if uid in account_by_user:
+                return f"a:{account_by_user[uid]}"
+            return f"u:{uid}"
+        if row["active_membership_id"] is not None:
+            return f"m:{int(row['active_membership_id'])}"
+        return f"r:{index}"     # nothing names the person: this row alone, never merged
+
+    people: Dict[str, Dict[str, Any]] = {}
+    holders: Dict[str, set] = {}
+    for index, row in enumerate(rows):
+        key = _person(row, index)
+        person = people.setdefault(key, {
+            "fullName": "", "userId": row["user_id"], "mainAccountId": None,
+        })
+        if not person["fullName"] and row["full_name"]:
+            person["fullName"] = str(row["full_name"])
+        if key.startswith("a:"):
+            person["mainAccountId"] = int(key[2:])
+        for col in ("first_card_id", "second_card_id"):
+            card = str(row[col] or "").strip()
+            if card:
+                holders.setdefault(card, set()).add(key)
+
+    duplicated = sorted((card for card, keys in holders.items() if len(keys) > 1),
+                        key=lambda c: (-len(holders[c]), c))
+    involved = set()
+    for card in duplicated:
+        involved |= holders[card]
+
+    by_state = {str(r[0]): (int(r[1] or 0), r[2]) for r in waiting}
+    pending, pending_oldest = by_state.get(ACCESS_HISTORY_SYNC_PENDING, (0, None))
+    retrying, retrying_oldest = by_state.get(ACCESS_HISTORY_SYNC_FAILED_RETRYABLE, (0, None))
+    oldest = min([v for v in (pending_oldest, retrying_oldest) if v], default=None)
+
+    return {
+        "memberships": len(rows),
+        "people": len(people),
+        "cards": {
+            "distinct": len(holders),
+            "duplicated": len(duplicated),
+            "peopleInvolved": len(involved),
+            "duplicates": [
+                {"card": card, "people": [people[k] for k in sorted(holders[card])]}
+                for card in duplicated[:_LOCAL_DB_DUPLICATE_SAMPLE]
+            ],
+        },
+        "historyToSend": {
+            "total": pending + retrying,
+            "pending": pending,
+            "retrying": retrying,
+            "oldestCreatedAt": oldest,
+        },
+    }
 
 
 def mark_access_history_synced(*, row_ids: Iterable[int], synced_at: str | None = None) -> int:

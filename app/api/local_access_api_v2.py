@@ -1888,7 +1888,7 @@ def _handle_sync_history_list(ctx: _Ctx) -> None:
 
 
 def _handle_sync_history_detail(ctx: _Ctx) -> None:
-    from app.core.db import get_sync_run
+    from app.core.db import get_sync_run, list_push_batches_for_sync_run
 
     run_id = ctx.param_int("id")
     if run_id <= 0:
@@ -1898,7 +1898,10 @@ def _handle_sync_history_detail(ctx: _Ctx) -> None:
     if row is None:
         ctx.send_json(404, {"ok": False, "error": "Sync run not found"})
         return
-    ctx.send_json(200, {"ok": True, "item": row})
+    # The push batches recorded as answering this run (guide §3.13) -- empty for a run
+    # older than the link, a members-only delta (no batch is written) or a run that
+    # pushed nothing. Never matched by time.
+    ctx.send_json(200, {"ok": True, "item": row, "pushBatches": list_push_batches_for_sync_run(run_id)})
 
 
 def _handle_push_history_list(ctx: _Ctx) -> None:
@@ -1910,6 +1913,20 @@ def _handle_push_history_list(ctx: _Ctx) -> None:
     status = ctx.q("status", default="").strip() or None
     result = list_push_batches(page=page, size=size, device_id=device_id, status=status)
     ctx.send_json(200, {"ok": True, **result})
+
+
+def _handle_push_history_hourly(ctx: _Ctx) -> None:
+    """Push batches of one local day, per device and local hour (Historique push chart)."""
+    from datetime import datetime as _dt
+    from app.core.db import push_batch_hourly
+
+    day = ctx.q("date", default="").strip() or _dt.now().strftime("%Y-%m-%d")
+    try:
+        _dt.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        ctx.send_json(400, {"ok": False, "error": "date must be YYYY-MM-DD"})
+        return
+    ctx.send_json(200, {"ok": True, **push_batch_hourly(day=day)})
 
 
 def _handle_push_history_pins(ctx: _Ctx) -> None:
@@ -7082,6 +7099,14 @@ def _handle_db_tables(ctx: _Ctx) -> None:
         pass
 
     ctx.send_json(200, {"tables": tables, "dbSizeBytes": db_size})
+
+
+def _handle_db_kpis(ctx: _Ctx) -> None:
+    """Base locale tiles: memberships / people, cards held by two persons, door history
+    still to send (db.py::local_db_kpis, guide §3.13)."""
+    from app.core.db import local_db_kpis
+
+    ctx.send_json(200, {"ok": True, **local_db_kpis()})
 
 
 def _handle_db_table_query(ctx: _Ctx) -> None:
