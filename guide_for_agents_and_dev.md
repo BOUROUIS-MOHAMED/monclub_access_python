@@ -6008,7 +6008,7 @@ decided. D39 ("unticked by default on existing installs") is superseded.
   count holds, so it adds nothing (review #1). The log stamps follow the PC's calendar (`Get-Date
   -Format`); an unparseable stamp is kept as `rawAt`. `[CODE; TEST; real read-only PowerShell tests]`
 - **Settings card** (`tauri-ui/src/components/WatchdogCard.tsx`, logic and FR/EN texts in
-  `src/lib/watchdogStatus.ts`; on the Access ConfigPage after "Démarrage Windows"): chip On / Off /
+  `src/lib/watchdogStatus.ts`; on the Access ConfigPage, « Démarrage Windows » tab, under the startup switch): chip On / Off /
   Not installed / Error / Stood down after repeated crashes, last check + result, the switch (locked
   outside an installed build or while saving), a confirm before turning off ("Access will not restart
   by itself after a crash or an interrupted update"), FR by default with its own FR/EN toggle. It
