@@ -423,3 +423,33 @@ def test_disconnect_without_a_worker_is_unchanged(pool):
     ctx = _Ctx(SimpleNamespace(_ultra_engine=None))
     la2._handle_device_disconnect(ctx)
     assert ctx.last == (200, {"ok": True})
+
+
+@pytest.mark.parametrize("strategy", ["delete_then_insert", "one_by_one"])
+def test_users_push_pre_delete_runs_before_the_door_rights_are_written(writes, monkeypatch, strategy):
+    """The pre-delete removes the pin's userauthorize row. It used to run AFTER the
+    userauthorize write, so the door rights just written were gone while the answer said
+    authResult "OK". It now runs first, as in the main sync."""
+    from app.core.device_sync import DeviceSyncEngine, FirmwareProfile
+
+    monkeypatch.setattr(DeviceSyncEngine, "_get_firmware_profile",
+                        lambda self, did: FirmwareProfile(insert_strategy=strategy))
+    raw = _raw()
+    calls = []
+    raw.delete_device_data.side_effect = lambda **kw: calls.append(("delete", kw["table"])) or 0
+    raw.set_device_data.side_effect = lambda **kw: calls.append(("set", kw["table"])) or 0
+    ctx = _push_ctx(_Worker(_driver(raw)))
+    la2._handle_device_users_push(ctx)
+    assert ctx.last[0] == 200 and ctx.last[1]["authResult"] == "OK"
+    assert ("delete", "userauthorize") in calls
+    assert calls.index(("delete", "userauthorize")) < calls.index(("set", "userauthorize"))
+    # Nothing is deleted after the door rights are written.
+    assert all(c[0] != "delete" for c in calls[calls.index(("set", "userauthorize")):])
+
+
+def test_users_push_default_profile_deletes_nothing(writes):
+    raw = _raw()
+    ctx = _push_ctx(_Worker(_driver(raw)))
+    la2._handle_device_users_push(ctx)
+    assert ctx.last[0] == 200
+    raw.delete_device_data.assert_not_called()

@@ -1092,8 +1092,8 @@ The reset runs on the request thread before the call is queued. If the worker th
 call (503), the result stays "unknown", which is the safe state. If the reset fails, the answer
 is 500 and nothing is queued or connected (before, a session was already open). The reads of
 the device payload, firmware profile and pin scheme, and the template normalisation, stay on the
-request thread. The device writes run on the worker: the user row, `userauthorize`, the optional
-pre-delete and `_push_templates`, in the same order as before. `_push_templates` also writes the
+request thread. The device writes run on the worker: the optional pre-delete, the user row,
+`userauthorize`, then `_push_templates` (the pre-delete moved first on 2026-10-16, below). `_push_templates` also writes the
 database on that thread (`save_firmware_profile`, `reset_firmware_template_combo`,
 `clear_firmware_profile`, `_record_finger_push_status`), as it does inside the worker's own
 syncs. It has no door yield (`_maybe_yield_doors` runs only in the batch paths), so doors and
@@ -1144,12 +1144,16 @@ opening, as card U built it. The erase-hold, wizard-open and user-push blocks st
 - `device_attendance.py` (`get_driver`, its own connection) runs only for
   `access_data_mode == "DEVICE"` devices. `realtime_agent.py` is AGENT mode's own driver.
 
-**Found while moving `/users/push`, not changed (owner decision)** `[CODE]`: the push writes
-`userauthorize`, THEN runs the firmware-profile pre-delete
-(`device_sync.py::_delete_auth_and_templates_best_effort`), which deletes that pin's
-`userauthorize`. On a panel whose profile is `delete_then_insert` or `one_by_one` the door
-rights just written are removed, yet the answer says `authResult: "OK"`. Same order on 941fffa
-and in 1.4.35.
+**Fixed while moving `/users/push` (owner, 2026-10-16)** `[CODE]`: the push wrote
+`userauthorize`, THEN ran the firmware-profile pre-delete
+(`device_sync.py::_delete_auth_and_templates_best_effort`), which deletes that pin's templates
+and its `userauthorize` row. On a panel whose profile is `delete_then_insert` or `one_by_one` the
+door rights just written were removed, yet the answer said `authResult: "OK"`. Same order on
+941fffa and in 1.4.35. The pre-delete now runs first, as in the main sync, where the strategy
+pre-delete precedes every insert (`device_sync.py`, "P0-bulk: strategy-driven pre-delete"). A
+panel with the default `upsert` profile deletes nothing, as before. `[TEST:
+test_one_connection_local_api.py::test_users_push_pre_delete_runs_before_the_door_rights_are_written,
+::test_users_push_default_profile_deletes_nothing]`
 
 ### 3.2 The roster rule — the most operationally important fact in this file
 

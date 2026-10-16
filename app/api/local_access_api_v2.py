@@ -5182,12 +5182,10 @@ def _handle_device_users_push(ctx: _Ctx) -> None:
 
     def _push(sdk):
         h, _on_worker = _pullsdk_handle(sdk)
-        h.set_device_data(table="user", data=user_data, options="")
-        auth_result = "OK"
-        try:
-            h.set_device_data(table="userauthorize", data=auth_data, options="")
-        except Exception as ex:
-            auth_result = str(ex)
+        # The pre-delete clears this pin's templates AND its userauthorize row, so it runs
+        # FIRST, as in the main sync (device_sync.py: the strategy pre-delete precedes every
+        # insert). It used to run after the userauthorize write and silently removed the door
+        # rights just written, while the answer said authResult "OK".
         if pre_delete:
             try:
                 engine._delete_auth_and_templates_best_effort(
@@ -5195,6 +5193,12 @@ def _handle_device_users_push(ctx: _Ctx) -> None:
                 )
             except Exception:
                 pass
+        h.set_device_data(table="user", data=user_data, options="")
+        auth_result = "OK"
+        try:
+            h.set_device_data(table="userauthorize", data=auth_data, options="")
+        except Exception as ex:
+            auth_result = str(ex)
         pushed, push_errs = engine._push_templates(
             h, pin=pin, templates=wire_templates, device_id=did,
             template_version_override=template_version_override,
