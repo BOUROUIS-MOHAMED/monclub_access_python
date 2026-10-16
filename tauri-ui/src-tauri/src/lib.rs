@@ -193,7 +193,9 @@ fn fetch_devices(port: u16) -> Option<Vec<DeviceInfo>> {
         .map(|r| r.devices)
 }
 
-fn fetch_presets(port: u16, device_id: i64) -> Vec<DoorPreset> {
+/// `None` when the presets could not be read, like `fetch_devices`: a failed read is not
+/// « aucun preset de porte ».
+fn fetch_presets(port: u16, device_id: i64) -> Option<Vec<DoorPreset>> {
     let url = format!("{}/devices/{}/door-presets", api_base(port), device_id);
     reqwest::blocking::Client::new()
         .get(&url)
@@ -202,7 +204,6 @@ fn fetch_presets(port: u16, device_id: i64) -> Vec<DoorPreset> {
         .ok()
         .and_then(|r| r.json::<PresetsResponse>().ok())
         .map(|r| r.presets)
-        .unwrap_or_default()
 }
 
 /// Fire a door open from the native tray. Returns whether the door actually opened.
@@ -232,8 +233,9 @@ fn post_open_door(port: u16, device_id: i64, door_number: i64, pulse_seconds: i6
         Ok(resp) => {
             let status = resp.status();
             let payload = resp.json::<serde_json::Value>().unwrap_or(serde_json::Value::Null);
-            // The endpoint answers 200 {"ok":false} for a driver-level refusal, so
-            // HTTP success alone is NOT proof the door opened.
+            // Every 2xx the door route sends today carries ok:true; refusals and failures
+            // are 4xx/5xx (local_access_api_v2.py::_handle_device_door_open, 202 from
+            // v2_routes.py::_file_request). The `ok` read is kept as a guard only.
             let ok = status.is_success()
                 && payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(status.is_success());
             if payload.get("requested").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -477,17 +479,20 @@ fn rebuild_tray_menu(
                 let dev_label = tray_device_label(dev);
                 let presets = fetch_presets(port, dev.id);
 
-                if presets.is_empty() {
-                    // No presets → single disabled item
+                if presets.as_ref().map_or(true, |p| p.is_empty()) {
+                    // No presets, or they could not be read → single disabled item
+                    let text = if presets.is_none() {
+                        format!("{} · portes non chargées", dev_label)
+                    } else {
+                        format!("{} · aucun preset de porte", dev_label)
+                    };
                     let item_id = format!("tray_dev_{}_nopreset", dev.id);
-                    let item = MenuItemBuilder::with_id(
-                        item_id,
-                        format!("{} · aucun preset de porte", dev_label),
-                    )
-                    .enabled(false)
-                    .build(app)?;
+                    let item = MenuItemBuilder::with_id(item_id, text)
+                        .enabled(false)
+                        .build(app)?;
                     open_sub = open_sub.item(&item);
                 } else {
+                    let presets = presets.unwrap_or_default();
                     // Device submenu with presets
                     let mut dev_sub =
                         SubmenuBuilder::with_id(app, format!("tray_dev_{}", dev.id), &dev_label);
