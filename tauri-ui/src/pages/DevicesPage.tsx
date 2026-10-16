@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useEffect, type ReactNode } from "react";
+import { useState, useCallback, useMemo, useEffect, useRef, type ReactNode } from "react";
 import { useDevices, usePullSdk, usePopupStream } from "@/api/hooks";
 import { useApp } from "@/context/AppContext";
 import { usePageChrome } from "@/context/PageChromeContext";
@@ -206,7 +206,10 @@ export default function DevicesPage() {
     liveError: string | null; liveLoading: boolean; presets: DoorPreset[]; presetsLoading: boolean;
     content: DeviceContentState;
     counts: DeviceCountsState;
+    /** Which opening of the dialog this is: a counts answer from an earlier opening is dropped. */
+    openSeq: number;
   } | null>(null);
+  const infoOpenSeqRef = useRef(0);
 
   // Control panel (re-entry block + clock). One scan-modify-apply object per device.
   const [control, setControl] = useState<ControlState | null>(null);
@@ -219,6 +222,9 @@ export default function DevicesPage() {
   const [nothingErasedIds, setNothingErasedIds] = useState<Set<number>>(new Set());
   // The start-up read of the holds failed: Access then holds EVERY turnstile until it reads.
   const [holdsUnknown, setHoldsUnknown] = useState(false);
+  // For the automatic Contenu counts read only: "not read yet" and "the read threw" both
+  // block it (the rows keep the behaviour above, which shows no hold when the read throws).
+  const [holdsRead, setHoldsRead] = useState<"pending" | "ok" | "failed">("pending");
   const reloadHolds = useCallback(async () => {
     try {
       const res = await liveEraseApi.holds();
@@ -228,7 +234,8 @@ export default function DevicesPage() {
         || (h.reason === "erase-prep" && h.terminalScheme != null && h.terminalScheme !== h.pinScheme))
         .map((h) => Number(h.deviceId))));
       setHoldsUnknown(!!res.loadFailed);
-    } catch { /* an older Access API without the wizard: no hold is shown */ }
+      setHoldsRead("ok");
+    } catch { /* an older Access API without the wizard: no hold is shown */ setHoldsRead("failed"); }
   }, []);
   useEffect(() => { void reloadHolds(); }, [reloadHolds, data]);
 
@@ -435,6 +442,7 @@ export default function DevicesPage() {
         error: null,
       },
       counts: { status: "idle", values: {}, error: null },
+      openSeq: ++infoOpenSeqRef.current,
     });
     loadPresets(deviceId);
   }, [devices, loadPresets]);
@@ -455,16 +463,17 @@ export default function DevicesPage() {
   }, [infoDialog, pullsdk]);
 
   // Contenu row counts: one live /info read, started by the tab (see the effect below).
-  const fetchContentCounts = useCallback(async (deviceId: number) => {
-    setInfoDialog((p) => p && p.deviceId === deviceId ? { ...p, counts: { status: "loading", values: {}, error: null } } : p);
+  const fetchContentCounts = useCallback(async (deviceId: number, openSeq: number) => {
+    const mine = (p: { deviceId: number; openSeq: number } | null) => !!p && p.deviceId === deviceId && p.openSeq === openSeq;
+    setInfoDialog((p) => mine(p) ? { ...p!, counts: { status: "loading", values: {}, error: null } } : p);
     try {
       const info = await pullsdk.getInfo(deviceId);
-      setInfoDialog((p) => p && p.deviceId === deviceId
-        ? { ...p, counts: { status: "ok", values: info?.counts ?? {}, error: null } }
+      setInfoDialog((p) => mine(p)
+        ? { ...p!, counts: { status: "ok", values: info?.counts ?? {}, error: null } }
         : p);
     } catch (e) {
-      setInfoDialog((p) => p && p.deviceId === deviceId
-        ? { ...p, counts: { status: "error", values: {}, error: liveReadError(e) } }
+      setInfoDialog((p) => mine(p)
+        ? { ...p!, counts: { status: "error", values: {}, error: liveReadError(e) } }
         : p);
     }
   }, [pullsdk]);
@@ -548,7 +557,9 @@ export default function DevicesPage() {
   // or a user push running on it. null = free to read.
   const infoDeviceId = infoDialog?.deviceId ?? null;
   const countsBlockedReason: string | null = infoDeviceId == null ? null
-    : holdsUnknown ? "Les retenues d'effacement n'ont pas pu être lues : aucune lecture en direct tant qu'elles ne le sont pas."
+    : holdsRead === "pending" ? "Lecture des retenues d'effacement en cours…"
+    : holdsRead === "failed" ? "Les retenues d'effacement n'ont pas pu être lues : pas de lecture en direct automatique."
+    : holdsUnknown ?"Les retenues d'effacement n'ont pas pu être lues : aucune lecture en direct tant qu'elles ne le sont pas."
     : heldIds.has(infoDeviceId) ? "Ce tourniquet est en retenue après un effacement : pas de lecture en direct pendant ce temps."
     : eraseDialog?.deviceId === infoDeviceId ? "L'assistant d'effacement est ouvert pour cet appareil."
     : status?.deviceSync?.progress?.running && status.deviceSync.progress.deviceId === infoDeviceId
@@ -556,11 +567,12 @@ export default function DevicesPage() {
       : null;
   const infoIsPullSdk = infoDialog ? protocolOf(infoDialog.cached) === "ZK_PULLSDK" : false;
   const countsStatus = infoDialog?.counts.status;
+  const infoOpenSeq = infoDialog?.openSeq ?? 0;
   useEffect(() => {
     if (infoTab !== "content" || infoDeviceId == null || !infoIsPullSdk) return;
     if (countsStatus !== "idle" || countsBlockedReason) return;
-    void fetchContentCounts(infoDeviceId);
-  }, [infoTab, infoDeviceId, infoIsPullSdk, countsStatus, countsBlockedReason, fetchContentCounts]);
+    void fetchContentCounts(infoDeviceId, infoOpenSeq);
+  }, [infoTab, infoDeviceId, infoOpenSeq, infoIsPullSdk, countsStatus, countsBlockedReason, fetchContentCounts]);
 
   // Composition by protocol (what really differs between devices) and the access-mode check,
   // counted from the roster on screen -- never assumed.

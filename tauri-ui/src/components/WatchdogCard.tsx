@@ -151,6 +151,7 @@ export default function WatchdogCard() {
         description={t.confirmBody}
         cancelLabel={t.cancel}
         confirmLabel={t.confirmOk}
+        confirmKind="primary"
         onConfirm={() => { setConfirmOpen(false); void apply(false); }}
       />
     </div>

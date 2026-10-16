@@ -207,11 +207,13 @@ export default function MainLayout() {
 
   // Beside it: how many ACTIVE declared devices have an IP address (Appareils' « Adresse
   // absente » rule; inactive devices are not counted). Read from the synced roster once,
-  // then again after each sync -- no polling of its own. The roster payload also carries
+  // then again after each sync -- no polling of its own -- and only while the health pill is
+  // shown (a PC that runs ULTRA workers and drives turnstiles). The roster payload also carries
   // each device's password, so it is reduced to two numbers right here and never kept.
   const lastSyncAt = status?.sync?.lastSyncAt ?? null;
   const [addressCount, setAddressCount] = useState<{ withAddress: number; active: number } | null>(null);
   useEffect(() => {
+    if (!showHealth) return undefined; // shown only beside the health pill
     let cancelled = false;
     (async () => {
       try {
@@ -224,7 +226,7 @@ export default function MainLayout() {
       }
     })();
     return () => { cancelled = true; };
-  }, [lastSyncAt]);
+  }, [lastSyncAt, showHealth]);
   const addressTone: Tone = addressCount && addressCount.withAddress < addressCount.active ? "warning" : "grey";
 
   // The account row shows the e-mail's local part — SessionBlock carries no

@@ -1,7 +1,7 @@
 // P3b-2: this PC's role (pilote / lecteur), its turnstiles, the notice socket, and — for a
 // reader — the door history of the drivers it reads, from the server (a reader never
 // connects to a turnstile).
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Activity, Clock, Loader2, RadioTower, RefreshCw, Router } from "lucide-react";
 
 import { realtime, ROLE_LABEL_FR, type ReaderDoorEvent, type RealtimeStatus } from "@/api/realtime";
@@ -49,15 +49,20 @@ export default function RealtimePage() {
     catch (e) { setError(String(e)); }
   }, []);
 
+  // Only the latest history request may write: a « Plus » page that lands after a reload
+  // must not be appended to the fresh list.
+  const historySeqRef = useRef(0);
   const loadHistory = useCallback(async (before?: number | null) => {
+    const seq = ++historySeqRef.current;
     setLoadingHistory(true);
     try {
       const page = await realtime.readerHistory(before ?? null, 50);
+      if (seq !== historySeqRef.current) return;
       setHistory((h) => (before ? [...h, ...page.items] : page.items));
       setNextBefore(page.nextBeforeId);
       setHistoryError(null);
-    } catch (e) { setHistoryError(String(e)); }
-    finally { setLoadingHistory(false); }
+    } catch (e) { if (seq === historySeqRef.current) setHistoryError(String(e)); }
+    finally { if (seq === historySeqRef.current) setLoadingHistory(false); }
   }, []);
 
   useEffect(() => { load(); const id = setInterval(load, 10_000); return () => clearInterval(id); }, [load]);
