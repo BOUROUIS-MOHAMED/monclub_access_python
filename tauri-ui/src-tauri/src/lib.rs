@@ -1119,6 +1119,11 @@ struct FavoriteShortcutEvent {
     door_name: String,
     device_name: String,
     shortcut: String,
+    /// What happened, for the dock (`FavoritesOverlayPage.tsx`): "opened" (2xx: the
+    /// controller accepted the open command), "requested" (202 filed for the PC pilote,
+    /// which is connected), "requested_offline" (filed, PC pilote not connected) or
+    /// "failed". `ok` and `error` keep their old meaning for a dock built before `status`.
+    status: &'static str,
     ok: bool,
     error: Option<String>,
 }
@@ -1295,7 +1300,7 @@ fn do_register_shortcuts(app: &AppHandle, shortcuts: Vec<FavoriteShortcutEntry>)
                         "doorNumber":   e.door_number,
                         "pulseSeconds": e.pulse_seconds,
                     });
-                    let (ok, err) = match reqwest::blocking::Client::new()
+                    let (status, ok, err) = match reqwest::blocking::Client::new()
                         .post(&url)
                         .header("X-Local-Token", local_api_token())
                         .json(&body)
@@ -1308,23 +1313,24 @@ fn do_register_shortcuts(app: &AppHandle, shortcuts: Vec<FavoriteShortcutEntry>)
                             let v = r.json::<serde_json::Value>().unwrap_or(serde_json::Value::Null);
                             if v.get("requested").and_then(|x| x.as_bool()).unwrap_or(false) {
                                 let connected = v.get("targetConnected").and_then(|x| x.as_bool()).unwrap_or(false);
-                                (false, Some(if connected {
-                                    "demandé au PC pilote (résultat non visible ici)".to_string()
+                                if connected {
+                                    ("requested", false, Some("demandé au PC pilote (résultat non visible ici)".to_string()))
                                 } else {
-                                    "PC pilote non connecté : la demande expirera sans ouvrir".to_string()
-                                }))
+                                    ("requested_offline", false, Some("PC pilote non connecté : la demande expirera sans ouvrir".to_string()))
+                                }
                             } else {
-                                (true, None)
+                                ("opened", true, None)
                             }
                         }
-                        Ok(r) => (false, Some(format!("HTTP {}", r.status()))),
-                        Err(e) => (false, Some(e.to_string())),
+                        Ok(r) => ("failed", false, Some(format!("HTTP {}", r.status()))),
+                        Err(e) => ("failed", false, Some(e.to_string())),
                     };
                     let payload = FavoriteShortcutEvent {
                         favorite_id: e.favorite_id,
                         door_name: e.door_name.clone(),
                         device_name: e.device_name.clone(),
                         shortcut: e.shortcut.clone(),
+                        status,
                         ok,
                         error: err,
                     };
