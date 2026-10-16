@@ -2,10 +2,11 @@
 // in main.logic.js, board S25), translated to French.
 //
 // Same calls and polling as before: /update/status every 3 s, /update/version
-// once, and the check / download / install / cancel actions. The design's
-// "Revenir à une version précédente" button is NOT built: no rollback endpoint
-// exists — a rollback only arrives as an offer (`status.rollback`), which this
-// page titles "Retour à une version précédente".
+// once, and the check / download / install / cancel actions. A server rollback
+// arrives as an offer (`status.rollback`), titled "Retour à une version
+// précédente". « Revenir à la version précédente » (Card B) is the other way
+// back: POST /update/rollback puts back the previous\ folder Setup kept, shown
+// only when `status.localRollback.available` (shared/update_runtime.py).
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -15,13 +16,16 @@ import {
   installAccessUpdate,
   cancelAccessUpdate,
   getAccessVersionInfo,
+  rollbackAccessUpdate,
 } from "@/api/accessUpdate";
+import { ApiError } from "@/api/client";
 import type { UpdateStatusResponse, UpdateVersionInfoResponse } from "@/api/types";
 import { usePageChrome } from "@/context/PageChromeContext";
 import { ActionButton } from "@/components/ui/action-button";
 import { ToneIcon } from "@/components/ui/chip";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { KpiCard, KpiRow } from "@/components/ui/kpi-card";
-import { DashedRule, ListRow, PageGrid, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
+import { DashedRule, ListRow, Note, PageGrid, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
 import {
   CircleCheck,
   Download,
@@ -31,6 +35,7 @@ import {
   RefreshCw,
   ScrollText,
   Trash2,
+  Undo2,
 } from "lucide-react";
 import ReleaseNotes from "@/components/update/ReleaseNotes";
 import UpdateNoticesFr from "@/components/update/UpdateNoticesFr";
@@ -54,6 +59,26 @@ function formatDate(iso: string | null | undefined): string {
   }
 }
 
+// POST /update/rollback refusal codes (shared/update_runtime.py RollbackRefused).
+const ROLLBACK_ERRORS: Record<string, string> = {
+  changed: "les versions ont changé depuis l'ouverture de cette fenêtre ; rechargez la page",
+  busy: "une installation est déjà en train de démarrer",
+  setup_running: "un installateur MonClub Access est en cours",
+  journal_present: "une installation ou une restauration est en cours",
+  update_in_progress: "une mise à jour est en cours",
+  launch_failed: "le programme de restauration n'a pas démarré",
+  no_previous: "la version précédente n'est plus complète sur ce poste",
+  previous_not_older: "la version gardée n'est pas plus ancienne que celle en service",
+  previous_too_old: "la version gardée est trop ancienne pour ce retour",
+  helper_missing: "le programme de restauration installé est introuvable",
+};
+
+function rollbackErrorText(e: unknown): string {
+  const code = e instanceof ApiError ? e.code : null;
+  if (code && ROLLBACK_ERRORS[code]) return ROLLBACK_ERRORS[code];
+  return e instanceof Error && e.message ? e.message : "erreur inconnue";
+}
+
 function withCodename(version: string, codename?: string | null): string {
   return codename ? `${version} « ${codename} »` : version;
 }
@@ -66,6 +91,12 @@ export default function UpdatePage() {
   const [installing, setInstalling] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
+  const [rollbackOpen, setRollbackOpen] = useState(false);
+  const [rollbackBusy, setRollbackBusy] = useState(false);
+  const [rollbackStarted, setRollbackStarted] = useState(false);
+  const [rollbackError, setRollbackError] = useState<string | null>(null);
+  // The versions the dialog names, frozen when it opens: the server refuses if they changed since.
+  const [rollbackTarget, setRollbackTarget] = useState<{ previousVersion: string; currentVersion: string } | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchStatus = useCallback(async () => {
@@ -120,6 +151,32 @@ export default function UpdatePage() {
       setInstallError(e instanceof Error && e.message ? e.message : "erreur inconnue");
       setInstalling(false);
       await fetchStatus();
+    }
+  };
+
+  const openRollback = () => {
+    const lr = status?.localRollback;
+    if (!lr?.available || !lr.previousVersion || !lr.currentVersion) return;
+    setRollbackTarget({ previousVersion: lr.previousVersion, currentVersion: lr.currentVersion });
+    setRollbackError(null);
+    setRollbackStarted(false);
+    setRollbackOpen(true);
+  };
+
+  const handleRollback = async () => {
+    if (!rollbackTarget) return;
+    setRollbackBusy(true);
+    setRollbackError(null);
+    try {
+      // Answers OK only once the restore helper runs; the app then quits and restarts.
+      await rollbackAccessUpdate(rollbackTarget);
+      setRollbackStarted(true);
+    } catch (e) {
+      // Nothing changed and the app keeps running.
+      setRollbackError(rollbackErrorText(e));
+      await fetchStatus();
+    } finally {
+      setRollbackBusy(false);
     }
   };
 
@@ -262,19 +319,73 @@ export default function UpdatePage() {
           </Panel>
         )}
 
-        <Panel className="col-span-4" aria-label="Ce poste">
-          <PanelHeader title="Ce poste" />
-          <PanelList>
-            <ListRow title="Composant" value={status?.componentDisplayName || versionInfo?.componentDisplayName || "MonClub Access"} />
-            <DashedRule />
-            <ListRow title="Canal" value={status?.channel || "—"} />
-            <DashedRule />
-            <ListRow title="Plateforme" value={status?.platform || "—"} />
-            <DashedRule />
-            <ListRow title="Dernière vérification" value={lastCheck ?? "—"} />
-          </PanelList>
-        </Panel>
+        <div className="col-span-4 flex flex-col gap-[18px]">
+          <Panel aria-label="Ce poste">
+            <PanelHeader title="Ce poste" />
+            <PanelList>
+              <ListRow title="Composant" value={status?.componentDisplayName || versionInfo?.componentDisplayName || "MonClub Access"} />
+              <DashedRule />
+              <ListRow title="Canal" value={status?.channel || "—"} />
+              <DashedRule />
+              <ListRow title="Plateforme" value={status?.platform || "—"} />
+              <DashedRule />
+              <ListRow title="Dernière vérification" value={lastCheck ?? "—"} />
+            </PanelList>
+          </Panel>
+
+          {status?.localRollback?.available && status.localRollback.previousVersion ? (
+            <Panel aria-label="Revenir en arrière">
+              <PanelHeader title="Revenir en arrière" />
+              <PanelList>
+                <ListRow
+                  icon={Undo2}
+                  tone="grey"
+                  title="Version précédente"
+                  sub={`Réinstalle la version ${status.localRollback.previousVersion}, gardée sur ce poste par la dernière mise à jour.`}
+                  wrap
+                  actions={
+                    <ActionButton kind="outline" size="sm" icon={Undo2} onClick={openRollback} disabled={installing || !!status.installing}>
+                      Revenir à la version précédente
+                    </ActionButton>
+                  }
+                />
+              </PanelList>
+            </Panel>
+          ) : null}
+        </div>
       </PageGrid>
+
+      {rollbackTarget && (
+        <ConfirmDialog
+          open={rollbackOpen}
+          onOpenChange={(open) => { if (!rollbackBusy && !rollbackStarted) setRollbackOpen(open); }}
+          title={`Revenir à la version ${rollbackTarget.previousVersion} ?`}
+          description={`MonClub Access ${rollbackTarget.currentVersion} sera remplacé par la version ${rollbackTarget.previousVersion}.`}
+          confirmLabel={rollbackStarted ? "Redémarrage…" : `Revenir à la ${rollbackTarget.previousVersion}`}
+          confirmKind="danger"
+          confirmDisabled={rollbackBusy || rollbackStarted}
+          onConfirm={() => { void handleRollback(); }}
+        >
+          <div className="flex flex-col gap-2">
+            <Note tone="warning">
+              L'application se ferme puis redémarre sur la version {rollbackTarget.previousVersion} : les tourniquets sont
+              en pause pendant ce temps. À faire quand le club est fermé.
+            </Note>
+            <Note tone="grey">
+              La version {rollbackTarget.currentVersion} ne sera plus installée automatiquement ; « Redémarrer et installer »
+              pourra toujours la réinstaller. Une version plus récente s'installera normalement.
+            </Note>
+            {rollbackStarted && (
+              <Note tone="info">
+                Restauration lancée : l'application va se fermer puis redémarrer sur la version {rollbackTarget.previousVersion}.
+              </Note>
+            )}
+            {rollbackError && (
+              <Note tone="error">Le retour n'a pas démarré : {rollbackError}. L'application continue de fonctionner.</Note>
+            )}
+          </div>
+        </ConfirmDialog>
+      )}
     </div>
   );
 }

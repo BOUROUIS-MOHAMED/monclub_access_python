@@ -512,6 +512,23 @@ export interface AgentDeviceSnap {
 }
 
 // ─── G) Updates (GET /api/v2/update/status) ───
+/** GET /update/status `localRollback` (shared/update_runtime.py::local_rollback_info). */
+export interface LocalRollbackInfo {
+  available: boolean;
+  currentVersion: string | null;
+  previousVersion: string | null;
+  /** Why it is not available: not_supported, not_installed_build, no_previous, previous_unreadable,
+   *  previous_other_component, previous_not_older, previous_too_old, helper_missing. */
+  reason: string | null;
+}
+
+/** POST /update/rollback — an error answer carries `code` (busy, changed, setup_running,
+ *  journal_present, update_in_progress, launch_failed, or one of LocalRollbackInfo.reason). */
+export interface UpdateRollbackResponse {
+  ok: boolean;
+  message?: string;
+}
+
 export interface UpdateStatusResponse {
   updateAvailable: boolean;
   downloaded: boolean;
@@ -552,6 +569,8 @@ export interface UpdateStatusResponse {
   pendingSince?: number | null;        // epoch seconds the offer was first verified
   installing?: boolean;
   lastResult?: UpdateLastResult | null;
+  // « Revenir à la version précédente »: the previous\ folder Setup kept (not the server's `rollback` offer).
+  localRollback?: LocalRollbackInfo | null;
 
   // Legacy block (backward compat)
   latestRelease?: {
