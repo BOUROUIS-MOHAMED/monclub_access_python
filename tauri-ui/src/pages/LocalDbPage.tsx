@@ -5,6 +5,9 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { ActionButton } from "@/components/ui/action-button";
 import { Chip } from "@/components/ui/chip";
+import { KpiCard, KpiRow } from "@/components/ui/kpi-card";
+import type { LocalDbKpisResponse } from "@/api/types";
+import { formatDate } from "@/lib/historyCopy";
 import { LineTabs } from "@/components/ui/line-tabs";
 import { ListRow, Note, PageGrid, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
 import {
@@ -20,6 +23,9 @@ import {
   ScrollText,
   Timer,
   AlertCircle,
+  CreditCard,
+  Send,
+  Users,
 } from "lucide-react";
 import { usePageChrome } from "@/context/PageChromeContext";
 import { cn } from "@/lib/utils";
@@ -392,6 +398,25 @@ export default function LocalDbPage() {
     return () => { cancelled = true; };
   }, [unlocked]);
 
+  // KPI tiles — GET /db/kpis, loaded once per unlock like the rail counts. Own error:
+  // a failed read shows « — », never a zero that would read as « nothing wrong ».
+  const [kpis, setKpis] = useState<LocalDbKpisResponse | null>(null);
+  const [kpisError, setKpisError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!unlocked) return;
+    let cancelled = false;
+    setKpisError(null);
+    void (async () => {
+      try {
+        const res = await get<LocalDbKpisResponse>("/db/kpis");
+        if (!cancelled) setKpis(res);
+      } catch (e: any) {
+        if (!cancelled) { setKpis(null); setKpisError(e?.message || String(e)); }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [unlocked]);
+
   const countOf = useCallback(
     (name: string) => tableStats.find((t) => t.name === name)?.rowCount ?? null,
     [tableStats],
@@ -461,6 +486,50 @@ export default function LocalDbPage() {
           { value: "raw", label: "Table brute", icon: ScrollText },
         ]}
       />
+
+      <KpiRow cols={3} className="flex-none">
+        <KpiCard
+          label="Abonnements"
+          value={kpis ? kpis.memberships.toLocaleString("fr-FR") : "—"}
+          sub={kpis
+            ? `${kpis.people.toLocaleString("fr-FR")} personne${kpis.people > 1 ? "s" : ""} · une ligne par abonnement`
+            : kpisError ? "lecture impossible" : "chargement…"}
+          subTone={kpisError ? "error" : undefined}
+          icon={Users}
+          tone="primary"
+        />
+        <div
+          className="min-w-0"
+          title={kpis && kpis.cards.duplicates.length
+            ? kpis.cards.duplicates.map((d) => `${d.card} : ${d.people.map((p) => p.fullName || (p.userId != null ? `#${p.userId}` : "?")).join(", ")}`).join("\n")
+            : undefined}
+        >
+          <KpiCard
+            label="Cartes en doublon"
+            value={kpis ? kpis.cards.duplicated.toLocaleString("fr-FR") : "—"}
+            sub={kpis
+              ? kpis.cards.duplicated
+                ? `${kpis.cards.peopleInvolved} personnes concernées · sur ${kpis.cards.distinct.toLocaleString("fr-FR")} cartes`
+                : `aucune carte partagée · ${kpis.cards.distinct.toLocaleString("fr-FR")} cartes`
+              : kpisError ? "lecture impossible" : "chargement…"}
+            subTone={kpisError ? "error" : kpis?.cards.duplicated ? "warning" : undefined}
+            icon={CreditCard}
+            tone={kpis?.cards.duplicated ? "warning" : "grey"}
+          />
+        </div>
+        <KpiCard
+          label="Passages à envoyer"
+          value={kpis ? kpis.historyToSend.total.toLocaleString("fr-FR") : "—"}
+          sub={kpis
+            ? kpis.historyToSend.total
+              ? `${kpis.historyToSend.retrying} en nouvel essai · le plus ancien ${formatDate(kpis.historyToSend.oldestCreatedAt)}`
+              : "tout est envoyé"
+            : kpisError ? "lecture impossible" : "chargement…"}
+          subTone={kpisError ? "error" : kpis?.historyToSend.retrying ? "warning" : undefined}
+          icon={Send}
+          tone={kpis?.historyToSend.total ? "warning" : "success"}
+        />
+      </KpiRow>
 
       <div className="grid min-h-0 flex-1 grid-cols-12 gap-[18px]">
         {/* ── Le sujet : la table ─────────────────────────────────────────── */}

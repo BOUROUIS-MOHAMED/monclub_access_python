@@ -688,6 +688,21 @@ export interface PushBatchHistoryResponse {
   size: number;
 }
 
+/** GET /db/kpis — Base locale tiles (counted per person for cards, see guide §3.13). */
+export interface LocalDbKpisResponse {
+  ok: boolean;
+  memberships: number;
+  people: number;
+  cards: {
+    distinct: number;
+    duplicated: number;
+    peopleInvolved: number;
+    /** At most 50, most-shared first. */
+    duplicates: { card: string; people: { fullName: string; userId: number | null; mainAccountId: number | null }[] }[];
+  };
+  historyToSend: { total: number; pending: number; retrying: number; oldestCreatedAt: string | null };
+}
+
 /** GET /push-history/hourly?date=YYYY-MM-DD — one local day, per device × local hour. */
 export interface PushHourlyCell {
   hour: number;

@@ -65,7 +65,7 @@ This file is only useful while it is true. If you change any of the following, y
 | What a turnstile's heartbeat line reports as waiting (`device_sync.py::count_waiting_pins`, `ultra_engine.py::_count_waiting_pins` and the snapshot's `failed_pins`, `_sync_one_device`'s `_last_waiting_pins`, `realtime_agent.py::get_status_snapshot`'s `failedPins`, `pc_identity.py::build_heartbeat_payload`, `::_report_held_turnstiles` and its `held` key, `erase_wizard.py::held_waiting_count`, the wizard's `_set_waiting`) | §3.10 |
 | Who writes to `access.db` — the DbWriter, `_run_db_write_sync` (its lanes, `priority=`, the inline nested call, the 60 s wait), a write outside it, the tripwire's allowlist (`tests/test_db_single_writer.py::ALLOWED_DIRECT`), which writes are in the door lane (`db.py::insert_access_history`, `::save_agent_rtlog_state`), the AGENT history claim (`realtime_agent.py::DecisionService.run`'s `F-013` block) | §3.11 |
 | The member fee lines of the entry screen -- what is stored, how it reaches the popup, how the screen judges and draws it (`db.py::_member_fees_json`, `::_member_fees_list`, `::_ensure_column_forcing_refresh`, `sync_users.fees_json` in `_SYNC_USER_COLUMNS` and the five member writers, `sync_access_software_settings.fee_due_soon_days`, `settings_reader.py::normalize_global_settings`'s `fee_due_soon_days`, `access_types.py::NotificationRequest.fees`, `ultra_engine.py::_enqueue_notification(user_fees=)`, `ultra_pc_entry.py::member_popup_fields`, `realtime_agent.py::_popup_payload_from_request`, `tauri-ui/src/lib/feeAlerts.ts`, `PopupWindow.tsx` `AFeeLine` / `AFeeMark`) | §3.12 |
-| Which sync run a push batch answers -- the `push_batch_sync_run` link and what carries its ids (`db.py::insert_push_batch(sync_run_ids=)`, `::list_push_batches_for_sync_run`; `app.py::_request_running_ultra_sync(sync_run_id=)` and its two calls in the sync tick; `ultra_engine.py::UltraEngine.request_sync_now(sync_run_ids=)`, `::_worker_full_sync_accepted_or_pending`, `UltraDeviceWorker.request_full_sync(sync_run_ids=)`, `::_drain_full_sync_commands`'s `run_kw`, `::_run_standalone_full_sync`, `::_maybe_mirror_reconcile`; `device_sync.py::run_one_device_on_connected_sdk` / `::_run_single_device_sync` / `::_sync_one_device`) -- or the history and Base locale figures (`db.py::push_batch_hourly`) | §3.13 |
+| Which sync run a push batch answers -- the `push_batch_sync_run` link and what carries its ids (`db.py::insert_push_batch(sync_run_ids=)`, `::list_push_batches_for_sync_run`; `app.py::_request_running_ultra_sync(sync_run_id=)` and its two calls in the sync tick; `ultra_engine.py::UltraEngine.request_sync_now(sync_run_ids=)`, `::_worker_full_sync_accepted_or_pending`, `UltraDeviceWorker.request_full_sync(sync_run_ids=)`, `::_drain_full_sync_commands`'s `run_kw`, `::_run_standalone_full_sync`, `::_maybe_mirror_reconcile`; `device_sync.py::run_one_device_on_connected_sdk` / `::_run_single_device_sync` / `::_sync_one_device`) -- or the history and Base locale figures (`db.py::push_batch_hourly`, `::local_db_kpis`) | §3.13 |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -4838,6 +4838,24 @@ handler here carries a member or a pin (so none belongs in §3.2f).
     reports as already covered without queuing a pass; a pass skipped because the roster hash did not
     change (scheduler path) -- and a pass that has not started yet when the detail is opened (its row
     appears once it starts). `[CODE]`
+- **`GET /api/v2/db/kpis`** → `_handle_db_kpis` → `db.py::local_db_kpis` (Base locale tiles, loaded once
+  per unlock):
+  - « Abonnements »: `sync_users` rows (one per membership) and the number of persons (key below).
+  - « Cartes en doublon »: a card value (trimmed; an empty string is no card -- what the cache stores
+    for a member without a card) held by **two or more persons**, in either `first_card_id` or
+    `second_card_id`. Counted per person, never per row: a person has one row per membership, each
+    repeating their cards, so counting rows would report false duplicates. The person is
+    `main_account_id`; when a row has none, the `main_account_id` another row of the same `user_id`
+    carries; else the `user_id` (tagged, so an account id and a user id never merge); else the
+    membership. `main_account_id` can be NULL on every row (§3.2d: a backend that does not send it) --
+    then persons are user ids, and two user ids of one account would count as two persons. The answer
+    also lists up to 50 duplicated cards with their persons' names (the page's tooltip).
+  - « Passages à envoyer »: the door-history uploader's own filter (`list_pending_access_history_for_sync`:
+    `PENDING` or `FAILED_RETRYABLE`, blank MB2000 rows excluded), without its due-now retry-time
+    condition; `retrying` is the `FAILED_RETRYABLE` part. `FAILED_TERMINAL` rows are never sent and are
+    not counted.
+  - Not shown (no column backs them without reading every fingerprint blob): the v4 « Empreintes »
+    tile. `[TEST: test_local_db_kpis.py]`
 
 ---
 

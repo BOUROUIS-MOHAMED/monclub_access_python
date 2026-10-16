@@ -11032,6 +11032,108 @@ def list_pending_access_history_for_sync(*, limit: int = 200) -> List[AccessHist
         return [AccessHistoryRow(**dict(r)) for r in rows]
 
 
+_LOCAL_DB_DUPLICATE_SAMPLE = 50
+
+
+def local_db_kpis() -> Dict[str, Any]:
+    """Base locale tiles (guide §3.13). Counts only what the tables store.
+
+    Duplicate cards are counted per PERSON, not per row: a person has one sync_users row per
+    membership, each repeating their cards. The person is ``main_account_id``, else -- when
+    no row of that ``user_id`` carries one -- the ``user_id``, else the membership. A card
+    counts as duplicated when two or more persons hold it, in either card column. A card
+    value is trimmed; an empty value is no card.
+
+    « Passages à envoyer » is the door-history uploader's own filter
+    (``list_pending_access_history_for_sync``): PENDING or FAILED_RETRYABLE, blank MB2000
+    rows excluded -- without its due-now time condition (a row waiting for its retry time
+    is still to send).
+    """
+    from app.core.zkem_rtlog_filter import BLANK_HISTORY_SQL
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id, main_account_id, active_membership_id, full_name,
+                   first_card_id, second_card_id
+            FROM sync_users
+            """
+        ).fetchall()
+        waiting = conn.execute(
+            """
+            SELECT backend_sync_state, COUNT(*), MIN(created_at)
+            FROM access_history
+            WHERE backend_sync_state IN (?, ?)
+              AND NOT """ + BLANK_HISTORY_SQL + """
+            GROUP BY backend_sync_state
+            """,
+            (ACCESS_HISTORY_SYNC_PENDING, ACCESS_HISTORY_SYNC_FAILED_RETRYABLE),
+        ).fetchall()
+
+    account_by_user: Dict[int, int] = {}
+    for row in rows:
+        if row["user_id"] is not None and row["main_account_id"] is not None:
+            uid, mid = int(row["user_id"]), int(row["main_account_id"])
+            account_by_user[uid] = min(mid, account_by_user.get(uid, mid))
+
+    def _person(row: Any) -> str:
+        if row["main_account_id"] is not None:
+            return f"a:{int(row['main_account_id'])}"
+        if row["user_id"] is not None:
+            uid = int(row["user_id"])
+            if uid in account_by_user:
+                return f"a:{account_by_user[uid]}"
+            return f"u:{uid}"
+        return f"m:{row['active_membership_id']}"
+
+    people: Dict[str, Dict[str, Any]] = {}
+    holders: Dict[str, set] = {}
+    for row in rows:
+        key = _person(row)
+        person = people.setdefault(key, {
+            "fullName": "", "userId": row["user_id"], "mainAccountId": None,
+        })
+        if not person["fullName"] and row["full_name"]:
+            person["fullName"] = str(row["full_name"])
+        if key.startswith("a:"):
+            person["mainAccountId"] = int(key[2:])
+        for col in ("first_card_id", "second_card_id"):
+            card = str(row[col] or "").strip()
+            if card:
+                holders.setdefault(card, set()).add(key)
+
+    duplicated = sorted((card for card, keys in holders.items() if len(keys) > 1),
+                        key=lambda c: (-len(holders[c]), c))
+    involved = set()
+    for card in duplicated:
+        involved |= holders[card]
+
+    by_state = {str(r[0]): (int(r[1] or 0), r[2]) for r in waiting}
+    pending, pending_oldest = by_state.get(ACCESS_HISTORY_SYNC_PENDING, (0, None))
+    retrying, retrying_oldest = by_state.get(ACCESS_HISTORY_SYNC_FAILED_RETRYABLE, (0, None))
+    oldest = min([v for v in (pending_oldest, retrying_oldest) if v], default=None)
+
+    return {
+        "memberships": len(rows),
+        "people": len(people),
+        "cards": {
+            "distinct": len(holders),
+            "duplicated": len(duplicated),
+            "peopleInvolved": len(involved),
+            "duplicates": [
+                {"card": card, "people": [people[k] for k in sorted(holders[card])]}
+                for card in duplicated[:_LOCAL_DB_DUPLICATE_SAMPLE]
+            ],
+        },
+        "historyToSend": {
+            "total": pending + retrying,
+            "pending": pending,
+            "retrying": retrying,
+            "oldestCreatedAt": oldest,
+        },
+    }
+
+
 def mark_access_history_synced(*, row_ids: Iterable[int], synced_at: str | None = None) -> int:
     ids = sorted({int(x) for x in row_ids if int(x) > 0})
     if not ids:

@@ -6956,6 +6956,14 @@ def _handle_db_tables(ctx: _Ctx) -> None:
     ctx.send_json(200, {"tables": tables, "dbSizeBytes": db_size})
 
 
+def _handle_db_kpis(ctx: _Ctx) -> None:
+    """Base locale tiles: memberships / people, cards held by two persons, door history
+    still to send (db.py::local_db_kpis, guide §3.13)."""
+    from app.core.db import local_db_kpis
+
+    ctx.send_json(200, {"ok": True, **local_db_kpis()})
+
+
 def _handle_db_table_query(ctx: _Ctx) -> None:
     table_name = ctx.param("tableName")
     limit = ctx.q_int("limit", default=500)
