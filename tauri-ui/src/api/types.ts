@@ -679,6 +679,36 @@ export interface PushBatchHistoryResponse {
   size: number;
 }
 
+/** GET /push-history/hourly?date=YYYY-MM-DD — one local day, per device × local hour. */
+export interface PushHourlyCell {
+  hour: number;
+  batches: number;
+  success: number;
+  partial: number;
+  failed: number;
+  inProgress: number;
+  other: number;
+  pinsAttempted: number;
+  pinsSuccess: number;
+  pinsFailed: number;
+}
+
+export interface PushHourlyDevice {
+  deviceId: number;
+  deviceName: string;
+  /** Only the hours that have at least one batch. */
+  hours: PushHourlyCell[];
+}
+
+export interface PushHourlyResponse {
+  ok: boolean;
+  date: string;
+  fromUtc: string;
+  toUtc: string;
+  devices: PushHourlyDevice[];
+  totals: { batches: number; pinsAttempted: number; pinsSuccess: number; pinsFailed: number };
+}
+
 export interface PushPinHistoryRow {
   id: number;
   batch_id: number;

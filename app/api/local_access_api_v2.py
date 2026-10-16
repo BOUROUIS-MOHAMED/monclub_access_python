@@ -1912,6 +1912,20 @@ def _handle_push_history_list(ctx: _Ctx) -> None:
     ctx.send_json(200, {"ok": True, **result})
 
 
+def _handle_push_history_hourly(ctx: _Ctx) -> None:
+    """Push batches of one local day, per device and local hour (Historique push chart)."""
+    from datetime import datetime as _dt
+    from app.core.db import push_batch_hourly
+
+    day = ctx.q("date", default="").strip() or _dt.now().strftime("%Y-%m-%d")
+    try:
+        _dt.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        ctx.send_json(400, {"ok": False, "error": "date must be YYYY-MM-DD"})
+        return
+    ctx.send_json(200, {"ok": True, **push_batch_hourly(day=day)})
+
+
 def _handle_push_history_pins(ctx: _Ctx) -> None:
     from app.core.db import get_push_batch, get_push_batch_pins
 

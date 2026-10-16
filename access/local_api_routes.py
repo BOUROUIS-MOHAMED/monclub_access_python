@@ -47,6 +47,7 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("GET", "/api/v2/sync-history", "_handle_sync_history_list"),
     ("GET", "/api/v2/sync-history/{id}", "_handle_sync_history_detail"),
     ("GET", "/api/v2/push-history", "_handle_push_history_list"),
+    ("GET", "/api/v2/push-history/hourly", "_handle_push_history_hourly"),
     ("GET", "/api/v2/push-history/{batchId}/pins", "_handle_push_history_pins"),
     ("GET", "/api/v2/sync/cache/meta", "_handle_sync_cache_meta"),
     ("GET", "/api/v2/sync/cache/users", "_handle_sync_cache_users"),

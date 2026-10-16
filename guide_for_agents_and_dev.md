@@ -4791,6 +4791,23 @@ tile's photo (red when a fee is unpaid, else gold). `[TEST: tauri-ui src/lib/fee
 (npm test)]` The layout on a real entry TV with two fee lines and the gold expiry footer together
 is `[UNVERIFIED]`: checked by type-check and by reading the 1280×720 stage sizes only.
 
+### 3.13 History pages and Base locale figures (Access v5 Card H, 2026-10-16)
+
+Read-only figures the Access UI shows on Historique push, Historique sync and Base locale. No
+handler here carries a member or a pin (so none belongs in §3.2f).
+
+- **`GET /api/v2/push-history/hourly?date=YYYY-MM-DD`** → `_handle_push_history_hourly` →
+  `db.py::push_batch_hourly` (tauri-ui `PushHourlyMatrix`, « Envois par heure »). `date` is a day of the
+  PC's local time (default today; anything else is 400). `push_batch_history.created_at` is UTC in two
+  spellings -- `...Z` (`ultra_engine.py` standalone pass and MIRROR, `time.strftime(..., gmtime())`) and
+  `+00:00` (`device_sync.py::_sync_one_device`, `isoformat()`); `_parse_push_batch_utc` reads both (a value
+  without an offset as UTC; an unparsable one is left out). Rows are cut on the local day and grouped by
+  device and local hour of `created_at` -- the moment the batch row was opened, i.e. when the push
+  started. A cell holds the batch count per stored `status` (`other` for anything but SUCCESS / PARTIAL /
+  FAILED / IN_PROGRESS) and the sums of the stored `pins_*`; nothing is inferred. The device name is the
+  latest stored for that device that day. On a day with a daylight-saving change the repeated hour is
+  one cell (grouped by hour number). `[TEST: test_push_history_hourly.py]`
+
 ---
 
 ## 4. Protocol resolution — how a device gets its driver

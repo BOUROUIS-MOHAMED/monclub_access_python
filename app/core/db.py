@@ -10339,6 +10339,117 @@ def prune_sync_run_history(*, retention_days: int = 30) -> int:
     return _run_db_write_sync("prune_sync_run_history", _write)
 
 
+def _parse_push_batch_utc(value: Any) -> datetime | None:
+    """push_batch_history.created_at -> aware UTC datetime.
+
+    Every writer stores UTC, in two spellings: ``...Z`` (ULTRA standalone / MIRROR,
+    ``time.strftime(..., gmtime())``) and ``+00:00`` (``device_sync.py``,
+    ``isoformat()``). A value without an offset is read as UTC too (same writers);
+    an unparsable value is None -- left out, never guessed.
+    """
+    from datetime import timezone as _tz
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text.replace(" ", "T", 1))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_tz.utc)
+    return parsed.astimezone(_tz.utc)
+
+
+_PUSH_HOURLY_STATUS_KEY = {
+    "SUCCESS": "success",
+    "PARTIAL": "partial",
+    "FAILED": "failed",
+    "IN_PROGRESS": "inProgress",
+}
+
+
+def push_batch_hourly(*, day: str, tz: Any = None) -> Dict[str, Any]:
+    """Push batches of one LOCAL day, grouped by device and local hour (Historique push).
+
+    ``day`` is ``YYYY-MM-DD`` in the PC's local time (``tz`` overrides the zone, for
+    tests). A batch is placed by its ``created_at`` -- the moment its row was opened,
+    i.e. when that push started. Each cell counts batches by their stored ``status``
+    (an unknown status counts as ``other``) and sums the stored ``pins_*`` columns.
+    """
+    from datetime import timezone as _tz
+
+    start_naive = datetime.strptime(str(day), "%Y-%m-%d")
+    end_naive = start_naive + timedelta(days=1)
+    if tz is None:
+        start_local = start_naive.astimezone()      # the PC's zone at that midnight
+        end_local = end_naive.astimezone()
+    else:
+        start_local = start_naive.replace(tzinfo=tz)
+        end_local = end_naive.replace(tzinfo=tz)
+    start_utc = start_local.astimezone(_tz.utc)
+    end_utc = end_local.astimezone(_tz.utc)
+    # Coarse SQL window on the first 19 characters, which both spellings share, one
+    # day wider on each side; the exact cut is made below on the parsed value.
+    lo = (start_utc - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    hi = (end_utc + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, device_id, device_name, status, pins_attempted, pins_success,
+                   pins_failed, created_at
+            FROM push_batch_history
+            WHERE substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
+              AND substr(replace(created_at, ' ', 'T'), 1, 19) < ?
+            ORDER BY id ASC
+            """,
+            (lo, hi),
+        ).fetchall()
+
+    devices: Dict[int, Dict[str, Any]] = {}
+    totals = {"batches": 0, "pinsAttempted": 0, "pinsSuccess": 0, "pinsFailed": 0}
+    for row in rows:
+        created = _parse_push_batch_utc(row["created_at"])
+        if created is None or not (start_utc <= created < end_utc):
+            continue
+        local = created.astimezone(tz) if tz is not None else created.astimezone()
+        device_id = int(row["device_id"])
+        dev = devices.setdefault(device_id, {"deviceId": device_id, "deviceName": "", "hours": {}})
+        dev["deviceName"] = str(row["device_name"] or "")   # id order: the latest name wins
+        cell = dev["hours"].setdefault(int(local.hour), {
+            "hour": int(local.hour), "batches": 0,
+            "success": 0, "partial": 0, "failed": 0, "inProgress": 0, "other": 0,
+            "pinsAttempted": 0, "pinsSuccess": 0, "pinsFailed": 0,
+        })
+        status = str(row["status"] or "").strip().upper()
+        cell[_PUSH_HOURLY_STATUS_KEY.get(status, "other")] += 1
+        cell["batches"] += 1
+        totals["batches"] += 1
+        for src, dst in (("pins_attempted", "pinsAttempted"),
+                         ("pins_success", "pinsSuccess"),
+                         ("pins_failed", "pinsFailed")):
+            n = int(row[src] or 0)
+            cell[dst] += n
+            totals[dst] += n
+
+    out = []
+    for dev in sorted(devices.values(), key=lambda d: (d["deviceName"].lower(), d["deviceId"])):
+        out.append({
+            "deviceId": dev["deviceId"],
+            "deviceName": dev["deviceName"],
+            "hours": [dev["hours"][h] for h in sorted(dev["hours"])],
+        })
+    return {
+        "date": start_naive.strftime("%Y-%m-%d"),
+        "fromUtc": start_utc.isoformat(timespec="seconds"),
+        "toUtc": end_utc.isoformat(timespec="seconds"),
+        "devices": out,
+        "totals": totals,
+    }
+
+
 def prune_push_batch_history(*, retention_days: int = 30) -> int:
     days = max(int(retention_days), 1)
     def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
