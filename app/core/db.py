@@ -8173,6 +8173,75 @@ def list_members_roster(
     return page_rows, filtered_total, counts
 
 
+def _member_row_for_card(conn: sqlite3.Connection, active_membership_id: int) -> tuple[Dict[str, Any] | None, Dict[str, Any] | None]:
+    """(row, hold) for one membership: the sync_users row, else the sync_users_held row with
+    its hold columns in ``hold``. Selects only the columns the member card reads -- one row's
+    fingerprints_json, never a roster-wide template read (list_sync_users_page CAUTION)."""
+    cols = "user_id, active_membership_id, membership_id, full_name, fingerprints_json"
+    r = conn.execute(
+        f"SELECT {cols} FROM sync_users WHERE active_membership_id = ? LIMIT 1",
+        (int(active_membership_id),),
+    ).fetchone()
+    if r is not None:
+        return dict(r), None
+    r = conn.execute(
+        f"SELECT {cols}, held_reason, held_for_date, held_at FROM sync_users_held "
+        "WHERE active_membership_id = ? LIMIT 1",
+        (int(active_membership_id),),
+    ).fetchone()
+    if r is None:
+        return None, None
+    d = dict(r)
+    hold = {
+        "reason": d.pop("held_reason", None),
+        "forDate": d.pop("held_for_date", None),
+        "at": d.pop("held_at", None),
+    }
+    return d, hold
+
+
+def get_member_card_details(active_membership_id: int) -> Dict[str, Any] | None:
+    """What the Utilisateurs member card shows beyond the roster row, for ONE membership,
+    read only when the card is opened (Access v5 Card M). None when this PC holds no row for
+    the membership (neither sync_users nor sync_users_held).
+
+    * ``fingerprints`` -- the prints of the local copy of the server's member row: finger id,
+      label, enabled. Never the template itself. ``fingerprintCount`` = number of entries.
+    """
+    try:
+        amid = int(active_membership_id)
+    except (TypeError, ValueError):
+        return None
+    if amid <= 0:
+        return None
+    with get_conn() as conn:
+        row, hold = _member_row_for_card(conn, amid)
+    if row is None:
+        return None
+
+    fps: List[Dict[str, Any]] = []
+    try:
+        raw = json.loads(row.get("fingerprints_json") or "[]")
+    except Exception:
+        raw = []
+    for f in raw if isinstance(raw, list) else []:
+        if not isinstance(f, dict):
+            continue
+        fps.append({
+            "fingerId": _to_int_or_none(f.get("fingerId")),
+            "label": f.get("label") if isinstance(f.get("label"), str) else None,
+            "enabled": f.get("enabled") is not False,
+        })
+
+    return {
+        "activeMembershipId": amid,
+        "userId": _to_int_or_none(row.get("user_id")),
+        "held": hold is not None,
+        "fingerprintCount": len(fps),
+        "fingerprints": fps,
+    }
+
+
 @_tel.timed("DB_READ_list_sync_users_by_active_membership_ids", slow_ms=50, warn_ms=1000)
 def list_sync_users_by_active_membership_ids(
     active_membership_ids: List[int] | set[int] | tuple[int, ...],

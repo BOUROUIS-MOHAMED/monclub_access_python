@@ -476,6 +476,24 @@ export interface OfflineQueueListResponse {
   states: OfflineCreationState[];
 }
 
+// ─── Utilisateurs member card (GET /api/v2/members/{activeMembershipId}/card) ───
+// Read only when the card opens. Local copy of the server's data; no template, no secret.
+export interface MemberCardFingerprint {
+  fingerId: number | null;
+  label: string | null;
+  enabled: boolean;
+}
+
+export interface MemberCardResponse {
+  ok: boolean;
+  activeMembershipId: number;
+  userId: number | null;
+  /** The row sits in sync_users_held (off the turnstile roster for the gym date). */
+  held: boolean;
+  fingerprintCount: number;
+  fingerprints: MemberCardFingerprint[];
+}
+
 // ─── E) Local fingerprints (GET /api/v2/fingerprints) ───
 export interface LocalFingerprintDto {
   id: number;

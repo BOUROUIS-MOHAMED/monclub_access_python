@@ -65,6 +65,7 @@ This file is only useful while it is true. If you change any of the following, y
 | What a turnstile's heartbeat line reports as waiting (`device_sync.py::count_waiting_pins`, `ultra_engine.py::_count_waiting_pins` and the snapshot's `failed_pins`, `_sync_one_device`'s `_last_waiting_pins`, `realtime_agent.py::get_status_snapshot`'s `failedPins`, `pc_identity.py::build_heartbeat_payload`, `::_report_held_turnstiles` and its `held` key, `erase_wizard.py::held_waiting_count`, the wizard's `_set_waiting`) | §3.10 |
 | Who writes to `access.db` — the DbWriter, `_run_db_write_sync` (its lanes, `priority=`, the inline nested call, the 60 s wait), a write outside it, the tripwire's allowlist (`tests/test_db_single_writer.py::ALLOWED_DIRECT`), which writes are in the door lane (`db.py::insert_access_history`, `::save_agent_rtlog_state`), the AGENT history claim (`realtime_agent.py::DecisionService.run`'s `F-013` block) | §3.11 |
 | The member fee lines of the entry screen -- what is stored, how it reaches the popup, how the screen judges and draws it (`db.py::_member_fees_json`, `::_member_fees_list`, `::_ensure_column_forcing_refresh`, `sync_users.fees_json` in `_SYNC_USER_COLUMNS` and the five member writers, `sync_access_software_settings.fee_due_soon_days`, `settings_reader.py::normalize_global_settings`'s `fee_due_soon_days`, `access_types.py::NotificationRequest.fees`, `ultra_engine.py::_enqueue_notification(user_fees=)`, `ultra_pc_entry.py::member_popup_fields`, `realtime_agent.py::_popup_payload_from_request`, `tauri-ui/src/lib/feeAlerts.ts`, `PopupWindow.tsx` `AFeeLine` / `AFeeMark`) | §3.12 |
+| The Utilisateurs member card data and the mutation-queue names (`db.py::get_member_card_details`, `::_member_row_for_card`, `local_access_api_v2.py::_handle_member_card`, `tauri-ui/src/pages/UsersPage.tsx` `cardDetailLine`) | §3.14 |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -1801,6 +1802,7 @@ Access desktop UI (`tauri-ui/src`) was grepped in this repo. `[CODE]`
 | `GET /api/v2/push-history/{batchId}/pins`, `GET /api/v2/devices/{deviceId}/mirror-plan`, `GET /api/v2/db/access-history`, `GET /api/v2/popup/poll` | — | Raw pins / stored rows / engine-enriched notifications, no pin → member mapping in the handler (`popup/poll` payloads are enriched by `_handle_allow`, which is converted) | Display only |
 | `POST /api/v2/members/photo`, `POST /api/v2/members/mutation`, `POST /api/v2/enroll/retry-push` | `activeMembershipId` / `targetId` | Backend-side membership ids; no device pin | n/a |
 | `GET /api/v2/sync/cache/users`, `GET /api/v2/members` (`_handle_members_roster`) | paging/filter | Cached rows; they now also carry `mainAccountId` | n/a |
+| `GET /api/v2/members/{activeMembershipId}/card` (`_handle_member_card`, tauri-ui UsersPage member card) | path id | One membership's extra card lines from the local copy (§3.14); no device pin | n/a |
 | `POST /api/v2/devices/{deviceId}/force-resync` | — | `clear_device_sync_hashes` (UPDATE) + scheduler `force_resync` | n/a |
 
 `[UNVERIFIED]` Whether any dashboard or UI screen calls `users/push` or `users/delete` with a pin: the
@@ -4790,6 +4792,23 @@ renouveler. », the last line ending « +N autre(s) »; `AMulti` puts one small 
 tile's photo (red when a fee is unpaid, else gold). `[TEST: tauri-ui src/lib/feeAlerts.test.ts
 (npm test)]` The layout on a real entry TV with two fee lines and the gold expiry footer together
 is `[UNVERIFIED]`: checked by type-check and by reading the 1280×720 stage sizes only.
+
+### 3.14 The Utilisateurs member card data (Access v5 Card M, 2026-10-16)
+
+The member card (Utilisateurs › Répertoire › « Voir la fiche ») shows lines the roster row does not
+carry. They come from `GET /api/v2/members/{activeMembershipId}/card` (`_handle_member_card` →
+`db.py::get_member_card_details`), called by `UsersPage.tsx` only when a card is open — once when it
+opens and again after each roster reload — never per roster row, and never for an offline-created
+member (no server id yet: the card says « après synchronisation »). 404 when this PC holds no row for
+the membership in `sync_users` nor `sync_users_held`. `[CODE]`
+
+- **Fingerprints (« Empreintes »).** `_member_row_for_card` reads that ONE row's `fingerprints_json`
+  (from `sync_users`, else `sync_users_held`); the answer carries `fingerprintCount` and, per entry,
+  `fingerId` / `label` / `enabled` — never `templateData`. The roster keeps its template-free read
+  (`list_members_roster` → `include_templates=False`, the 8.8 s field measurement of
+  `list_sync_users_page`). The count is the local copy of the server's member row, like Enrôlement's
+  « Déjà enregistrées ». `[TEST: tests/test_member_card_details.py::TestFingerprintCount,
+  ::TestCardEndpoint]`
 
 ---
 

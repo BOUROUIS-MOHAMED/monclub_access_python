@@ -2017,6 +2017,23 @@ def _handle_members_roster(ctx: _Ctx) -> None:
     })
 
 
+def _handle_member_card(ctx: _Ctx) -> None:
+    """GET /api/v2/members/{activeMembershipId}/card -- the member card's extra lines for ONE
+    membership, read when the card opens (never per roster row). Local copy only, works
+    offline. Never returns a fingerprint template. 404 when this PC holds no row for it."""
+    from app.core.db import get_member_card_details
+
+    amid = ctx.param_int("activeMembershipId", 0)
+    if amid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "a positive activeMembershipId is required"})
+        return
+    details = get_member_card_details(amid)
+    if details is None:
+        ctx.send_json(404, {"ok": False, "error": "membership not on this PC"})
+        return
+    ctx.send_json(200, {"ok": True, **details})
+
+
 def _handle_member_photo(ctx: _Ctx) -> None:
     """Attach a member photo. For a SYNCED member (real activeMembershipId) it uploads
     immediately via the managed-media presign flow; for an OFFLINE-PENDING member

@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } f
 import { useUsers } from "@/api/hooks";
 import { get, openSSE, patch, post } from "@/api/client";
 import type {
+  MemberCardResponse,
   OfflineAttemptResponse,
   OfflineCreationKind,
   OfflineCreationRow,
@@ -53,6 +54,7 @@ import {
   UserPlus,
   Users as UsersIcon,
   X,
+  type LucideIcon,
 } from "lucide-react";
 import { usePageChrome } from "@/context/PageChromeContext";
 import { cn } from "@/lib/utils";
@@ -1061,6 +1063,23 @@ export default function UsersPage() {
   // falls back to the default rail when the row leaves the page.
   const selected = selectedKey ? roster.find((m) => memberKey(m) === selectedKey) ?? null : null;
 
+  // The card's extra lines (prints, …) come from GET /members/{id}/card, read once when a
+  // card opens and again after each roster reload — never per roster row. Keyed by the
+  // membership id so a slow answer for a previous card is never shown on the next one.
+  const selectedAmid = selected && !selected.offlinePending && Number(selected.activeMembershipId) > 0
+    ? Number(selected.activeMembershipId) : 0;
+  const [cardInfo, setCardInfo] = useState<{ amid: number; data: MemberCardResponse | null; error: string | null }>({ amid: 0, data: null, error: null });
+  useEffect(() => {
+    if (!selectedAmid) return;
+    let alive = true;
+    setCardInfo((c) => (c.amid === selectedAmid ? c : { amid: selectedAmid, data: null, error: null }));
+    get<MemberCardResponse>(`/members/${selectedAmid}/card`)
+      .then((d) => { if (alive) setCardInfo({ amid: selectedAmid, data: d, error: null }); })
+      .catch((e) => { if (alive) setCardInfo({ amid: selectedAmid, data: null, error: e?.message || String(e) }); });
+    return () => { alive = false; };
+  }, [selectedAmid, roster]);
+  const card = cardInfo.amid === selectedAmid ? cardInfo : { amid: selectedAmid, data: null, error: null };
+
   // Rail figures. Every one is derived from the roster page the API returned
   // (rosterCounts) or from flags the backend already sets on each row
   // (offlinePending / hasConflict / pendingDelete / pendingMutations).
@@ -1147,6 +1166,40 @@ export default function UsersPage() {
 
   const canMutate = (m: MemberRosterRow) => !m.offlinePending && Number(m.activeMembershipId) > 0;
 
+  // One line of the card fed by GET /members/{id}/card: loading, honest error, or the value.
+  // An offline-created member has no server id yet, so nothing is read for it.
+  const cardDetailLine = (
+    Icon: LucideIcon,
+    label: string,
+    m: MemberRosterRow,
+    show: (d: MemberCardResponse) => { v: string; muted?: boolean; tone?: Tone; title?: string },
+  ) => {
+    let v: string;
+    let cls = "text-muted-foreground";
+    let title: string | undefined;
+    if (m.offlinePending || !(Number(m.activeMembershipId) > 0)) {
+      v = "après synchronisation";
+    } else if (card.error) {
+      v = "indisponible";
+      cls = INK.error;
+      title = card.error;
+    } else if (!card.data) {
+      v = "chargement…";
+    } else {
+      const r = show(card.data);
+      v = r.v;
+      cls = r.tone ? INK[r.tone] : r.muted ? "text-muted-foreground" : "text-foreground";
+      title = r.title;
+    }
+    return (
+      <div className="mt-[9px] flex items-center gap-2.5 text-[13.5px]">
+        <Icon className="h-[17px] w-[17px] shrink-0 text-muted-foreground" />
+        <span className="flex-1">{label}</span>
+        <span className={cn("text-right text-[12.5px]", cls)} title={title}>{v}</span>
+      </div>
+    );
+  };
+
   // ── Fiche membre (right rail) ─────────────────────────────────────────
   const renderFiche = (m: MemberRosterRow) => {
     const st = statusOf(m.status);
@@ -1209,6 +1262,11 @@ export default function UsersPage() {
               <span className={cn("font-mono text-[12.5px]", c.v ? "text-foreground" : "text-muted-foreground")}>{c.v || "—"}</span>
             </div>
           ))}
+          {cardDetailLine(Fingerprint, "Empreintes", m, (d) => {
+            if (d.fingerprintCount === 0) return { v: "aucune", muted: true };
+            const ids = d.fingerprints.map((f) => (f.fingerId != null ? `#${f.fingerId}${f.enabled ? "" : " (désactivée)"}` : "?"));
+            return { v: `${d.fingerprintCount} · ${ids.join(", ")}`, title: "Copie locale du serveur" };
+          })}
         </div>
         <div className="flex flex-wrap gap-2 px-[18px] pb-4 pt-3">
           {canMutate(m) ? (
