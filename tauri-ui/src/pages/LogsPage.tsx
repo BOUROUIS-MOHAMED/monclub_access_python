@@ -13,7 +13,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { LogLine } from "@/api/types";
-import { get, openSSE } from "@/api/client";
+import { get, openSSE, post } from "@/api/client";
 import { usePageChrome } from "@/context/PageChromeContext";
 import { ActionButton } from "@/components/ui/action-button";
 import { Segmented } from "@/components/ui/segmented";
@@ -21,7 +21,7 @@ import { ListRow, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
 import { cn } from "@/lib/utils";
 import { formatLogClock, normalizeLogLine, upsertLogLine } from "@/lib/logs";
 import {
-  Search, Download, Trash2, FolderOpen, CircleX, FileText, Pause, Play, CircleCheck, Tag,
+  Search, Download, Trash2, FolderOpen, CircleX, FileText, Pause, Play, CircleCheck, Tag, Send, X,
 } from "lucide-react";
 
 const RECENT_LIMIT = 500;
@@ -54,6 +54,11 @@ export default function LogsPage() {
   const [category, setCategory] = useState<string>("ALL");
   const [live, setLive] = useState(false);
   const [follow, setFollow] = useState(true);
+  // « Envoyer à MonClub » — POST /logs/flush (the same call as the web dashboard's
+  // « Sync logs now »): closes the current log file and queues it for upload. The
+  // answer says what was queued, not that the upload finished, and the text says so.
+  const [uploading, setUploading] = useState(false);
+  const [uploadNote, setUploadNote] = useState<{ tone: "info" | "error"; text: string } | null>(null);
   const logsRef = useRef<LogLine[]>([]);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -140,7 +145,26 @@ export default function LogsPage() {
 
   const handleClear = useCallback(() => { logsRef.current = []; setLogs([]); }, []);
   const handleOpenFolder = useCallback(() => {
-    void get<{ ok: boolean; path: string }>("/logs/open-dir").catch(() => {});
+    // The route is POST-only (access/local_api_routes.py); a GET never opened the folder.
+    void post<{ ok: boolean; path: string }>("/logs/open-dir").catch(() => {});
+  }, []);
+  const handleUpload = useCallback(async () => {
+    setUploading(true);
+    setUploadNote(null);
+    try {
+      const res = await post<{ ok?: boolean; pendingNow?: string[] }>("/logs/flush");
+      const n = Array.isArray(res?.pendingNow) ? res.pendingNow.length : 0;
+      setUploadNote({
+        tone: "info",
+        text: n > 0
+          ? `Journal mis en file d'envoi vers MonClub : ${n} fichier${n > 1 ? "s" : ""} en attente. L'envoi se fait en arrière-plan dès que le serveur répond.`
+          : "Journal mis en file d'envoi vers MonClub. L'envoi se fait en arrière-plan dès que le serveur répond.",
+      });
+    } catch (e) {
+      setUploadNote({ tone: "error", text: `Envoi impossible : ${e instanceof Error ? e.message : String(e)}` });
+    } finally {
+      setUploading(false);
+    }
   }, []);
 
   usePageChrome(() => ({
@@ -151,9 +175,12 @@ export default function LogsPage() {
         <ActionButton kind="outline" icon={FolderOpen} onClick={handleOpenFolder}>Dossier</ActionButton>
         <ActionButton kind="outline" icon={Download} onClick={handleExport}>Exporter</ActionButton>
         <ActionButton kind="outline" icon={Trash2} onClick={handleClear}>Vider</ActionButton>
+        <ActionButton kind="outline" icon={Send} spin={uploading} disabled={uploading} onClick={() => { void handleUpload(); }}>
+          Envoyer à MonClub
+        </ActionButton>
       </>
     ),
-  }), [logs.length, follow, handleExport, handleClear, handleOpenFolder]);
+  }), [logs.length, follow, uploading, handleExport, handleClear, handleOpenFolder, handleUpload]);
 
   return (
     <div className="grid h-full min-h-0 grid-cols-12 gap-[18px]">
@@ -231,6 +258,23 @@ export default function LogsPage() {
 
       {/* ── Le rail ─────────────────────────────────────────────────────── */}
       <div className="col-span-4 flex min-h-0 flex-col gap-[18px] overflow-y-auto">
+        {uploadNote && (
+          <div
+            role="status"
+            className={cn(
+              "flex flex-none items-start gap-2.5 rounded-2xl px-4 py-3 text-[13px] leading-normal",
+              uploadNote.tone === "error" ? "bg-error/16 text-error-ink" : "bg-info/16 text-info-ink",
+            )}
+          >
+            {uploadNote.tone === "error"
+              ? <CircleX className="mt-px h-[17px] w-[17px] shrink-0" />
+              : <Send className="mt-px h-[17px] w-[17px] shrink-0" />}
+            <span className="min-w-0 flex-1">{uploadNote.text}</span>
+            <button type="button" aria-label="Fermer" onClick={() => setUploadNote(null)} className="shrink-0 cursor-pointer opacity-70 hover:opacity-100">
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        )}
         <Panel className="flex-none">
           <PanelHeader
             title="À traiter"
