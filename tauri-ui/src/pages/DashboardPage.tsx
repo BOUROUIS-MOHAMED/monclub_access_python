@@ -12,8 +12,8 @@
 //     "Carte ####" / "PIN #### — membre inconnu" by design);
 //   · sync / agent / reader / session / update → the existing /status poll;
 //   · entry screen → usePopupStream, unchanged.
-// Refusal texts use the entry screen's French copy (lib/denyCopy.ts); an ULTRA
-// device refusal (`DEVICE_DENIED`, no "why") reads "Accès refusé".
+// Refusal texts use the entry screen's French copy (A_DENY in PopupWindow.tsx);
+// an ULTRA device refusal (`DEVICE_DENIED`, no "why") reads "Accès refusé".
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
@@ -29,7 +29,7 @@ import { FlexCell, FlexRow, FlexTable, IconCell, PersonCell } from "@/components
 import { ListRow, Note, PageGrid, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
 import { INK, initialsOf, type Tone } from "@/components/ui/tone";
 import { hasAgentDevices } from "@/lib/agentMode";
-import { denyShort } from "@/lib/denyCopy";
+import { aDenyCopy } from "@/pages/PopupWindow";
 import { cn } from "@/lib/utils";
 import type { DashboardFeedItem, DashboardOverview, DashboardToday } from "@/api/types";
 import {
@@ -121,7 +121,7 @@ function rowDetail(it: DashboardFeedItem): string {
 
 /** Refused row — the short French reason first ("Carte non reconnue · carte · Tourniquet principal"). */
 function refusedDetail(it: DashboardFeedItem): string {
-  const bits: string[] = [denyShort(it.reason), credentialBit(it)];
+  const bits: string[] = [aDenyCopy(it.reason).short, credentialBit(it)];
   if (it.deviceName) bits.push(it.deviceName);
   return bits.join(" · ");
 }
