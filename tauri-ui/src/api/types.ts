@@ -659,6 +659,8 @@ export interface SyncRunHistoryResponse {
 export interface PushBatchHistoryRow {
   id: number;
   sync_run_id?: number | null;
+  /** Every sync run this batch answers: the DEVICE-mode column and the ULTRA link rows. */
+  sync_run_ids?: number[];
   device_id: number;
   device_name: string;
   policy: string;
@@ -669,6 +671,13 @@ export interface PushBatchHistoryRow {
   duration_ms: number;
   error_message?: string | null;
   created_at: string;
+}
+
+/** GET /sync-history/{id}: the run and the push batches recorded as answering it. */
+export interface SyncRunDetailResponse {
+  ok: boolean;
+  item: SyncRunHistoryRow;
+  pushBatches?: PushBatchHistoryRow[];
 }
 
 export interface PushBatchHistoryResponse {

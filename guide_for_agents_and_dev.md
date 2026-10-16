@@ -65,6 +65,7 @@ This file is only useful while it is true. If you change any of the following, y
 | What a turnstile's heartbeat line reports as waiting (`device_sync.py::count_waiting_pins`, `ultra_engine.py::_count_waiting_pins` and the snapshot's `failed_pins`, `_sync_one_device`'s `_last_waiting_pins`, `realtime_agent.py::get_status_snapshot`'s `failedPins`, `pc_identity.py::build_heartbeat_payload`, `::_report_held_turnstiles` and its `held` key, `erase_wizard.py::held_waiting_count`, the wizard's `_set_waiting`) | §3.10 |
 | Who writes to `access.db` — the DbWriter, `_run_db_write_sync` (its lanes, `priority=`, the inline nested call, the 60 s wait), a write outside it, the tripwire's allowlist (`tests/test_db_single_writer.py::ALLOWED_DIRECT`), which writes are in the door lane (`db.py::insert_access_history`, `::save_agent_rtlog_state`), the AGENT history claim (`realtime_agent.py::DecisionService.run`'s `F-013` block) | §3.11 |
 | The member fee lines of the entry screen -- what is stored, how it reaches the popup, how the screen judges and draws it (`db.py::_member_fees_json`, `::_member_fees_list`, `::_ensure_column_forcing_refresh`, `sync_users.fees_json` in `_SYNC_USER_COLUMNS` and the five member writers, `sync_access_software_settings.fee_due_soon_days`, `settings_reader.py::normalize_global_settings`'s `fee_due_soon_days`, `access_types.py::NotificationRequest.fees`, `ultra_engine.py::_enqueue_notification(user_fees=)`, `ultra_pc_entry.py::member_popup_fields`, `realtime_agent.py::_popup_payload_from_request`, `tauri-ui/src/lib/feeAlerts.ts`, `PopupWindow.tsx` `AFeeLine` / `AFeeMark`) | §3.12 |
+| Which sync run a push batch answers -- the `push_batch_sync_run` link and what carries its ids (`db.py::insert_push_batch(sync_run_ids=)`, `::list_push_batches_for_sync_run`; `app.py::_request_running_ultra_sync(sync_run_id=)` and its two calls in the sync tick; `ultra_engine.py::UltraEngine.request_sync_now(sync_run_ids=)`, `::_worker_full_sync_accepted_or_pending`, `UltraDeviceWorker.request_full_sync(sync_run_ids=)`, `::_drain_full_sync_commands`'s `run_kw`, `::_run_standalone_full_sync`, `::_maybe_mirror_reconcile`; `device_sync.py::run_one_device_on_connected_sdk` / `::_run_single_device_sync` / `::_sync_one_device`) -- or the history and Base locale figures (`db.py::push_batch_hourly`) | §3.13 |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -4807,6 +4808,36 @@ handler here carries a member or a pin (so none belongs in §3.2f).
   FAILED / IN_PROGRESS) and the sums of the stored `pins_*`; nothing is inferred. The device name is the
   latest stored for that device that day. On a day with a daylight-saving change the repeated hour is
   one cell (grouped by hour number). `[TEST: test_push_history_hourly.py]`
+- **A sync run's result per device -- a recorded link, never a time match** (Historique sync, run
+  detail « Résultat par appareil »; `GET /api/v2/sync-history/{id}` now also answers `pushBatches`,
+  from `db.py::list_push_batches_for_sync_run`). Two sources, both written when the batch row is opened:
+  - DEVICE mode, unchanged: `push_batch_history.sync_run_id`, from the actor dispatch context
+    `_sync_all_devices` sets (`device_sync.py::_DeviceSyncActorAdapter._build_session` reads it when the
+    actor builds its session).
+  - ULTRA: before this change every ULTRA batch had `sync_run_id=None`. Now the sync tick passes its
+    `sync_run_history` id to `app.py::_request_running_ultra_sync(sync_run_id=)` -- only the two calls
+    inside the tick (members-only delta, device refresh); the other callers pass none -- which sends
+    `sync_run_ids={id}` to `UltraEngine.request_sync_now`. It reaches the worker only on the live-worker
+    full-sync route (`_worker_full_sync_accepted_or_pending` → `UltraDeviceWorker.request_full_sync`). The
+    worker merges every request that arrives before its pass starts into one pending request, so the ids
+    are a **set, unioned on merge** (never "last wins"), kept under the `sync_run_ids` key only when
+    non-empty. `_drain_full_sync_commands` hands them to the pass (`_run_standalone_full_sync`, which also
+    hands them to the MIRROR batch, or `run_one_device_on_connected_sdk` → `_sync_one_device`), and its
+    two re-queues of the SAME request (link dead, no raw PullSDK handle) carry them. The worker's own
+    follow-ups (`push-capped`, `revoke-failed`, `intent-promoted`, removal and erase requests) never
+    claim a run. `insert_push_batch(sync_run_ids=)` writes one `push_batch_sync_run (batch_id,
+    sync_run_id)` row per run in the batch's own transaction, linking only run rows that exist; the
+    ULTRA batch's `sync_run_id` column stays NULL. Both FKs cascade (`PRAGMA foreign_keys = ON`), so the
+    30-day prunes of either table remove the link rows. The ids are metadata only: no revoke, exclusion,
+    lease or hash decision reads them. `[CODE]` `[TEST: test_sync_run_push_link.py,
+    test_standalone_incremental_sync.py::TestSyncRunLink]`
+  - **Not linked, on purpose** (the run detail then says « Pas de détail par appareil pour ce
+    passage »): runs before this change; a members-only delta on ULTRA (targeted member syncs write no
+    push batch at all); the scheduler fallback for a worker whose thread is dead
+    (`UltraSyncScheduler.request_sync_now` / `_sync_all` do not carry the ids); a request the worker
+    reports as already covered without queuing a pass; a pass skipped because the roster hash did not
+    change (scheduler path) -- and a pass that has not started yet when the detail is opened (its row
+    appears once it starts). `[CODE]`
 
 ---
 

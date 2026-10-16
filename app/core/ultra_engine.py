@@ -100,11 +100,14 @@ def _worker_full_sync_accepted_or_pending(
     revoked_ids: set[int] | None = None,
     require_full_refresh: bool = False,
     full_reconcile: bool = False,
+    sync_run_ids: set[int] | None = None,
 ) -> bool:
     request = getattr(worker, "request_full_sync", None)
     if not callable(request):
         return False
     kwargs: Dict[str, Any] = {"reason": reason}
+    if sync_run_ids:
+        kwargs["sync_run_ids"] = set(sync_run_ids)
     if fingerprint_hash is not None:
         kwargs["fingerprint_hash"] = fingerprint_hash
     if revoked_ids:
@@ -1621,9 +1624,15 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         revoked_ids: set[int] | None = None,
         require_full_refresh: bool = False,
         full_reconcile: bool = False,
+        sync_run_ids: set[int] | None = None,
     ) -> bool:
         normalized_reason = str(reason or "manual").strip() or "manual"
         normalized_full_reconcile = bool(full_reconcile)
+        # The sync runs (sync_run_history ids) whose request this is: metadata only, carried
+        # to the pass's push-batch row (guide §3.13). Union on merge -- never "last wins".
+        normalized_run_ids = {
+            int(run_id) for run_id in (sync_run_ids or set()) if run_id is not None
+        }
         normalized_revoked_ids = {
             int(member_id)
             for member_id in (revoked_ids or set())
@@ -1698,6 +1707,8 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                     # queued explicit reconcile must not downgrade it.
                     if normalized_full_reconcile:
                         pending["full_reconcile"] = True
+                    if normalized_run_ids:
+                        pending.setdefault("sync_run_ids", set()).update(normalized_run_ids)
                     for member_id in retry_revoked_ids:
                         phases.pop(member_id, None)
                     for member_id in retry_excluded_ids:
@@ -1742,6 +1753,8 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                     "require_full_refresh": bool(require_full_refresh),
                     "full_reconcile": normalized_full_reconcile,
                 }
+                if normalized_run_ids:
+                    self._pending_full_sync_request["sync_run_ids"] = set(normalized_run_ids)
                 if queued_targeted_revoked_ids:
                     self._pending_member_syncs = deque(
                         member_id
@@ -3530,6 +3543,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         fingerprint_hash: str | None,
         revoked_ids: set[int] | None = None,
         excluded_ids: set[int] | None = None,
+        sync_run_ids: set[int] | None = None,
     ) -> None:
         """Full roster push for a push driver, with FULL parity on the started/
         finished bookkeeping so scheduler skip-hashes and manual-sync pending
@@ -3952,6 +3966,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                     policy=str((self._device or {}).get("rosterPushingPolicy") or "PRESERVE").strip().upper(),
                     status="IN_PROGRESS",
                     created_at=started_iso,
+                    sync_run_ids=sync_run_ids,
                 )
             except Exception:
                 logger.debug("%s push-batch row not recorded", self._prefix, exc_info=True)
@@ -4104,7 +4119,9 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                     ]
                     try:
                         self._maybe_mirror_reconcile(full_reconcile=full_reconcile,
-                                                     roster_users=_mirror_roster)
+                                                     roster_users=_mirror_roster,
+                                                     **({"sync_run_ids": set(sync_run_ids)}
+                                                        if sync_run_ids else {}))
                     except Exception as exc:
                         logger.warning("%s MIRROR reconcile error (ignored): %s", self._prefix, exc)
                 if (unconfirmed_revoked_ids - set(skipped_revokes) - removed_revokes) \
@@ -5345,7 +5362,8 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         return out
 
     def _maybe_mirror_reconcile(self, *, full_reconcile: bool,
-                                roster_users: list[Dict[str, Any]]) -> None:
+                                roster_users: list[Dict[str, Any]],
+                                sync_run_ids: set[int] | None = None) -> None:
         """MIRROR pushing policy: delete device users NOT in the app roster.
 
         DESTRUCTIVE — removes users off a live turnstile. Every gate is an early
@@ -5457,6 +5475,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                 policy="MIRROR",
                 status="IN_PROGRESS",
                 created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                sync_run_ids=sync_run_ids,
             )
         except Exception:
             logger.debug("%s MIRROR batch row not recorded", self._prefix, exc_info=True)
@@ -5681,6 +5700,11 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             full_reconcile = bool(request.get("full_reconcile"))
             revoked_ids = request_revoked_ids
             excluded_ids = request_excluded_ids
+            # Only the two re-queues of THIS request below carry it on; the worker's own
+            # follow-ups (revoke-failed, push-capped, ...) never claim a run.
+            run_kw: Dict[str, Any] = {}
+            if request.get("sync_run_ids"):
+                run_kw["sync_run_ids"] = set(request["sync_run_ids"])
 
             self._removal_retry_reported = False
             try:
@@ -5700,6 +5724,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                         fingerprint_hash=fingerprint_hash,
                         revoked_ids=revoked_ids,
                         full_reconcile=full_reconcile,
+                        **run_kw,
                     )
                     break
                 # Push drivers (ZK_STANDALONE) have no raw PullSDK handle — the
@@ -5713,6 +5738,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                         fingerprint_hash=fingerprint_hash,
                         revoked_ids=revoked_ids,
                         excluded_ids=excluded_ids,
+                        **run_kw,
                     )
                     drained += 1
                     continue
@@ -5726,6 +5752,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                         fingerprint_hash=fingerprint_hash,
                         revoked_ids=revoked_ids,
                         full_reconcile=full_reconcile,
+                        **run_kw,
                     )
                     break
                 cache = load_sync_cache()
@@ -5844,6 +5871,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                     device=device_copy,
                     source=reason,
                     changed_ids=None,
+                    **run_kw,
                 ))
                 # "N waiting": the pass counted what its roster still waits for; a pass that
                 # stopped before hashing its roster counted nothing and the figure stays.
@@ -8657,10 +8685,17 @@ class UltraEngine:
         device_ids: set[int] | None = None,
         reason: str = "manual",
         full_reconcile: bool = False,
+        sync_run_ids: set[int] | None = None,
     ) -> bool:
         if not self._running or not self._sync_scheduler:
             return False
         normalized_full_reconcile = bool(full_reconcile)
+        # The sync run(s) asking (guide §3.13): carried only on the live-worker full-sync
+        # route below. Targeted member syncs write no push batch, and the scheduler
+        # fallback (a dead worker thread) does not carry it -- its batch stays unlinked.
+        normalized_run_ids = {
+            int(run_id) for run_id in (sync_run_ids or set()) if run_id is not None
+        }
         normalized_changed_ids = (
             None
             if changed_ids is None
@@ -8727,6 +8762,7 @@ class UltraEngine:
                             revoked_ids=normalized_revoked_ids,
                             require_full_refresh=True,
                             full_reconcile=normalized_full_reconcile,
+                            sync_run_ids=normalized_run_ids,
                         )
                         and commands_handled
                     )

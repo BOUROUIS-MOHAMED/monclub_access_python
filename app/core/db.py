@@ -3669,6 +3669,27 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_push_batch_history_device_id "
             "ON push_batch_history(device_id);"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_push_batch_history_sync_run_id "
+            "ON push_batch_history(sync_run_id);"
+        )
+        # Which sync runs asked for an ULTRA pass (guide §3.13). A worker coalesces the
+        # requests that arrive before its pass starts, so one pass (one batch row) can
+        # answer several runs: one row per (batch, run). DEVICE mode keeps using the
+        # single push_batch_history.sync_run_id column, as before.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS push_batch_sync_run (
+                batch_id    INTEGER NOT NULL REFERENCES push_batch_history(id) ON DELETE CASCADE,
+                sync_run_id INTEGER NOT NULL REFERENCES sync_run_history(id) ON DELETE CASCADE,
+                PRIMARY KEY (batch_id, sync_run_id)
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_push_batch_sync_run_run "
+            "ON push_batch_sync_run(sync_run_id);"
+        )
 
         conn.execute(
             """
@@ -10104,7 +10125,13 @@ def insert_push_batch(
     policy: str,
     status: str = "IN_PROGRESS",
     created_at: str,
+    sync_run_ids: Iterable[int] | None = None,
 ) -> int:
+    """Open a push batch row. ``sync_run_ids``: the sync runs whose request this ULTRA pass
+    answers (push_batch_sync_run, same transaction); a run row that no longer exists is
+    not linked."""
+    link_ids = sorted({int(run_id) for run_id in (sync_run_ids or ()) if run_id is not None})
+
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
         cur = conn.execute(
             """
@@ -10126,9 +10153,50 @@ def insert_push_batch(
                 created_at,
             ),
         )
-        return int(cur.lastrowid)
+        batch_id = int(cur.lastrowid)
+        for run_id in link_ids:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO push_batch_sync_run (batch_id, sync_run_id)
+                SELECT ?, id FROM sync_run_history WHERE id = ?
+                """,
+                (batch_id, run_id),
+            )
+        return batch_id
 
     return int(_run_db_write_sync("insert_push_batch", _write))
+
+
+def list_push_batches_for_sync_run(sync_run_id: int) -> List[Dict[str, Any]]:
+    """Every push batch recorded as answering this sync run: the DEVICE-mode column or an
+    ULTRA link row (push_batch_sync_run). Nothing is matched by time."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT b.id, b.device_id, b.device_name, b.policy, b.pins_attempted,
+                   b.pins_success, b.pins_failed, b.status, b.duration_ms,
+                   b.error_message, b.created_at
+            FROM push_batch_history b
+            WHERE b.sync_run_id = ?
+               OR b.id IN (SELECT batch_id FROM push_batch_sync_run WHERE sync_run_id = ?)
+            ORDER BY b.device_name COLLATE NOCASE ASC, b.id ASC
+            """,
+            (int(sync_run_id), int(sync_run_id)),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _push_batch_run_ids(conn: sqlite3.Connection, batch_ids: List[int]) -> Dict[int, List[int]]:
+    if not batch_ids:
+        return {}
+    placeholders = ",".join("?" for _ in batch_ids)
+    out: Dict[int, set] = {}
+    for row in conn.execute(
+        f"SELECT batch_id, sync_run_id FROM push_batch_sync_run WHERE batch_id IN ({placeholders})",
+        list(batch_ids),
+    ).fetchall():
+        out.setdefault(int(row[0]), set()).add(int(row[1]))
+    return {bid: sorted(ids) for bid, ids in out.items()}
 
 
 def update_push_batch(
@@ -10254,7 +10322,19 @@ def get_push_batch(batch_id: int) -> Dict[str, Any] | None:
             "SELECT * FROM push_batch_history WHERE id = ?",
             (int(batch_id),),
         ).fetchone()
-    return dict(row) if row else None
+        links = _push_batch_run_ids(conn, [int(batch_id)]) if row else {}
+    if not row:
+        return None
+    item = dict(row)
+    item["sync_run_ids"] = _batch_run_ids(item, links)
+    return item
+
+
+def _batch_run_ids(item: Dict[str, Any], links: Dict[int, List[int]]) -> List[int]:
+    ids = set(links.get(int(item["id"]), []))
+    if item.get("sync_run_id") is not None:
+        ids.add(int(item["sync_run_id"]))
+    return sorted(ids)
 
 
 def get_push_batch_pins(batch_id: int) -> List[Dict[str, Any]]:
@@ -10317,8 +10397,12 @@ def list_push_batches(
             """,
             [*params, page_size, page_num * page_size],
         ).fetchall()
+        items = [dict(row) for row in rows]
+        links = _push_batch_run_ids(conn, [int(item["id"]) for item in items])
+    for item in items:
+        item["sync_run_ids"] = _batch_run_ids(item, links)
     return {
-        "items": [dict(row) for row in rows],
+        "items": items,
         "total": total,
         "page": page_num,
         "size": page_size,

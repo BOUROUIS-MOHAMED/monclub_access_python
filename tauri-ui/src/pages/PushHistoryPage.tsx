@@ -196,7 +196,9 @@ export default function PushHistoryPage() {
                   formatDate(sel.created_at),
                   formatDuration(sel.duration_ms),
                   policyLabel(sel.policy),
-                  sel.sync_run_id != null ? `run #${sel.sync_run_id}` : "",
+                  (sel.sync_run_ids?.length
+                    ? `run${sel.sync_run_ids.length > 1 ? "s" : ""} #${sel.sync_run_ids.join(", #")}`
+                    : sel.sync_run_id != null ? `run #${sel.sync_run_id}` : ""),
                 ].filter(Boolean).join(" · ")}
               >
                 {detailLoading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}

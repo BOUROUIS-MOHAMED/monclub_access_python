@@ -1888,7 +1888,7 @@ def _handle_sync_history_list(ctx: _Ctx) -> None:
 
 
 def _handle_sync_history_detail(ctx: _Ctx) -> None:
-    from app.core.db import get_sync_run
+    from app.core.db import get_sync_run, list_push_batches_for_sync_run
 
     run_id = ctx.param_int("id")
     if run_id <= 0:
@@ -1898,7 +1898,10 @@ def _handle_sync_history_detail(ctx: _Ctx) -> None:
     if row is None:
         ctx.send_json(404, {"ok": False, "error": "Sync run not found"})
         return
-    ctx.send_json(200, {"ok": True, "item": row})
+    # The push batches recorded as answering this run (guide §3.13) -- empty for a run
+    # older than the link, a members-only delta (no batch is written) or a run that
+    # pushed nothing. Never matched by time.
+    ctx.send_json(200, {"ok": True, "item": row, "pushBatches": list_push_batches_for_sync_run(run_id)})
 
 
 def _handle_push_history_list(ctx: _Ctx) -> None:

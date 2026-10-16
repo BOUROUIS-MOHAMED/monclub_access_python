@@ -744,3 +744,23 @@ class TestDriverReportsFailedPins:
         assert res["ok"] is False
         assert set(res["failed_pins"]) == {str(i) for i in range(10, 20)}
         assert res["pushed"] == 15
+
+
+# --------------------------------------------------------------------------- #
+# Card H item 10: the pass's push batch names the sync runs whose request it answers
+# --------------------------------------------------------------------------- #
+
+class TestSyncRunLink:
+    def test_the_batch_row_carries_the_requesting_runs(self, monkeypatch, state):
+        w, _ = _worker(monkeypatch, users=[_user(117, "Bob", "1")])
+        w.request_full_sync(reason="timer", fingerprint_hash="h1", sync_run_ids={55})
+        w.request_full_sync(reason="timer", fingerprint_hash="h1", sync_run_ids={56})
+        assert w._drain_full_sync_commands(limit=1) == 1
+
+        assert ue.insert_push_batch.call_args.kwargs["sync_run_ids"] == {55, 56}
+
+    def test_a_pass_no_run_asked_for_links_nothing(self, monkeypatch, state):
+        w, _ = _worker(monkeypatch, users=[_user(117, "Bob", "1")])
+        _full_sync(w)
+
+        assert ue.insert_push_batch.call_args.kwargs["sync_run_ids"] is None

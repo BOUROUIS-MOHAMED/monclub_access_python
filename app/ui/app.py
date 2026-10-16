@@ -1129,8 +1129,13 @@ class MainApp:
         device_ids: set[int] | None = None,
         reason: str,
         full_reconcile: bool = False,
+        sync_run_id: int | None = None,
     ) -> bool:
         """Ask the running ULTRA engine to push.
+
+        `sync_run_id`: the sync_run_history row of the sync tick asking, carried to the
+        pass's push-batch row so the run's detail lists each device's result (guide §3.13).
+        Only the two calls inside the sync tick pass it.
 
         `full_reconcile` says a PERSON (or the nightly job) asked for a complete
         reconcile of the device, as opposed to an automatic tick. Derive it from
@@ -1175,6 +1180,8 @@ class MainApp:
                 "reason": normalized_reason,
                 "full_reconcile": bool(full_reconcile),
             }
+            if sync_run_id is not None:
+                sync_kwargs["sync_run_ids"] = {int(sync_run_id)}
             started = bool(
                 self._ultra_engine.request_sync_now(**sync_kwargs)
             )
@@ -3587,6 +3594,7 @@ class MainApp:
                         revoked_ids=_delta_revoked_ids,
                         reason=trigger_context.trigger_source,
                         full_reconcile=_is_user_initiated_sync,
+                        sync_run_id=sync_run_id,
                     )
                     ultra_push_requested = True
                 sync_online = True
@@ -3847,6 +3855,7 @@ class MainApp:
                     revoked_ids=_delta_revoked_ids,
                     reason=trigger_context.trigger_source,
                     full_reconcile=_is_user_initiated_sync,
+                    sync_run_id=sync_run_id,
                 )
                 # Record the ULTRA dispatch so the sync-run row stops reporting
                 # "Appareils 0" on a gym whose roster genuinely was pushed.
