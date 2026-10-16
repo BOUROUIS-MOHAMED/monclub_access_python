@@ -8262,6 +8262,57 @@ def get_member_card_details(active_membership_id: int) -> Dict[str, Any] | None:
     }
 
 
+MEMBER_HISTORY_LIMIT_MAX = 200
+
+
+def list_member_access_history(active_membership_id: int, *, limit: int = 20) -> Dict[str, Any] | None:
+    """The latest door events stored on THIS PC for the person behind one membership
+    (Utilisateurs member card, Card M 7c). None when this PC holds no row for the membership.
+
+    By person: access_history.user_id is resolved at insert time by the AGENT and ULTRA
+    writers, and the person's other memberships are the same visitor -- each row carries its
+    own active_membership_id so the UI can tell them apart. The query is the
+    ix_access_history_user_door_day prefix (user_id). Rows with no user_id (DEVICE-mode
+    attendance, an event no member was resolved for) cannot be attributed and are not listed.
+    A member row with no user_id falls back to ``active_membership_id = ?`` (no index, rare).
+    """
+    try:
+        amid = int(active_membership_id)
+    except (TypeError, ValueError):
+        return None
+    if amid <= 0:
+        return None
+    lim = max(1, min(int(limit or 20), MEMBER_HISTORY_LIMIT_MAX))
+    cols = (
+        "id, created_at, event_time, device_id, door_id, allowed, reason, event_type, "
+        "history_source, raw_json, active_membership_id"
+    )
+    with get_conn() as conn:
+        found = None
+        for table in ("sync_users", "sync_users_held"):
+            found = conn.execute(
+                f"SELECT user_id FROM {table} WHERE active_membership_id = ? LIMIT 1", (amid,),
+            ).fetchone()
+            if found is not None:
+                break
+        if found is None:
+            return None
+        uid = _to_int_or_none(found[0])
+        if uid is not None:
+            rows = conn.execute(
+                f"SELECT {cols} FROM access_history WHERE user_id = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (uid, lim),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT {cols} FROM access_history WHERE active_membership_id = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (amid, lim),
+            ).fetchall()
+    return {"userId": uid, "limit": lim, "rows": [dict(r) for r in rows]}
+
+
 @_tel.timed("DB_READ_list_sync_users_by_active_membership_ids", slow_ms=50, warn_ms=1000)
 def list_sync_users_by_active_membership_ids(
     active_membership_ids: List[int] | set[int] | tuple[int, ...],

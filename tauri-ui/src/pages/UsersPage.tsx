@@ -1,9 +1,10 @@
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode } from "react";
 import { useUsers } from "@/api/hooks";
 import { get, openSSE, patch, post } from "@/api/client";
 import type {
   MemberCardResponse,
+  MemberHistoryResponse,
   OfflineAttemptResponse,
   OfflineCreationKind,
   OfflineCreationRow,
@@ -58,6 +59,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { usePageChrome } from "@/context/PageChromeContext";
+import { aDenyCopy } from "@/pages/PopupWindow";
 import { cn } from "@/lib/utils";
 
 type MembershipChoice = { id: number | string; title?: string };
@@ -144,6 +146,21 @@ const CITIES: { v: string; l: string }[] = [
 
 const NONE = "__none__";
 const ROSTER_SIZE = 25;
+/** Passages listed on the member card (the endpoint caps at 200). */
+const VISITS_SHOWN = 10;
+
+/** Same words as the dashboard feed (DashboardPage methodLabel). */
+function visitMethod(method: string): string {
+  const m = (method || "").toUpperCase();
+  if (m.includes("QR") || m.includes("TOTP")) return "QR Code";
+  if (m.includes("FINGER") || m.includes("FP") || m.includes("BIO")) return "empreinte";
+  return "carte";
+}
+/** "2026-10-16T14:32:05" (local wall clock) → "16/10/2026 14:32". */
+function visitTime(at: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/.exec(n(at));
+  return m ? `${m[3]}/${m[2]}/${m[1]} ${m[4]}:${m[5]}` : (n(at) || "—");
+}
 
 const MEMBERSHIP_FORM_INIT = {
   accountUsernameId: "",
@@ -1081,6 +1098,19 @@ export default function UsersPage() {
   }, [selectedAmid, roster]);
   const card = cardInfo.amid === selectedAmid ? cardInfo : { amid: selectedAmid, data: null, error: null };
 
+  // « Derniers passages »: same rule — read when the card opens, keyed by membership id.
+  const [visitInfo, setVisitInfo] = useState<{ amid: number; data: MemberHistoryResponse | null; error: string | null }>({ amid: 0, data: null, error: null });
+  useEffect(() => {
+    if (!selectedAmid) return;
+    let alive = true;
+    setVisitInfo((c) => (c.amid === selectedAmid ? c : { amid: selectedAmid, data: null, error: null }));
+    get<MemberHistoryResponse>(`/members/${selectedAmid}/history`, { limit: String(VISITS_SHOWN) })
+      .then((d) => { if (alive) setVisitInfo({ amid: selectedAmid, data: d, error: null }); })
+      .catch((e) => { if (alive) setVisitInfo({ amid: selectedAmid, data: null, error: e?.message || String(e) }); });
+    return () => { alive = false; };
+  }, [selectedAmid, roster]);
+  const visits = visitInfo.amid === selectedAmid ? visitInfo : { amid: selectedAmid, data: null, error: null };
+
   // Rail figures. Every one is derived from the roster page the API returned
   // (rosterCounts) or from flags the backend already sets on each row
   // (offlinePending / hasConflict / pendingDelete / pendingMutations).
@@ -1201,6 +1231,56 @@ export default function UsersPage() {
     );
   };
 
+  // « Derniers passages »: door events stored on THIS PC for the member (GET /members/{id}/history).
+  const renderVisits = (m: MemberRosterRow) => {
+    const amid = Number(m.activeMembershipId);
+    const d = visits.data;
+    const retention = d?.retentionDays ?? null;
+    const footnote = [
+      `Passages vus par ce PC${d ? ` (les ${d.limit} derniers au plus)` : ""}.`,
+      retention ? `Ceux de plus de ${retention} jours peuvent avoir été effacés.` : "",
+      "Un passage non rattaché à un membre n'apparaît pas.",
+    ].filter(Boolean).join(" ");
+    let body: ReactNode;
+    if (m.offlinePending || !(amid > 0)) {
+      body = <div className="mt-2 text-[12.5px] text-muted-foreground">Disponible après synchronisation.</div>;
+    } else if (visits.error) {
+      body = <div className={cn("mt-2 text-[12.5px]", INK.error)} title={visits.error}>Historique indisponible.</div>;
+    } else if (!d) {
+      body = <div className="mt-2 text-[12.5px] text-muted-foreground">Chargement…</div>;
+    } else if (d.rows.length === 0) {
+      body = <div className="mt-2 text-[12.5px] text-muted-foreground">Aucun passage enregistré sur ce PC.</div>;
+    } else {
+      body = (
+        <div className="mt-1">
+          {d.rows.map((r) => {
+            const other = r.activeMembershipId != null && Number(r.activeMembershipId) !== amid;
+            const where = [r.deviceName || (r.deviceId != null ? `Appareil #${r.deviceId}` : ""), r.doorId != null ? `porte ${r.doorId}` : ""].filter(Boolean).join(" · ");
+            const sub = [r.allowed ? visitMethod(r.method) : aDenyCopy(r.reason).short, where, other ? "autre abonnement" : ""].filter(Boolean).join(" · ");
+            return (
+              <div key={r.id} className="mt-[7px] flex items-start gap-2.5 text-[13px]" title={r.allowed ? undefined : r.reason || undefined}>
+                {r.allowed
+                  ? <CircleCheck className={cn("mt-[1px] h-4 w-4 shrink-0", INK.success)} />
+                  : <CircleX className={cn("mt-[1px] h-4 w-4 shrink-0", INK.error)} />}
+                <div className="min-w-0 flex-1">
+                  <div className="font-mono text-[12.5px]">{visitTime(r.at)}</div>
+                  <div className="truncate text-[12px] text-muted-foreground">{sub || "—"}</div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+    return (
+      <div className="border-b border-dashed border-grey/20 px-[18px] py-3">
+        <div className="text-[12px] font-bold uppercase tracking-[0.04em] text-muted-foreground">Derniers passages</div>
+        {body}
+        {amid > 0 && !m.offlinePending ? <div className="mt-2 text-[11.5px] text-muted-foreground">{footnote}</div> : null}
+      </div>
+    );
+  };
+
   // ── Fiche membre (right rail) ─────────────────────────────────────────
   const renderFiche = (m: MemberRosterRow) => {
     const st = statusOf(m.status);
@@ -1276,6 +1356,7 @@ export default function UsersPage() {
             return { v: "aucun", muted: true };
           })}
         </div>
+        {renderVisits(m)}
         <div className="flex flex-wrap gap-2 px-[18px] pb-4 pt-3">
           {canMutate(m) ? (
             <>

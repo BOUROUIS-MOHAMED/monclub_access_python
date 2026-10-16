@@ -496,6 +496,35 @@ export interface MemberCardResponse {
   qrCredentials: { enabled: boolean; rotatedAt: string | null; updatedAt: string | null }[];
 }
 
+// GET /api/v2/members/{activeMembershipId}/history?limit= — door events THIS PC stored for the
+// person behind the membership (rows with no resolved member are not attributable).
+export interface MemberHistoryRow {
+  id: number;
+  /** Local wall clock "YYYY-MM-DDTHH:MM:SS" (event time, else the PC's receive time). */
+  at: string;
+  allowed: boolean;
+  /** Raw refusal code; word it with aDenyCopy(reason).short. */
+  reason: string;
+  deviceId: number | null;
+  deviceName: string;
+  doorId: number | null;
+  /** CARD | FINGER_PRINT | QR_CODE … (same source as the dashboard feed). */
+  method: string;
+  /** The membership the event was resolved to (may be another plan of the same person). */
+  activeMembershipId: number | null;
+  source: string;
+}
+
+export interface MemberHistoryResponse {
+  ok: boolean;
+  activeMembershipId: number;
+  userId: number | null;
+  limit: number;
+  /** Backend history_retention_days (what the local prune uses), null if unknown. */
+  retentionDays: number | null;
+  rows: MemberHistoryRow[];
+}
+
 // ─── E) Local fingerprints (GET /api/v2/fingerprints) ───
 export interface LocalFingerprintDto {
   id: number;

@@ -7,6 +7,8 @@ GET /api/v2/members/{activeMembershipId}/card reads ONE membership when the card
   template.
 * 7b -- the QR (TOTP) credentials whose granted ids contain the membership: state only, the
   secret never leaves the database.
+* 7c -- GET /api/v2/members/{activeMembershipId}/history: the latest door events this PC stored
+  for the person behind the membership, newest first, capped.
 
 Every test patches ``app.core.db._DB_PATH`` to a temp file.
 """
@@ -213,11 +215,99 @@ class TestQrCredential:
         assert _SECRET not in json.dumps(ctx.sent[1])
 
 
+# --------------------------------------------------------------------------- 7c
+
+def _event(db, eid, *, created, user_id, amid, allowed=1, reason="", device_id=3, door_id=1,
+           event_time=None, raw=None):
+    with db.get_conn() as conn:
+        conn.execute(
+            "INSERT INTO access_history (created_at, event_id, device_id, door_id, card_no, event_time, "
+            "event_type, allowed, reason, raw_json, history_source, user_id, active_membership_id) "
+            "VALUES (?, ?, ?, ?, '1001', ?, 'CARD', ?, ?, ?, 'ULTRA', ?, ?)",
+            (created, eid, device_id, door_id, event_time, allowed, reason,
+             json.dumps(raw) if raw is not None else None, user_id, amid),
+        )
+        conn.commit()
+
+
+class TestMemberHistory:
+    def test_lists_the_persons_events_newest_first_and_capped(self, db):
+        db.upsert_delta_users([_user(1, 100, card="1001"), _user(2, 200, card="1002")])
+        for i in range(5):
+            _event(db, f"e{i}", created=f"2026-10-1{i} 08:00:00", user_id=100, amid=1)
+        _event(db, "other-person", created="2026-10-15 09:00:00", user_id=200, amid=2)
+        _event(db, "unresolved", created="2026-10-15 10:00:00", user_id=None, amid=None)
+
+        res = db.list_member_access_history(1, limit=3)
+
+        assert res["userId"] == 100 and res["limit"] == 3
+        assert [r["created_at"] for r in res["rows"]] == [
+            "2026-10-14 08:00:00", "2026-10-13 08:00:00", "2026-10-12 08:00:00",
+        ]
+
+    def test_another_plan_of_the_same_person_is_listed_with_its_own_id(self, db):
+        db.upsert_delta_users([_user(1, 100, card="1001"), _user(9, 100, card="1009", membership_id=51)])
+        _event(db, "a", created="2026-10-10 08:00:00", user_id=100, amid=9)
+
+        rows = db.list_member_access_history(1)["rows"]
+        assert [r["active_membership_id"] for r in rows] == [9]
+
+    def test_the_limit_is_bounded_and_unknown_ids_give_none(self, db):
+        db.upsert_delta_users([_user(1, 100, card="1001")])
+        assert db.list_member_access_history(1, limit=10_000)["limit"] == db.MEMBER_HISTORY_LIMIT_MAX
+        assert db.list_member_access_history(1, limit=0)["limit"] == 20
+        assert db.list_member_access_history(404) is None
+        assert db.list_member_access_history(-1) is None
+
+    def test_a_held_member_is_reached(self, db):
+        db.upsert_delta_users([_user(7, 700, card="1007")])
+        _event(db, "h", created="2026-10-10 08:00:00", user_id=700, amid=7)
+        _hold(db, 7)
+
+        assert len(db.list_member_access_history(7)["rows"]) == 1
+
+    def test_the_query_uses_the_user_index(self, db):
+        with db.get_conn() as conn:
+            plan = " ".join(str(tuple(r)) for r in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT id FROM access_history WHERE user_id = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT 10", (1,),
+            ).fetchall())
+        assert "ix_access_history_user_door_day" in plan
+
+    def test_the_endpoint_shapes_rows_like_the_dashboard_feed(self, db, monkeypatch):
+        import app.core.settings_reader as sr
+        from app.api.local_access_api_v2 import _handle_member_history
+
+        db.upsert_delta_users([_user(1, 100, card="1001")])
+        _event(db, "ok", created="2026-10-10 08:00:05", event_time="2026-10-10 08:00:00",
+               user_id=100, amid=1, raw={"scanMode": "QR"})
+        _event(db, "no", created="2026-10-11 09:00:00", user_id=100, amid=1, allowed=0,
+               reason="DENY_EXPIRED", door_id=2)
+        monkeypatch.setattr(sr, "get_backend_global_settings", lambda: {"history_retention_days": 45})
+
+        ctx = _Ctx(params={"activeMembershipId": "1"}, query={"limit": "5"})
+        _handle_member_history(ctx)
+        status, body = ctx.sent
+
+        assert status == 200 and body["retentionDays"] == 45 and body["limit"] == 5
+        refused, granted = body["rows"]
+        assert refused["allowed"] is False and refused["reason"] == "DENY_EXPIRED" and refused["doorId"] == 2
+        assert refused["at"] == "2026-10-11T09:00:00"          # no event time: the receive time
+        assert granted["allowed"] is True and granted["method"] == "QR_CODE"
+        assert granted["at"] == "2026-10-10T08:00:00"          # the event time first
+        assert granted["activeMembershipId"] == 1
+
+        ctx = _Ctx(params={"activeMembershipId": "77"})
+        _handle_member_history(ctx)
+        assert ctx.sent[0] == 404
+
+
 class TestCardEndpoint:
     def test_route_is_registered(self):
         from access.local_api_routes import ACCESS_LOCAL_ROUTE_SPECS
 
         assert ("GET", "/api/v2/members/{activeMembershipId}/card", "_handle_member_card") in ACCESS_LOCAL_ROUTE_SPECS
+        assert ("GET", "/api/v2/members/{activeMembershipId}/history", "_handle_member_history") in ACCESS_LOCAL_ROUTE_SPECS
 
     def test_router_matches_the_card_path_and_not_the_post_routes(self):
         from app.api.local_access_api_v2 import _Router

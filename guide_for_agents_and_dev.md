@@ -65,7 +65,7 @@ This file is only useful while it is true. If you change any of the following, y
 | What a turnstile's heartbeat line reports as waiting (`device_sync.py::count_waiting_pins`, `ultra_engine.py::_count_waiting_pins` and the snapshot's `failed_pins`, `_sync_one_device`'s `_last_waiting_pins`, `realtime_agent.py::get_status_snapshot`'s `failedPins`, `pc_identity.py::build_heartbeat_payload`, `::_report_held_turnstiles` and its `held` key, `erase_wizard.py::held_waiting_count`, the wizard's `_set_waiting`) | §3.10 |
 | Who writes to `access.db` — the DbWriter, `_run_db_write_sync` (its lanes, `priority=`, the inline nested call, the 60 s wait), a write outside it, the tripwire's allowlist (`tests/test_db_single_writer.py::ALLOWED_DIRECT`), which writes are in the door lane (`db.py::insert_access_history`, `::save_agent_rtlog_state`), the AGENT history claim (`realtime_agent.py::DecisionService.run`'s `F-013` block) | §3.11 |
 | The member fee lines of the entry screen -- what is stored, how it reaches the popup, how the screen judges and draws it (`db.py::_member_fees_json`, `::_member_fees_list`, `::_ensure_column_forcing_refresh`, `sync_users.fees_json` in `_SYNC_USER_COLUMNS` and the five member writers, `sync_access_software_settings.fee_due_soon_days`, `settings_reader.py::normalize_global_settings`'s `fee_due_soon_days`, `access_types.py::NotificationRequest.fees`, `ultra_engine.py::_enqueue_notification(user_fees=)`, `ultra_pc_entry.py::member_popup_fields`, `realtime_agent.py::_popup_payload_from_request`, `tauri-ui/src/lib/feeAlerts.ts`, `PopupWindow.tsx` `AFeeLine` / `AFeeMark`) | §3.12 |
-| The Utilisateurs member card data and the mutation-queue names (`db.py::get_member_card_details`, `::_member_row_for_card`, `local_access_api_v2.py::_handle_member_card`, `tauri-ui/src/pages/UsersPage.tsx` `cardDetailLine`) | §3.14 |
+| The Utilisateurs member card data and the mutation-queue names (`db.py::get_member_card_details`, `::_member_row_for_card`, `::list_member_access_history`, `local_access_api_v2.py::_handle_member_card`, `::_handle_member_history`, `tauri-ui/src/pages/UsersPage.tsx` `cardDetailLine`) | §3.14 |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -1803,6 +1803,7 @@ Access desktop UI (`tauri-ui/src`) was grepped in this repo. `[CODE]`
 | `POST /api/v2/members/photo`, `POST /api/v2/members/mutation`, `POST /api/v2/enroll/retry-push` | `activeMembershipId` / `targetId` | Backend-side membership ids; no device pin | n/a |
 | `GET /api/v2/sync/cache/users`, `GET /api/v2/members` (`_handle_members_roster`) | paging/filter | Cached rows; they now also carry `mainAccountId` | n/a |
 | `GET /api/v2/members/{activeMembershipId}/card` (`_handle_member_card`, tauri-ui UsersPage member card) | path id | One membership's extra card lines from the local copy (§3.14); no device pin | n/a |
+| `GET /api/v2/members/{activeMembershipId}/history` (`_handle_member_history`, tauri-ui UsersPage member card) | path id, `limit` | `access_history` rows by the membership's `user_id` (stored at insert); no pin → member mapping in the handler (§3.14) | Display only |
 | `POST /api/v2/devices/{deviceId}/force-resync` | — | `clear_device_sync_hashes` (UPDATE) + scheduler `force_resync` | n/a |
 
 `[UNVERIFIED]` Whether any dashboard or UI screen calls `users/push` or `users/delete` with a pin: the
@@ -4817,6 +4818,21 @@ the membership in `sync_users` nor `sync_users_held`. `[CODE]`
   not "valid": the QR check (§3.1b roster check, allowed days) can still refuse a scan, and the
   upcoming credentials of §3.8 (a renewal starting today) are not read here. `[TEST:
   tests/test_member_card_details.py::TestQrCredential]`
+- **Visits (« Derniers passages »).** `GET /api/v2/members/{activeMembershipId}/history?limit=`
+  (`_handle_member_history` → `db.py::list_member_access_history`, default 20, capped at
+  `MEMBER_HISTORY_LIMIT_MAX` = 200; the card asks 10). It lists `access_history` rows of the PERSON:
+  the membership's `sync_users`/`sync_users_held` `user_id`, then `WHERE user_id = ?` newest first —
+  the `ix_access_history_user_door_day` prefix, no new index. A row resolved to another plan of the
+  same person carries its own `activeMembershipId` and the card marks it « autre abonnement ». Rows
+  are shaped like the dashboard feed (`_handle_dashboard_overview`): time = `event_time`, else
+  `created_at`; device name from the synced devices; door number; `method` from
+  `_credential_type_from_raw`; the raw refusal code, worded in the UI by `aDenyCopy(reason).short`.
+  Limits, said in the card's footnote: only events THIS PC stored (a READER PC under driver leases,
+  or a gym whose turnstiles another PC drives, may have few or none); `user_id` is filled at insert
+  by the AGENT and ULTRA writers only, so DEVICE-mode attendance and unresolved events are not
+  listed; rows are pruned after the backend `history_retention_days` (`retentionDays` in the
+  answer, from `settings_reader.get_backend_global_settings`) once uploaded (§3.5). `[TEST:
+  tests/test_member_card_details.py::TestMemberHistory]`
 
 ---
 
