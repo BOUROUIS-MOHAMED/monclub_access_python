@@ -5726,8 +5726,8 @@ installer through the wrapper below; `updater_exe_name`, `_launch_installer_exe`
 records `attempt {version, from, at, mode}` in `update_state.json`, then starts a hidden
 `powershell.exe` (full `System32` path, `-NoProfile -ExecutionPolicy Bypass`, cwd
 `{app}\state`) and checks it is still alive after 0.5 s. Only then does the caller quit;
-any failure raises `InstallRefused` and the app keeps running — the "Restart to update"
-handler answers 500 with the reason (`local_access_api_v2.py::_handle_component_update_install`). `[CODE; TEST: test_updater_v2_app_wiring.py::test_install_answers_an_error_and_never_quits_when_the_wrapper_fails]`
+any failure raises `InstallRefused` and the app keeps running — the install button's
+handler (« Redémarrer et installer » on Access, "Restart to update" on TV) answers 500 with the reason (`local_access_api_v2.py::_handle_component_update_install`). `[CODE; TEST: test_updater_v2_app_wiring.py::test_install_answers_an_error_and_never_quits_when_the_wrapper_fails]`
 
 The wrapper (`shared/update_wrapper.py::build_install_script`): wait up to 90 s for the app
 pid, then stop that pid only (Setup's `taskkill /T` on a live app would kill the wrapper's whole
@@ -5822,8 +5822,8 @@ the watchdog-started 1.5.0 launched the wrapper and quit; the wrapper ran Setup 
   shutdown) or a PC with Fast Startup off retries at the next start. Journal staleness does
   not depend on the boot rule alone (10 min / dead `setupPid` also make it stale), and claim
   liveness uses the restorer's start time (§11.4).
-  `same_version` is no strike. "Restart to update" still works on a banned version; the
-  page warns.
+  `same_version` is no strike. The install button (« Redémarrer et installer » on Access,
+  "Restart to update" on TV) still works on a banned version; the page warns.
 - **Direction of `last_update.json`** (L2's `UpdWriteLastUpdate`, the restore helper, the
   wrapper): `ROLLED_BACK` from = the version that failed, to = the one restored;
   `INSTALLED` / `ABORTED` from = before, to = tried. The engine strikes the TRIED version
@@ -5852,7 +5852,9 @@ reported (it made the dashboard count a healthy PC as failed, L4 E2E (g)); `::te
 notes through `src/lib/releaseNotes.ts` (allowlist p/br/ul/ol/li/strong/b/em/i/h1-h4/code,
 no attributes, links as text, script/style/iframe dropped) — never `dangerouslySetInnerHTML`
 (D33) — and show the last result, a refused offer, the loop-guard warning and an install
-error (`src/components/update/UpdateNotices.tsx`). `[TEST: tauri-ui src/lib/releaseNotes.test.ts; tests/test_updater_v2_app_wiring.py::test_release_notes_are_never_injected_as_raw_html]`
+error: `src/components/update/UpdateNotices.tsx` (English) on TV, its French twin
+`src/components/update/UpdateNoticesFr.tsx` on Access since the v5 redesign — same conditions,
+keep the two in step. `[TEST: tauri-ui src/lib/releaseNotes.test.ts; tests/test_updater_v2_app_wiring.py::test_release_notes_are_never_injected_as_raw_html]`
 
 ### 11.8 The installer — safe swap, health wait, results (D21-D24)
 
@@ -6006,7 +6008,7 @@ decided. D39 ("unticked by default on existing installs") is superseded.
   count holds, so it adds nothing (review #1). The log stamps follow the PC's calendar (`Get-Date
   -Format`); an unparseable stamp is kept as `rawAt`. `[CODE; TEST; real read-only PowerShell tests]`
 - **Settings card** (`tauri-ui/src/components/WatchdogCard.tsx`, logic and FR/EN texts in
-  `src/lib/watchdogStatus.ts`; on the Access ConfigPage after "Démarrage Windows"): chip On / Off /
+  `src/lib/watchdogStatus.ts`; on the Access ConfigPage, « Démarrage Windows » tab, under the startup switch): chip On / Off /
   Not installed / Error / Stood down after repeated crashes, last check + result, the switch (locked
   outside an installed build or while saving), a confirm before turning off ("Access will not restart
   by itself after a crash or an interrupted update"), FR by default with its own FR/EN toggle. It

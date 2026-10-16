@@ -7,49 +7,52 @@ import type {
   OfflineCreationKind,
   OfflineCreationRow,
   OfflineCreationState,
+  OfflineFailureType,
   OfflineQueueListResponse,
   UserDto,
 } from "@/api/types";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Select, SelectContent, SelectItem, SelectValue } from "@/components/ui/select";
+import { ActionButton } from "@/components/ui/action-button";
+import { Avatar, Chip } from "@/components/ui/chip";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { DialogFrame } from "@/components/ui/dialog-frame";
+import { FieldGrid, FieldInput, FieldSection, FieldSelectTrigger, FormField } from "@/components/ui/form-field";
+import { CellText, FlexCell, FlexRow, FlexTable } from "@/components/ui/flex-table";
+import { LineTabs } from "@/components/ui/line-tabs";
+import { Segmented } from "@/components/ui/segmented";
+import { ListRow, Note, PageGrid, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
+import { INK, initialsOf, type Tone } from "@/components/ui/tone";
 import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
-import {
+  Archive,
+  ArrowRightLeft,
   ChevronLeft,
   ChevronRight,
+  CircleCheck,
+  CirclePause,
+  CirclePlay,
+  CircleX,
   Clock3,
-  Edit3,
+  CloudUpload,
+  Copy,
+  CreditCard,
+  Eye,
   Fingerprint,
+  History,
+  IdCard,
   ImagePlus,
+  Loader2,
   Pencil,
   RefreshCw,
   Repeat,
-  Save,
   ScanLine,
   Search,
+  Send,
   Snowflake,
   Trash2,
-  Users as UsersIcon,
-  XCircle,
+  TriangleAlert,
   UserPlus,
-  CloudUpload,
-  GitMerge,
-  AlertCircle,
-  CheckCircle2,
+  Users as UsersIcon,
+  X,
 } from "lucide-react";
 import { usePageChrome } from "@/context/PageChromeContext";
 import { cn } from "@/lib/utils";
@@ -105,7 +108,7 @@ const MUTATION_ACTIVE_STATES = ["pending", "processing", "failed_retryable", "bl
 const HISTORY_STATES: OfflineCreationState[] = ["succeeded", "reconciled", "cancelled", "failed_terminal", "archived"];
 
 // Mirrors the backend enums so the UI only ever sends values the API can deserialize.
-const GENDERS = [{ v: "MALE", l: "Male" }, { v: "FEMALE", l: "Female" }];
+const GENDERS = [{ v: "MALE", l: "Homme" }, { v: "FEMALE", l: "Femme" }];
 const BLOOD_TYPES = ["A_PLUS", "B_PLUS", "AB_PLUS", "O_PLUS", "A_MINUS", "B_MINUS", "AB_MINUS", "O_MINUS", "UNDEFINED"];
 const PAYMENT_METHODS = ["CASH", "TPE", "BANK_TRANSFER", "CHEQUE", "BALANCE"];
 const PAYMENT_STATUSES = ["PENDING", "COMPLETED"];
@@ -197,72 +200,138 @@ function stripLeadingZeros(card: string): string {
   const stripped = s.replace(/^0+/, "");
   return stripped || s;
 }
-function badgeForState(state: OfflineCreationState): "default" | "secondary" | "destructive" | "outline" | "success" | "warning" {
-  if (state === "succeeded") return "success";
-  if (state === "reconciled") return "secondary";
-  if (state === "cancelled") return "warning";
-  if (state === "failed_terminal") return "destructive";
-  if (state === "blocked_auth") return "warning";
-  if (state === "processing") return "secondary";
-  return "outline";
+
+// ── French copy for the raw backend values (display only; the values sent stay raw) ──
+const PAYMENT_METHOD_FR: Record<string, string> = {
+  CASH: "Espèces", TPE: "TPE (carte)", BANK_TRANSFER: "Virement", CHEQUE: "Chèque", BALANCE: "Solde",
+};
+const PAYMENT_STATUS_FR: Record<string, string> = { PENDING: "En attente", COMPLETED: "Réglé" };
+
+const KIND_FR: Record<OfflineCreationKind, string> = {
+  account_plus_membership: "Membre + abonnement",
+  membership_only: "Abonnement seul",
+};
+
+// Offline-creation states (active queue + processed history).
+const CREATION_STATE: Record<OfflineCreationState, { l: string; tone: Tone }> = {
+  pending: { l: "En attente", tone: "warning" },
+  processing: { l: "Envoi…", tone: "info" },
+  failed_retryable: { l: "Échec — nouvel essai", tone: "error" },
+  blocked_auth: { l: "Bloqué (authentification)", tone: "warning" },
+  succeeded: { l: "Créé", tone: "success" },
+  reconciled: { l: "Rapproché", tone: "info" },
+  cancelled: { l: "Annulé", tone: "grey" },
+  failed_terminal: { l: "Échec définitif", tone: "error" },
+  archived: { l: "Archivé", tone: "grey" },
+};
+const creationState = (s: string) => CREATION_STATE[s as OfflineCreationState] ?? { l: s || "—", tone: "grey" as Tone };
+
+const FAILURE_TYPE_FR: Record<OfflineFailureType, string> = {
+  network: "réseau", server: "serveur", auth: "authentification",
+  validation: "validation", conflict: "conflit", unknown: "inconnu",
+};
+
+// Lifecycle-change states (/mutations).
+const MUTATION_STATE: Record<string, { l: string; tone: Tone }> = {
+  pending: { l: "En attente", tone: "warning" },
+  processing: { l: "Envoi…", tone: "info" },
+  failed_retryable: { l: "Échec — nouvel essai", tone: "error" },
+  blocked_auth: { l: "Bloqué (authentification)", tone: "warning" },
+  conflict: { l: "Conflit", tone: "error" },
+  succeeded: { l: "Appliqué", tone: "success" },
+  reconciled: { l: "Rapproché", tone: "success" },
+  failed_terminal: { l: "Échec définitif", tone: "error" },
+  cancelled: { l: "Annulé", tone: "grey" },
+};
+const mutationState = (s: string) => MUTATION_STATE[s] ?? { l: s || "—", tone: "grey" as Tone };
+
+const OP_FR: Record<string, string> = {
+  edit: "Modification",
+  freeze_create: "Gel",
+  delete: "Suppression",
+  renew: "Renouvellement",
+  freeze_cancel: "Fin du gel",
+  balance_adjust: "Ajustement du solde",
+  pay_rest: "Paiement du reste",
+  pay_tolerance: "Paiement (tolérance)",
+};
+function opLabel(op: string): string {
+  return OP_FR[op] ?? op;
 }
-function statusBadge(status?: string): "success" | "destructive" | "warning" | "outline" {
-  if (status === "active") return "success";
-  if (status === "expired") return "destructive";
-  if (status === "pending") return "warning";
-  return "outline";
+
+// Roster status → French chip. The server decides the status; the UI only names it.
+const STATUS: Record<string, { l: string; tone: Tone }> = {
+  active: { l: "Actif", tone: "success" },
+  expired: { l: "Expiré", tone: "error" },
+  pending: { l: "En attente", tone: "info" },
+};
+const statusOf = (s?: string) => (s && STATUS[s]) || { l: s || "—", tone: "grey" as Tone };
+
+/** "2027-03-11…" → local midnight Date (never `new Date("YYYY-MM-DD")`, which is UTC). */
+function localDay(v?: string | null): Date | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(n(v));
+  if (!m) return null;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
 }
+function frDate(v?: string | null): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(n(v));
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : "—";
+}
+function todayLocal(): Date {
+  const t = new Date();
+  return new Date(t.getFullYear(), t.getMonth(), t.getDate());
+}
+/**
+ * « encore 12 jours » / « dernier jour » / « expiré depuis 3 jours », computed from validTo.
+ * Returns "" when the computed text would contradict the server's status.
+ */
+function daysLeftText(m: MemberRosterRow): string {
+  if (m.status === "pending") return "pas encore sur le serveur";
+  const end = localDay(m.validTo);
+  if (!end) return "";
+  const d = Math.round((end.getTime() - todayLocal().getTime()) / 86400000);
+  if (m.status === "active" && d >= 0) return d === 0 ? "dernier jour" : `encore ${d} jour${d > 1 ? "s" : ""}`;
+  if (m.status === "expired" && d < 0) return `expiré depuis ${-d} jour${-d > 1 ? "s" : ""}`;
+  return "";
+}
+/** Share of the validFrom → validTo period already used, 0–100, or null without both dates. */
+function periodUsedPct(m: MemberRosterRow): number | null {
+  const s = localDay(m.validFrom);
+  const e = localDay(m.validTo);
+  if (!s || !e || e.getTime() <= s.getTime()) return null;
+  const pct = ((todayLocal().getTime() - s.getTime()) / (e.getTime() - s.getTime())) * 100;
+  return Math.max(0, Math.min(100, Math.round(pct)));
+}
+
+/** The one flag shown next to a member's name (same priority as before). */
+function rowFlag(m: MemberRosterRow): { label: string; tone: Tone } | null {
+  if (m.hasConflict) return { label: "conflit", tone: "error" };
+  if (m.offlinePending) return { label: "créé hors ligne", tone: "info" };
+  if (m.pendingDelete) return { label: "suppression…", tone: "warning" };
+  if ((m.pendingMutations?.length ?? 0) > 0) return { label: "sync en attente", tone: "warning" };
+  return null;
+}
+
+/** Name of the member behind an offline creation, read from its payload. */
+function payloadName(p: Record<string, any> | undefined): string {
+  const q = p || {};
+  const full = [n(q.firstname || q.firstName || q.first_name), n(q.lastname || q.lastName || q.last_name)].filter(Boolean).join(" ");
+  return full || n(q.accountUsernameId || q.account_username_id) || "—";
+}
+
+const memberKey = (m: MemberRosterRow) => `${m.userId}-${m.activeMembershipId || "na"}`;
 
 // Turn a raw backend error into an operator-friendly hint for the decision dialog.
-// ── Access v3 roster primitives ────────────────────────────────────────────
-const ROSTER_GRID = "grid grid-cols-[2fr_1.1fr_1.15fr_0.8fr_0.75fr_1.25fr] gap-[13px] items-center";
-const LB = "text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground";
-
-function initialsOf(name: string | null | undefined): string {
-  const p = String(name || "").trim().split(/\s+/).filter(Boolean);
-  if (!p.length) return "—";
-  return ((p[0][0] || "") + (p.length > 1 ? p[p.length - 1][0] : "")).toUpperCase();
-}
-
-function RosterChip({ tone, children }: { tone: "ok" | "no" | "wn" | "flat"; children: React.ReactNode }) {
-  const tones = {
-    ok: "bg-emerald-500/[0.055] text-emerald-700 dark:text-emerald-400",
-    no: "bg-primary/[0.09] text-primary",
-    wn: "bg-amber-500/[0.14] text-amber-700 dark:text-amber-400",
-    flat: "bg-muted text-muted-foreground",
-  } as const;
-  return (
-    <span className={cn("inline-flex h-[18px] shrink-0 items-center whitespace-nowrap rounded-lg px-2 text-[10px] font-bold", tones[tone])}>
-      {children}
-    </span>
-  );
-}
-
-function IconAction({ title, disabled, onClick, children }: {
-  title: string; disabled?: boolean; onClick: () => void; children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      title={title}
-      disabled={disabled}
-      onClick={onClick}
-      className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-lg border border-border text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
-    >
-      {children}
-    </button>
-  );
-}
-
+// The match keys stay English: they read the server's own (English) message.
 function friendlyConflict(a: OfflineAttemptResponse | undefined): string | null {
   const msg = nl(a?.error);
   if (!msg) return null;
-  if (msg.includes("card") && (msg.includes("use") || msg.includes("already"))) return "This card is already assigned to another member in this gym. Use a different card.";
-  if (msg.includes("email") && msg.includes("exist")) return "An account with this email already exists.";
-  if (msg.includes("username") && msg.includes("exist")) return "This username is already taken.";
-  if (msg.includes("already has this membership")) return "This member already has this membership.";
-  if (msg.includes("maximum number of members")) return "You reached the maximum number of members allowed for this gym.";
-  if (msg.includes("password")) return "Password must be at least 8 characters.";
+  if (msg.includes("card") && (msg.includes("use") || msg.includes("already"))) return "Cette carte est déjà attribuée à un autre membre de cette salle. Utilisez une autre carte.";
+  if (msg.includes("email") && msg.includes("exist")) return "Un compte existe déjà avec cet e-mail.";
+  if (msg.includes("username") && msg.includes("exist")) return "Cet identifiant est déjà pris.";
+  if (msg.includes("already has this membership")) return "Ce membre a déjà cet abonnement.";
+  if (msg.includes("maximum number of members")) return "Vous avez atteint le nombre maximal de membres autorisé pour cette salle.";
+  if (msg.includes("password")) return "Le mot de passe doit contenir au moins 8 caractères.";
   return null;
 }
 
@@ -293,29 +362,71 @@ function profilePayload(form: any): Record<string, any> {
 
 function PaymentFields({ form, set }: { form: any; set: (patch: any) => void }) {
   return (
-    <div className="space-y-2 rounded-md border border-dashed p-2">
-      <div className="text-xs font-medium text-muted-foreground">Payment</div>
-      <div className="grid grid-cols-2 gap-2">
-        <div className="space-y-1"><Label>price</Label><Input type="number" inputMode="decimal" value={form.price} onChange={(e) => set({ price: e.target.value })} /></div>
-        <div className="space-y-1"><Label>payedPrice</Label><Input type="number" inputMode="decimal" value={form.payedPrice} onChange={(e) => set({ payedPrice: e.target.value })} /></div>
-      </div>
-      <div className="grid grid-cols-2 gap-2">
-        <div className="space-y-1">
-          <Label>paymentMethod</Label>
-          <Select value={form.paymentMethod || "CASH"} onValueChange={(v) => set({ paymentMethod: v })}>
-            <SelectTrigger><SelectValue /></SelectTrigger>
-            <SelectContent>{PAYMENT_METHODS.map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
-          </Select>
-        </div>
-        <div className="space-y-1">
-          <Label>paymentStatus</Label>
-          <Select value={form.paymentStatus || "PENDING"} onValueChange={(v) => set({ paymentStatus: v })}>
-            <SelectTrigger><SelectValue /></SelectTrigger>
-            <SelectContent>{PAYMENT_STATUSES.map((s) => <SelectItem key={s} value={s}>{s}</SelectItem>)}</SelectContent>
-          </Select>
-        </div>
-      </div>
-      <div className="space-y-1"><Label>remaining payment due date (optional)</Label><Input type="date" value={form.remainingPaymentDueDate} onChange={(e) => set({ remainingPaymentDueDate: e.target.value })} /></div>
+    <>
+      <FieldSection>Paiement</FieldSection>
+      <FormField label="Prix"><FieldInput type="number" inputMode="decimal" value={form.price} onChange={(e) => set({ price: e.target.value })} /></FormField>
+      <FormField label="Payé"><FieldInput type="number" inputMode="decimal" value={form.payedPrice} onChange={(e) => set({ payedPrice: e.target.value })} /></FormField>
+      <FormField label="Moyen de paiement">
+        <Select value={form.paymentMethod || "CASH"} onValueChange={(v) => set({ paymentMethod: v })}>
+          <FieldSelectTrigger><SelectValue /></FieldSelectTrigger>
+          <SelectContent>{PAYMENT_METHODS.map((m) => <SelectItem key={m} value={m}>{PAYMENT_METHOD_FR[m] ?? m}</SelectItem>)}</SelectContent>
+        </Select>
+      </FormField>
+      <FormField label="Statut du paiement">
+        <Select value={form.paymentStatus || "PENDING"} onValueChange={(v) => set({ paymentStatus: v })}>
+          <FieldSelectTrigger><SelectValue /></FieldSelectTrigger>
+          <SelectContent>{PAYMENT_STATUSES.map((s) => <SelectItem key={s} value={s}>{PAYMENT_STATUS_FR[s] ?? s}</SelectItem>)}</SelectContent>
+        </Select>
+      </FormField>
+      <FormField label="Échéance du reste (facultatif)" full>
+        <FieldInput type="date" value={form.remainingPaymentDueDate} onChange={(e) => set({ remainingPaymentDueDate: e.target.value })} />
+      </FormField>
+    </>
+  );
+}
+
+/** Card-number field with the « Scanner » button (POST /scan/quick through `onScan`). */
+function CardField({ label, value, onChange, scanKey, scanning, onScan }: {
+  label: string; value: string; onChange: (v: string) => void;
+  scanKey: string; scanning: string | null; onScan: () => void;
+}) {
+  return (
+    <FormField
+      label={label}
+      addon={(
+        <ActionButton kind="outline" size="xs" icon={scanning === scanKey ? Clock3 : ScanLine} disabled={!!scanning} onClick={onScan} title="Scanner une carte RFID">
+          {scanning === scanKey ? "Lecture…" : "Scanner"}
+        </ActionButton>
+      )}
+    >
+      <FieldInput className="font-mono" value={value} onChange={(e) => onChange(e.target.value)} />
+    </FormField>
+  );
+}
+
+function MembershipSelect({ value, memberships, onChange }: {
+  value: string; memberships: MembershipChoice[]; onChange: (v: string) => void;
+}) {
+  return (
+    <FormField label="Abonnement" full>
+      <Select value={value || NONE} onValueChange={(v) => onChange(v === NONE ? "" : v)}>
+        <FieldSelectTrigger><SelectValue placeholder="Choisir un abonnement" /></FieldSelectTrigger>
+        <SelectContent>
+          <SelectItem value={NONE}>Choisir un abonnement</SelectItem>
+          {memberships.map((m) => <SelectItem key={String(m.id)} value={String(m.id)}>{m.title || `Abonnement ${m.id}`}</SelectItem>)}
+        </SelectContent>
+      </Select>
+    </FormField>
+  );
+}
+
+/** Error / success line shown inside an open dialog (the page alerts sit behind the overlay). */
+function DialogMessages({ error, message }: { error: string | null; message?: string }) {
+  if (!error && !message) return null;
+  return (
+    <div className="mt-3 space-y-2">
+      {error ? <Note tone="error">{error}</Note> : null}
+      {message ? <Note tone="success">{message}</Note> : null}
     </div>
   );
 }
@@ -366,7 +477,7 @@ function EnrollDialog({ member, onClose }: { member: MemberRosterRow | null; onC
         fullName: member.fullName || "",
       }, 20000);
     } catch (e: any) {
-      setLogs((l) => [...l, "ERROR: " + (e?.message || String(e))]);
+      setLogs((l) => [...l, "ERREUR : " + (e?.message || String(e))]);
       setResult("failed");
       setRunning(false);
       closeStream();
@@ -377,49 +488,44 @@ function EnrollDialog({ member, onClose }: { member: MemberRosterRow | null; onC
     try { await post("/enroll/cancel", {}); } catch { /* noop */ }
   };
 
+  const resultTone: Tone = result === "success" ? "success" : result === "cancelled" ? "warning" : "error";
+
   return (
-    <AlertDialog open={!!member} onOpenChange={(o) => { if (!o) { closeStream(); onClose(); } }}>
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>Enroll fingerprint — {member?.fullName || ""}</AlertDialogTitle>
-          <AlertDialogDescription asChild>
-            <div className="space-y-2">
-              {member?.offlinePending ? (
-                <p className="text-xs">This member was created offline — the fingerprint is captured now and pushed automatically once they sync to the server.</p>
-              ) : (
-                <p className="text-xs">Place the finger on the scanner after pressing Start (3 captures).</p>
-              )}
-              <div className="flex items-center gap-2">
-                <Label>Finger</Label>
-                <Select value={fingerId} onValueChange={setFingerId} disabled={running}>
-                  <SelectTrigger className="w-[90px]"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    {Array.from({ length: 10 }, (_, i) => String(i)).map((f) => <SelectItem key={f} value={f}>#{f}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-                <Button size="sm" onClick={start} disabled={running}>
-                  <Fingerprint className="h-3.5 w-3.5" /> {running ? "Scanning…" : "Start"}
-                </Button>
-                {running ? <Button size="sm" variant="outline" onClick={cancelScan}>Cancel scan</Button> : null}
-              </div>
-              <div className="max-h-40 overflow-auto rounded bg-muted p-2 text-xs font-mono">
-                {logs.length === 0 ? <span className="text-muted-foreground">Idle.</span> : logs.map((l, i) => <div key={i}>{l}</div>)}
-              </div>
-              {result ? (
-                <p className={result === "success" ? "text-emerald-600" : result === "cancelled" ? "text-amber-600" : "text-red-600"}>
-                  {result === "success"
-                    ? (member?.offlinePending ? "Fingerprint captured — will sync with the member." : "Fingerprint saved to the member.")
-                    : result === "cancelled" ? "Cancelled." : "Enrollment failed."}
-                </p>
-              ) : null}
-            </div>
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel asChild><Button variant="outline">Close</Button></AlertDialogCancel>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
+    <DialogFrame
+      open={!!member}
+      onOpenChange={(o) => { if (!o) { closeStream(); onClose(); } }}
+      lockOutside
+      width={520}
+      title={`Enrôler une empreinte — ${member?.fullName || ""}`}
+      sub={member?.offlinePending
+        ? "Membre créé hors ligne : l'empreinte est capturée maintenant et envoyée automatiquement quand il sera synchronisé avec le serveur."
+        : "Posez le doigt sur le lecteur après « Démarrer » (3 captures)."}
+      footer={<ActionButton kind="dark" className="px-4" onClick={() => { closeStream(); onClose(); }}>Fermer</ActionButton>}
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-[13.5px] font-semibold">Doigt</span>
+        <Select value={fingerId} onValueChange={setFingerId} disabled={running}>
+          <FieldSelectTrigger className="h-9 w-[90px] rounded-lg border border-grey/32 px-3"><SelectValue /></FieldSelectTrigger>
+          <SelectContent>
+            {Array.from({ length: 10 }, (_, i) => String(i)).map((f) => <SelectItem key={f} value={f}>#{f}</SelectItem>)}
+          </SelectContent>
+        </Select>
+        <ActionButton kind="primary" icon={Fingerprint} onClick={start} disabled={running}>
+          {running ? "Capture…" : "Démarrer"}
+        </ActionButton>
+        {running ? <ActionButton kind="outline" onClick={cancelScan}>Annuler la capture</ActionButton> : null}
+      </div>
+      <div className="mt-3 max-h-40 overflow-auto rounded-lg bg-muted p-2.5 font-mono text-[12px]">
+        {logs.length === 0 ? <span className="text-muted-foreground">En attente.</span> : logs.map((l, i) => <div key={i}>{l}</div>)}
+      </div>
+      {result ? (
+        <p className={cn("mt-3 text-[13.5px] font-semibold", INK[resultTone])}>
+          {result === "success"
+            ? (member?.offlinePending ? "Empreinte capturée : elle sera synchronisée avec le membre." : "Empreinte enregistrée pour le membre.")
+            : result === "cancelled" ? "Annulé." : "Échec de l'enrôlement."}
+        </p>
+      ) : null}
+    </DialogFrame>
   );
 }
 
@@ -446,6 +552,10 @@ export default function UsersPage() {
 
   const [decision, setDecision] = useState<QueueDecision | null>(null);
   const [decisionOpen, setDecisionOpen] = useState(false);
+
+  // v5: the creation forms live in one dialog (two tabs) instead of an in-page panel.
+  const [memberOpen, setMemberOpen] = useState(false);
+  const [memberTab, setMemberTab] = useState<OfflineCreationKind>("account_plus_membership");
 
   // -------- roster (local-first searchable directory) --------
   const [roster, setRoster] = useState<MemberRosterRow[]>([]);
@@ -538,11 +648,11 @@ export default function UsersPage() {
         money: opts?.money,
         expectedVersion: m.version ?? undefined,
       }, 30000);
-      if (res.ok) setMessage(`${opKind} applied.`);
-      else if (res.conflict) setQueueError("This member changed on the server. Open the queue below to re-base or abort the change.");
-      else if (res.queued) setMessage(res.gated ? `${opKind} queued — it will apply once server money support is enabled.` : `${opKind} queued (offline) — it will sync automatically.`);
-      else if (res.needsFix) setQueueError(res.error || `${opKind} was rejected — fix the values and retry.`);
-      else setQueueError(res.error || `${opKind} failed.`);
+      if (res.ok) setMessage(`Changement appliqué en ligne : ${opLabel(opKind)}.`);
+      else if (res.conflict) setQueueError("Cet abonnement a changé sur le serveur entre-temps : rien n'a été envoyé. Rechargez puis recommencez la modification.");
+      else if (res.queued) setMessage(res.gated ? `Changement mis en file : ${opLabel(opKind)}. Il s'appliquera quand le serveur acceptera les opérations d'argent.` : `Changement mis en file (hors ligne) : ${opLabel(opKind)}. Il sera synchronisé automatiquement.`);
+      else if (res.needsFix) setQueueError(res.error || `Changement refusé : ${opLabel(opKind)}. Corrigez les valeurs et réessayez.`);
+      else setQueueError(res.error || `Échec du changement : ${opLabel(opKind)}.`);
       await Promise.all([loadRoster(), loadMutations()]);
       return res;
     } catch (e: any) {
@@ -593,7 +703,7 @@ export default function UsersPage() {
     if (!m) return;
     const dur = parseInt(freezeForm.durationInDays, 10);
     if (!n(freezeForm.startFreezeDate) || !Number.isFinite(dur) || dur <= 0) {
-      setQueueError("Freeze needs a start date and a positive duration.");
+      setQueueError("Le gel demande une date de début et une durée positive.");
       return;
     }
     const payload: Record<string, any> = {
@@ -674,9 +784,9 @@ export default function UsersPage() {
       const r = await post<{ ok: boolean; card?: string; error?: string }>("/scan/quick", { timeout_ms: 15000 }, 20000);
       if (r.ok && n(r.card)) {
         apply(stripLeadingZeros(String(r.card)));
-        setMessage("Card scanned.");
+        setMessage("Carte scannée.");
       } else {
-        setQueueError(r.error || "No card detected. Try again.");
+        setQueueError(r.error || "Aucune carte détectée. Réessayez.");
       }
     } catch (e: any) {
       setQueueError(e?.message || String(e));
@@ -704,7 +814,7 @@ export default function UsersPage() {
       const dataUrl: string = await new Promise((resolve, reject) => {
         const r = new FileReader();
         r.onload = () => resolve(String(r.result || ""));
-        r.onerror = () => reject(new Error("Could not read the image file."));
+        r.onerror = () => reject(new Error("Impossible de lire le fichier image."));
         r.readAsDataURL(file);
       });
       const base64 = dataUrl.includes(",") ? dataUrl.split(",")[1] : dataUrl;
@@ -716,8 +826,8 @@ export default function UsersPage() {
       if (m.offlinePending && m.offlinePendingLocalId) payload.offlinePendingLocalId = m.offlinePendingLocalId;
       else payload.activeMembershipId = m.activeMembershipId;
       const res = await post<{ ok: boolean; deferred?: boolean; error?: string }>("/members/photo", payload, 60000);
-      if (res.ok) setMessage(res.deferred ? "Photo saved — it will upload automatically when the member syncs." : "Photo uploaded.");
-      else setQueueError(res.error || "Photo upload failed.");
+      if (res.ok) setMessage(res.deferred ? "Photo enregistrée : elle sera envoyée automatiquement quand le membre sera synchronisé." : "Photo envoyée.");
+      else setQueueError(res.error || "Échec de l'envoi de la photo.");
       await loadRoster();
     } catch (err: any) {
       setQueueError(err?.message || String(err));
@@ -728,49 +838,49 @@ export default function UsersPage() {
   }, [photoTarget, loadRoster]);
 
   const checkDateRange = (startDate: string, endDate: string): string | null => {
-    if (!n(startDate) || !n(endDate)) return "startDate and endDate are required.";
+    if (!n(startDate) || !n(endDate)) return "Les dates de début et de fin sont obligatoires.";
     const s = new Date(startDate);
     const e = new Date(endDate);
-    if (Number.isNaN(s.getTime()) || Number.isNaN(e.getTime())) return "Invalid date format.";
-    if (e < s) return "endDate must be after startDate.";
+    if (Number.isNaN(s.getTime()) || Number.isNaN(e.getTime())) return "Format de date invalide.";
+    if (e < s) return "La date de fin doit être après la date de début.";
     return null;
   };
 
   const validateMembership = (): string | null => {
     const username = nl(membershipForm.accountUsernameId);
-    if (!username) return "accountUsernameId is required.";
-    if (!n(membershipForm.membershipId)) return "membershipId is required.";
+    if (!username) return "L'identifiant compte est obligatoire.";
+    if (!n(membershipForm.membershipId)) return "Choisissez un abonnement.";
 
     const d = checkDateRange(membershipForm.startDate, membershipForm.endDate);
     if (d) return d;
 
-    if (!byUsername.get(username)) return "Unknown accountUsernameId in local cache.";
+    if (!byUsername.get(username)) return "Identifiant compte inconnu dans la copie locale.";
 
     const duplicate = users.some((u) => nl((u as any).accountUsernameId) === username && n((u as any).membershipId) === n(membershipForm.membershipId));
-    if (duplicate) return "Membership already exists locally for this user.";
+    if (duplicate) return "Ce membre a déjà cet abonnement dans la copie locale.";
 
     const c1 = nl(membershipForm.cardId);
     const c2 = nl(membershipForm.secondCardId);
-    if (c1 && cards.has(c1)) return "cardId already exists locally.";
-    if (c2 && cards.has(c2)) return "secondCardId already exists locally.";
+    if (c1 && cards.has(c1)) return "Ce numéro de carte existe déjà dans la copie locale.";
+    if (c2 && cards.has(c2)) return "Ce deuxième numéro de carte existe déjà dans la copie locale.";
     return null;
   };
 
   const validateAccount = (): string | null => {
-    if (!n(accountForm.firstname)) return "firstname is required.";
-    if (!n(accountForm.lastname)) return "lastname is required.";
-    if (!n(accountForm.email)) return "email is required.";
-    if (!n(accountForm.phone)) return "phone is required.";
-    if (!n(accountForm.membershipId)) return "membershipId is required.";
-    if (n(accountForm.password).length < 8) return "password must be at least 8 chars.";
+    if (!n(accountForm.firstname)) return "Le prénom est obligatoire.";
+    if (!n(accountForm.lastname)) return "Le nom est obligatoire.";
+    if (!n(accountForm.email)) return "L'e-mail est obligatoire.";
+    if (!n(accountForm.phone)) return "Le téléphone est obligatoire.";
+    if (!n(accountForm.membershipId)) return "Choisissez un abonnement.";
+    if (n(accountForm.password).length < 8) return "Le mot de passe doit contenir au moins 8 caractères.";
 
     const email = nl(accountForm.email);
-    if (!email.includes("@") || !email.split("@")[1]?.includes(".")) return "Invalid email format.";
-    if (users.some((u) => nl(u.email) === email)) return "Email already exists locally.";
+    if (!email.includes("@") || !email.split("@")[1]?.includes(".")) return "Format d'e-mail invalide.";
+    if (users.some((u) => nl(u.email) === email)) return "Cet e-mail existe déjà dans la copie locale.";
 
     const username = nl(accountForm.accountUsernameId);
     if (username && users.some((u) => nl((u as any).accountUsernameId) === username)) {
-      return "accountUsernameId already exists locally.";
+      return "Cet identifiant compte existe déjà dans la copie locale.";
     }
 
     const d = checkDateRange(accountForm.startDate, accountForm.endDate);
@@ -778,8 +888,8 @@ export default function UsersPage() {
 
     const c1 = nl(accountForm.cardId);
     const c2 = nl(accountForm.secondCardId);
-    if (c1 && cards.has(c1)) return "cardId already exists locally.";
-    if (c2 && cards.has(c2)) return "secondCardId already exists locally.";
+    if (c1 && cards.has(c1)) return "Ce numéro de carte existe déjà dans la copie locale.";
+    if (c2 && cards.has(c2)) return "Ce deuxième numéro de carte existe déjà dans la copie locale.";
     return null;
   };
 
@@ -797,9 +907,9 @@ export default function UsersPage() {
   const handleAttempt = useCallback(async (creationKind: OfflineCreationKind, payload: Record<string, any>) => {
     const attempt = await post<OfflineAttemptResponse>("/offline-creations/attempt", { creationKind, payload });
     if (attempt.ok) {
-      const stateMsg = attempt.state === "reconciled" ? "reconciled" : "succeeded";
-      setMessage(`Backend creation ${stateMsg}.`);
+      setMessage(attempt.state === "reconciled" ? "Déjà présent sur le serveur : création rapprochée." : "Créé sur le serveur.");
       setEditing(null);
+      setMemberOpen(false);
       setDecision(null);
       setDecisionOpen(false);
       if (creationKind === "membership_only") setMembershipForm({ ...MEMBERSHIP_FORM_INIT });
@@ -833,7 +943,9 @@ export default function UsersPage() {
     if (editing && editing.creation_kind === "membership_only") {
       await patch(`/offline-creations/${editing.local_id}`, { payload, tryToCreate: true });
       setEditing(null);
-      setMessage(`Pending row ${editing.local_id} updated.`);
+      setMemberOpen(false);
+      setMembershipForm({ ...MEMBERSHIP_FORM_INIT });
+      setMessage("Création en attente mise à jour.");
       await Promise.all([refreshQueue(), loadRoster()]);
       return;
     }
@@ -868,7 +980,9 @@ export default function UsersPage() {
     if (editing && editing.creation_kind === "account_plus_membership") {
       await patch(`/offline-creations/${editing.local_id}`, { payload, tryToCreate: true });
       setEditing(null);
-      setMessage(`Pending row ${editing.local_id} updated.`);
+      setMemberOpen(false);
+      setAccountForm({ ...ACCOUNT_FORM_INIT });
+      setMessage("Création en attente mise à jour.");
       await Promise.all([refreshQueue(), loadRoster()]);
       return;
     }
@@ -926,18 +1040,26 @@ export default function UsersPage() {
         ...common,
       });
     }
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    setMessage("");
+    setMemberTab(row.creation_kind);
+    setMemberOpen(true);
   };
 
   const saveLaterRecommended = decision?.attempt?.recommendation === "save_later";
   const conflictHint = friendlyConflict(decision?.attempt);
 
-  // ── Access v3 layout ──────────────────────────────────────────────────
-  // The design makes the directory the subject at full height and moves
-  // creation/queue administration behind the header's "Nouveau membre" pill.
-  // The existing forms and queue panels below are NOT rewritten — they are
-  // toggled, so their wiring is untouched.
-  const [showForms, setShowForms] = useState(false);
+  // ── Access v5 layout ──────────────────────────────────────────────────
+  // Four tabs: the directory (with the member card in the right rail), the
+  // offline-creation queue, its processed history, and the lifecycle-change
+  // queue. The creation forms open in one dialog (« Nouveau membre »). The
+  // loaders and handlers above are the same ones as before; only where their
+  // results are shown changed.
+  type UsersTab = "roster" | "creations" | "history" | "mutations";
+  const [tab, setTab] = useState<UsersTab>("roster");
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  // Looked up in the current page so the card refreshes after a change and
+  // falls back to the default rail when the row leaves the page.
+  const selected = selectedKey ? roster.find((m) => memberKey(m) === selectedKey) ?? null : null;
 
   // Rail figures. Every one is derived from the roster page the API returned
   // (rosterCounts) or from flags the backend already sets on each row
@@ -950,36 +1072,63 @@ export default function UsersPage() {
     return { conflicts, offlineNew, deleting, syncing };
   }, [roster]);
 
-  const attentionCount =
-    railFacts.conflicts.length + railFacts.offlineNew.length + railFacts.deleting.length + railFacts.syncing.length;
+  const waitingCount = railFacts.offlineNew.length + railFacts.syncing.length + railFacts.deleting.length;
 
   const firstNames = (rows: MemberRosterRow[], max = 3) =>
     rows.slice(0, max).map((m) => (m.fullName || "—").split(/\s+/)[0]).join(", ") +
     (rows.length > max ? ` +${rows.length - max}` : "");
 
+  const openNewMember = () => {
+    setQueueError(null);
+    setMessage("");
+    setMemberTab("account_plus_membership");
+    setMemberOpen(true);
+  };
+  // Closing the form while a pending row is being modified abandons that
+  // modification (the old « Cancel edit »), so a later « Nouveau membre »
+  // can never PATCH the pending row by surprise.
+  const onMemberOpenChange = (o: boolean) => {
+    if (o) return;
+    if (editing) cancelEdit();
+    setMemberOpen(false);
+  };
+  const openDialogFor = (fn: () => void) => {
+    setQueueError(null);
+    setMessage("");
+    fn();
+  };
+
+  const activeMutations = mutations.filter((mu) => MUTATION_ACTIVE_STATES.includes(mu.state));
+  const hasMutationConflict = mutations.some((mu) => mu.state === "conflict");
+  const allCount = rosterCounts.all ?? 0;
+
   usePageChrome(() => ({
-    fill: true,
-    subtitle: `${rosterTotal} membre${rosterTotal > 1 ? "s" : ""}`,
+    subtitle: `${allCount} abonnement${allCount > 1 ? "s" : ""} sur ce poste · copie locale du serveur`,
     actions: (
       <>
-        <Button
-          variant="outline"
-          className="h-[30px] gap-1.5 rounded-[14px] px-[13px] text-[12px] font-semibold"
+        <ActionButton
+          kind="outline"
+          icon={RefreshCw}
+          spin={loading || queueLoading}
           disabled={loading || queueLoading}
           onClick={() => runAction(async () => {
             await Promise.all([reloadUsers(), loadMemberships(), refreshQueue(), loadRoster()]);
           })}
         >
-          <RefreshCw className={`h-[15px] w-[15px] ${loading || queueLoading ? "animate-spin" : ""}`} />
           Recharger
-        </Button>
-        <Button
-          className="h-[34px] gap-[7px] rounded-full px-[18px] text-[12.5px] font-bold shadow-[0_8px_20px_rgba(226,32,63,0.22)]"
-          onClick={() => setShowForms((v) => !v)}
-        >
-          {showForms ? <ChevronLeft className="h-4 w-4" /> : <UserPlus className="h-4 w-4" />}
-          {showForms ? "Retour au répertoire" : "Nouveau membre"}
-        </Button>
+        </ActionButton>
+        {tab === "creations" && (
+          <ActionButton kind="outline" icon={Repeat} onClick={() => runAction(() => post("/offline-creations/process-due", {}), "Nouvel essai lancé.")}>
+            Réessayer maintenant
+          </ActionButton>
+        )}
+        {tab === "mutations" ? (
+          <ActionButton kind="outline" icon={Send} onClick={() => runMutationAction(() => post("/mutations/process-due", {}), "Envoi lancé.")}>
+            Envoyer maintenant
+          </ActionButton>
+        ) : (
+          <ActionButton kind="primary" icon={UserPlus} onClick={openNewMember}>Nouveau membre</ActionButton>
+        )}
       </>
     ),
     // Deps are PRIMITIVES ONLY on purpose. `runAction` is a plain arrow
@@ -990,744 +1139,703 @@ export default function UsersPage() {
     // call (reloadUsers / loadMemberships / refreshQueue / loadRoster) are
     // stable useCallbacks, so capturing them from the last committed render is
     // correct.
-  }), [rosterTotal, loading, queueLoading, showForms]);
+    // rosterQ / rosterStatus / rosterPage: « Recharger » calls loadRoster,
+    // which is rebuilt when they change — re-publish so it never reloads a
+    // previous page, filter or search.
+  }), [allCount, loading, queueLoading, tab, rosterQ, rosterStatus, rosterPage]);
   const rosterTotalPages = Math.max(1, Math.ceil(rosterTotal / ROSTER_SIZE));
 
-  return (
-    <div className="flex h-full min-h-0 gap-4">
-      {/* ── Le sujet : le répertoire, pleine hauteur ────────────────────── */}
-      <div className={cn("flex min-w-0 flex-1 flex-col gap-[11px]", showForms && "overflow-y-auto pr-1")}>
+  const canMutate = (m: MemberRosterRow) => !m.offlinePending && Number(m.activeMembershipId) > 0;
 
-        {error ? <Alert variant="destructive"><AlertTitle>Users error</AlertTitle><AlertDescription>{error}</AlertDescription></Alert> : null}
-        {queueError ? <Alert variant="destructive"><AlertTitle>Queue error</AlertTitle><AlertDescription>{queueError}</AlertDescription></Alert> : null}
-        {message ? <Alert variant="success"><AlertTitle>Done</AlertTitle><AlertDescription>{message}</AlertDescription></Alert> : null}
-
-        {editing ? (
-          <Alert variant="info">
-            <AlertTitle>Editing pending row {editing.local_id}</AlertTitle>
-            <AlertDescription className="flex items-center justify-between gap-2">
-              <span>Update values and submit to keep this pending row valid.</span>
-              <Button size="sm" variant="outline" onClick={cancelEdit}>
-                <XCircle className="h-3.5 w-3.5" /> Cancel edit
-              </Button>
-            </AlertDescription>
-          </Alert>
-        ) : null}
-
-        {showForms ? (
-          <div className="flex flex-none items-center justify-between gap-3">
-            <div className="flex items-center gap-[9px]">
-              <UserPlus className="h-[17px] w-[17px] text-primary" />
-              <span className="font-display text-[13px] font-extrabold tracking-[-0.01em] text-foreground">Gestion</span>
-              <span className="ml-1 text-[12px] text-muted-foreground">création, file d'attente et historique</span>
+  // ── Fiche membre (right rail) ─────────────────────────────────────────
+  const renderFiche = (m: MemberRosterRow) => {
+    const st = statusOf(m.status);
+    const flag = rowFlag(m);
+    const left = daysLeftText(m);
+    const pct = periodUsedPct(m);
+    const headBg: Record<Tone, string> = {
+      primary: "bg-primary/6", success: "bg-success/6", warning: "bg-warning/6",
+      error: "bg-error/6", info: "bg-info/6", grey: "bg-grey/6",
+    };
+    const bar: Record<Tone, string> = {
+      primary: "bg-primary", success: "bg-success", warning: "bg-warning",
+      error: "bg-error", info: "bg-info", grey: "bg-grey",
+    };
+    const creds = [
+      { icon: IdCard, l: "Identifiant compte", v: n(m.accountUsernameId) },
+      { icon: CreditCard, l: "Carte", v: n(m.firstCardId) },
+      { icon: CreditCard, l: "Deuxième carte", v: n(m.secondCardId) },
+    ];
+    return (
+      <Panel className="col-span-4">
+        <div className={cn("relative flex items-center gap-3.5 p-[18px] pr-12", headBg[st.tone])}>
+          <Avatar initials={initialsOf(m.fullName || "")} tone={m.hasConflict ? "error" : st.tone} size={56} />
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-[17px] font-bold">{m.fullName || "—"}</div>
+            <div className="truncate text-[12.5px] text-muted-foreground">
+              {[n(m.phone), n(m.email)].filter(Boolean).join(" · ") || "—"}
             </div>
-            <Button size="sm" variant="outline" onClick={() => runAction(() => post("/offline-creations/process-due", {}), "Manual retry executed.")}>
-              <Repeat className="h-3.5 w-3.5" /> Retry due now
-            </Button>
-          </div>
-        ) : null}
-
-      <div className={cn("grid grid-cols-1 xl:grid-cols-2 gap-4", !showForms && "hidden")}>
-        {/* ----- existing-user subscription ----- */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm">New subscription for existing user</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-2">
-            <div className="grid grid-cols-2 gap-2">
-              <div className="space-y-1">
-                <Label>accountUsernameId</Label>
-                <Input value={membershipForm.accountUsernameId} onChange={(e) => setMembership({ accountUsernameId: e.target.value })} />
-              </div>
-              <div className="space-y-1">
-                <Label>membership</Label>
-                <Select value={membershipForm.membershipId || NONE} onValueChange={(v) => setMembership({ membershipId: v === NONE ? "" : v })}>
-                  <SelectTrigger><SelectValue placeholder="Select membership" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={NONE}>Select membership</SelectItem>
-                    {memberships.map((m) => <SelectItem key={String(m.id)} value={String(m.id)}>{m.title || `Membership ${m.id}`}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              <div className="space-y-1"><Label>startDate</Label><Input type="date" value={membershipForm.startDate} onChange={(e) => setMembership({ startDate: e.target.value })} /></div>
-              <div className="space-y-1"><Label>endDate</Label><Input type="date" value={membershipForm.endDate} onChange={(e) => setMembership({ endDate: e.target.value })} /></div>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              <div className="space-y-1">
-                <Label>cardId</Label>
-                <div className="flex gap-1">
-                  <Input value={membershipForm.cardId} onChange={(e) => setMembership({ cardId: e.target.value })} />
-                  <Button type="button" size="sm" variant="outline" disabled={!!scanning} onClick={() => scanCard("m.cardId", (c) => setMembership({ cardId: c }))} title="Scan RFID card">
-                    {scanning === "m.cardId" ? <Clock3 className="h-3.5 w-3.5 animate-pulse" /> : <ScanLine className="h-3.5 w-3.5" />}
-                  </Button>
-                </div>
-              </div>
-              <div className="space-y-1">
-                <Label>secondCardId</Label>
-                <div className="flex gap-1">
-                  <Input value={membershipForm.secondCardId} onChange={(e) => setMembership({ secondCardId: e.target.value })} />
-                  <Button type="button" size="sm" variant="outline" disabled={!!scanning} onClick={() => scanCard("m.secondCardId", (c) => setMembership({ secondCardId: c }))} title="Scan RFID card">
-                    {scanning === "m.secondCardId" ? <Clock3 className="h-3.5 w-3.5 animate-pulse" /> : <ScanLine className="h-3.5 w-3.5" />}
-                  </Button>
-                </div>
-              </div>
-            </div>
-            <div className="space-y-1"><Label>note (optional)</Label><Input value={membershipForm.note} onChange={(e) => setMembership({ note: e.target.value })} /></div>
-            <PaymentFields form={membershipForm} set={setMembership} />
-            <Button onClick={submitMembership}>{editing?.creation_kind === "membership_only" ? <Save className="h-4 w-4" /> : <Edit3 className="h-4 w-4" />} Submit</Button>
-          </CardContent>
-        </Card>
-
-        {/* ----- new account + first subscription ----- */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm">New member (account + first subscription)</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-2">
-            <div className="grid grid-cols-2 gap-2">
-              <div className="space-y-1"><Label>firstname</Label><Input value={accountForm.firstname} onChange={(e) => setAccount({ firstname: e.target.value })} /></div>
-              <div className="space-y-1"><Label>lastname</Label><Input value={accountForm.lastname} onChange={(e) => setAccount({ lastname: e.target.value })} /></div>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              <div className="space-y-1"><Label>email</Label><Input value={accountForm.email} onChange={(e) => setAccount({ email: e.target.value })} /></div>
-              <div className="space-y-1"><Label>phone</Label><Input value={accountForm.phone} onChange={(e) => setAccount({ phone: e.target.value })} /></div>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              <div className="space-y-1"><Label>password (min 8)</Label><Input type="password" value={accountForm.password} onChange={(e) => setAccount({ password: e.target.value })} /></div>
-              <div className="space-y-1"><Label>accountUsernameId (optional)</Label><Input value={accountForm.accountUsernameId} onChange={(e) => setAccount({ accountUsernameId: e.target.value })} /></div>
-            </div>
-
-            <div className="space-y-2 rounded-md border border-dashed p-2">
-              <div className="text-xs font-medium text-muted-foreground">Profile</div>
-              <div className="grid grid-cols-2 gap-2">
-                <div className="space-y-1"><Label>CIN</Label><Input value={accountForm.cin} onChange={(e) => setAccount({ cin: e.target.value })} /></div>
-                <div className="space-y-1"><Label>birthday</Label><Input type="date" value={accountForm.birthday} onChange={(e) => setAccount({ birthday: e.target.value })} /></div>
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <div className="space-y-1">
-                  <Label>gender</Label>
-                  <Select value={accountForm.gender || NONE} onValueChange={(v) => setAccount({ gender: v === NONE ? "" : v })}>
-                    <SelectTrigger><SelectValue placeholder="—" /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value={NONE}>—</SelectItem>
-                      {GENDERS.map((g) => <SelectItem key={g.v} value={g.v}>{g.l}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="space-y-1">
-                  <Label>blood type</Label>
-                  <Select value={accountForm.bloodType || NONE} onValueChange={(v) => setAccount({ bloodType: v === NONE ? "" : v })}>
-                    <SelectTrigger><SelectValue placeholder="—" /></SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value={NONE}>—</SelectItem>
-                      {BLOOD_TYPES.map((b) => <SelectItem key={b} value={b}>{b.replace("_PLUS", "+").replace("_MINUS", "-")}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
-                </div>
-              </div>
-              <div className="space-y-1">
-                <Label>city</Label>
-                <Select value={accountForm.city || NONE} onValueChange={(v) => setAccount({ city: v === NONE ? "" : v })}>
-                  <SelectTrigger><SelectValue placeholder="—" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={NONE}>—</SelectItem>
-                    {CITIES.map((c) => <SelectItem key={c.v} value={c.v}>{c.l}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <div className="space-y-1"><Label>emergency name</Label><Input value={accountForm.emergencyContactName} onChange={(e) => setAccount({ emergencyContactName: e.target.value })} /></div>
-                <div className="space-y-1"><Label>emergency phone</Label><Input value={accountForm.emergencyContactPhone} onChange={(e) => setAccount({ emergencyContactPhone: e.target.value })} /></div>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-2">
-              <div className="space-y-1">
-                <Label>membership</Label>
-                <Select value={accountForm.membershipId || NONE} onValueChange={(v) => setAccount({ membershipId: v === NONE ? "" : v })}>
-                  <SelectTrigger><SelectValue placeholder="Select membership" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={NONE}>Select membership</SelectItem>
-                    {memberships.map((m) => <SelectItem key={String(m.id)} value={String(m.id)}>{m.title || `Membership ${m.id}`}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-1">
-                <Label>cardId</Label>
-                <div className="flex gap-1">
-                  <Input value={accountForm.cardId} onChange={(e) => setAccount({ cardId: e.target.value })} />
-                  <Button type="button" size="sm" variant="outline" disabled={!!scanning} onClick={() => scanCard("a.cardId", (c) => setAccount({ cardId: c }))} title="Scan RFID card">
-                    {scanning === "a.cardId" ? <Clock3 className="h-3.5 w-3.5 animate-pulse" /> : <ScanLine className="h-3.5 w-3.5" />}
-                  </Button>
-                </div>
-              </div>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              <div className="space-y-1"><Label>startDate</Label><Input type="date" value={accountForm.startDate} onChange={(e) => setAccount({ startDate: e.target.value })} /></div>
-              <div className="space-y-1"><Label>endDate</Label><Input type="date" value={accountForm.endDate} onChange={(e) => setAccount({ endDate: e.target.value })} /></div>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              <div className="space-y-1">
-                <Label>secondCardId</Label>
-                <div className="flex gap-1">
-                  <Input value={accountForm.secondCardId} onChange={(e) => setAccount({ secondCardId: e.target.value })} />
-                  <Button type="button" size="sm" variant="outline" disabled={!!scanning} onClick={() => scanCard("a.secondCardId", (c) => setAccount({ secondCardId: c }))} title="Scan RFID card">
-                    {scanning === "a.secondCardId" ? <Clock3 className="h-3.5 w-3.5 animate-pulse" /> : <ScanLine className="h-3.5 w-3.5" />}
-                  </Button>
-                </div>
-              </div>
-              <div className="space-y-1"><Label>note (optional)</Label><Input value={accountForm.note} onChange={(e) => setAccount({ note: e.target.value })} /></div>
-            </div>
-            <PaymentFields form={accountForm} set={setAccount} />
-            <Button onClick={submitAccount}>{editing?.creation_kind === "account_plus_membership" ? <Save className="h-4 w-4" /> : <Edit3 className="h-4 w-4" />} Submit</Button>
-          </CardContent>
-        </Card>
-      </div>
-
-      <Card className={cn(!showForms && "hidden")}>
-        <CardHeader><CardTitle className="text-sm">Pending queue (active rows)</CardTitle></CardHeader>
-        <CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Local ID</TableHead>
-                <TableHead>Kind</TableHead>
-                <TableHead>State</TableHead>
-                <TableHead>Try</TableHead>
-                <TableHead>Failures</TableHead>
-                <TableHead>Next retry</TableHead>
-                <TableHead>Last error</TableHead>
-                <TableHead className="text-right">Actions</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {activeRows.length === 0 ? (
-                <TableRow><TableCell colSpan={8} className="h-20 text-center text-muted-foreground">No active pending rows.</TableCell></TableRow>
-              ) : activeRows.map((row) => (
-                <TableRow key={row.local_id}>
-                  <TableCell className="font-mono text-xs">{row.local_id}</TableCell>
-                  <TableCell>{row.creation_kind}</TableCell>
-                  <TableCell><Badge variant={badgeForState(row.state)}>{row.state}</Badge></TableCell>
-                  <TableCell>{row.try_to_create ? "on" : "off"}</TableCell>
-                  <TableCell>{row.failure_count}</TableCell>
-                  <TableCell className="text-xs">{ts(row.next_retry_at)}</TableCell>
-                  <TableCell className="max-w-[260px] truncate text-xs" title={row.last_error_message || ""}>{row.last_error_message || "-"}</TableCell>
-                  <TableCell className="text-right">
-                    <div className="flex items-center justify-end gap-1">
-                      <Button size="sm" variant="outline" onClick={() => editRow(row)}>Modify</Button>
-                      <Button size="sm" variant="outline" onClick={() => runAction(() => post(`/offline-creations/${row.local_id}/retry`, {}), "Row retried.")}>Retry</Button>
-                      <Button size="sm" variant="outline" onClick={() => runAction(() => post(`/offline-creations/${row.local_id}/toggle`, { enabled: !row.try_to_create }), "Row toggle updated.")}>{row.try_to_create ? "Pause" : "Resume"}</Button>
-                      <Button size="sm" variant="outline" onClick={() => runAction(() => post(`/offline-creations/${row.local_id}/cancel`, {}), "Row cancelled.")}>Cancel</Button>
-                      <Button size="sm" variant="outline" onClick={() => runAction(() => post(`/offline-creations/${row.local_id}/duplicate`, {}), "Row duplicated.")}>Duplicate</Button>
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
-
-      <Card className={cn(!showForms && "hidden")}>
-        <CardHeader>
-          <div className="flex items-center justify-between gap-2 flex-wrap">
-            <CardTitle className="text-sm">Processed history</CardTitle>
-            <div className="flex items-center gap-2">
-              <Label>State filter</Label>
-              <Select value={historyFilter} onValueChange={(v) => setHistoryFilter(v as any)}>
-                <SelectTrigger className="w-[220px]"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">all</SelectItem>
-                  {HISTORY_STATES.map((s) => <SelectItem key={s} value={s}>{s}</SelectItem>)}
-                </SelectContent>
-              </Select>
+            <div className="mt-1.5 flex flex-wrap gap-1.5">
+              <Chip tone={st.tone}>{st.l}</Chip>
+              {flag ? <Chip tone={flag.tone}>{flag.label}</Chip> : null}
             </div>
           </div>
-        </CardHeader>
-        <CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Local ID</TableHead>
-                <TableHead>Kind</TableHead>
-                <TableHead>Final state</TableHead>
-                <TableHead>Updated</TableHead>
-                <TableHead>Failure type</TableHead>
-                <TableHead>Message</TableHead>
-                <TableHead className="text-right">Actions</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {historyRows.length === 0 ? (
-                <TableRow><TableCell colSpan={7} className="h-20 text-center text-muted-foreground">No rows for this filter.</TableCell></TableRow>
-              ) : historyRows.map((row) => (
-                <TableRow key={row.local_id}>
-                  <TableCell className="font-mono text-xs">{row.local_id}</TableCell>
-                  <TableCell>{row.creation_kind}</TableCell>
-                  <TableCell><Badge variant={badgeForState(row.state)}>{row.state}</Badge></TableCell>
-                  <TableCell className="text-xs">{ts(row.updated_at)}</TableCell>
-                  <TableCell>{row.failure_type || "-"}</TableCell>
-                  <TableCell className="max-w-[260px] truncate text-xs" title={row.last_error_message || ""}>{row.last_error_message || "-"}</TableCell>
-                  <TableCell className="text-right">
-                    <div className="flex items-center justify-end gap-1">
-                      <Button size="sm" variant="outline" onClick={() => runAction(() => post(`/offline-creations/${row.local_id}/duplicate`, {}), "Row duplicated.")}>Duplicate</Button>
-                      {row.state !== "archived" ? <Button size="sm" variant="outline" onClick={() => runAction(() => post(`/offline-creations/${row.local_id}/archive`, {}), "Row archived.")}>Archive</Button> : null}
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
+          <ActionButton kind="ghost" size="xs" iconOnly icon={X} className="absolute right-3 top-3" onClick={() => setSelectedKey(null)}>
+            Fermer la fiche
+          </ActionButton>
+        </div>
+        <div className="border-b border-dashed border-grey/20 px-[18px] py-3.5">
+          <div className="flex items-baseline gap-2.5">
+            <span className="min-w-0 truncate text-[14.5px] font-bold">{m.membershipTitle || (m.membershipId ?? "—")}</span>
+            <span className="flex-1" />
+            {left ? <span className={cn("whitespace-nowrap text-[13.5px] font-bold", INK[st.tone])}>{left}</span> : null}
+          </div>
+          {pct != null && (
+            <div className="mt-2.5 h-2 rounded-full bg-muted">
+              <div className={cn("h-2 rounded-full", bar[st.tone])} style={{ width: `${pct}%` }} />
+            </div>
+          )}
+          <div className="mt-1.5 flex justify-between text-[12px] text-muted-foreground">
+            <span>du {frDate(m.validFrom)}</span>
+            <span>au {frDate(m.validTo)}</span>
+          </div>
+        </div>
+        <div className="border-b border-dashed border-grey/20 px-[18px] py-3">
+          <div className="text-[12px] font-bold uppercase tracking-[0.04em] text-muted-foreground">Identifiants</div>
+          {creds.map((c) => (
+            <div key={c.l} className="mt-[9px] flex items-center gap-2.5 text-[13.5px]">
+              <c.icon className="h-[17px] w-[17px] shrink-0 text-muted-foreground" />
+              <span className="flex-1">{c.l}</span>
+              <span className={cn("font-mono text-[12.5px]", c.v ? "text-foreground" : "text-muted-foreground")}>{c.v || "—"}</span>
+            </div>
+          ))}
+        </div>
+        <div className="flex flex-wrap gap-2 px-[18px] pb-4 pt-3">
+          {canMutate(m) ? (
+            <>
+              <ActionButton kind="dark" size="md" icon={Pencil} disabled={mutBusy} onClick={() => openDialogFor(() => openEdit(m))}>Modifier</ActionButton>
+              <ActionButton kind="outline" size="md" icon={Snowflake} disabled={mutBusy} onClick={() => openDialogFor(() => setFreezeTarget(m))}>Geler</ActionButton>
+            </>
+          ) : null}
+          <ActionButton kind="outline" size="md" icon={ImagePlus} disabled={photoBusy} onClick={() => pickPhoto(m)}>Photo</ActionButton>
+          <ActionButton kind="outline" size="md" icon={Fingerprint} onClick={() => setEnrollMember(m)}>Empreinte</ActionButton>
+          {canMutate(m) ? (
+            <ActionButton kind="danger" size="md" icon={Trash2} disabled={mutBusy} onClick={() => openDialogFor(() => setDeleteTarget(m))}>Supprimer</ActionButton>
+          ) : null}
+        </div>
+      </Panel>
+    );
+  };
 
-      {/* ----- local-first searchable member roster (Access v3) ----- */}
-      <div className={cn("flex min-h-0 flex-1 flex-col gap-[11px]", showForms && "hidden")}>
-        <div className="flex flex-none items-center gap-[9px]">
-          <div className="flex h-[34px] max-w-[340px] flex-1 items-center gap-[9px] rounded-xl border border-border bg-card px-3">
+  // ── Tab: Répertoire ───────────────────────────────────────────────────
+  const rosterTab = (
+    <PageGrid>
+      <Panel className="col-span-8">
+        <div className="flex flex-wrap items-center gap-2.5 px-[18px] pt-4">
+          <div className="flex h-9 min-w-[200px] flex-1 items-center gap-2 rounded-lg border border-grey/32 bg-card px-3 focus-within:border-primary">
             <Search className="h-[17px] w-[17px] shrink-0 text-muted-foreground" />
             <input
               value={rosterQInput}
               onChange={(e) => setRosterQInput(e.target.value)}
               placeholder="Nom, e-mail, téléphone, carte…"
-              className="min-w-0 flex-1 bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground"
+              aria-label="Rechercher un membre"
+              className="min-w-0 flex-1 bg-transparent text-[13.5px] text-foreground outline-none placeholder:text-muted-foreground"
             />
+            {rosterLoading ? <Loader2 className="h-4 w-4 shrink-0 animate-spin text-muted-foreground" /> : null}
           </div>
-          <div className="flex gap-[5px]">
-            {([
-              ["all", "Tous", rosterCounts.all],
-              ["active", "Actifs", rosterCounts.active],
-              ["expired", "Expirés", rosterCounts.expired],
-              ["pending", "En attente", rosterCounts.pending],
-            ] as const).map(([key, label, count]) => (
-              <button
-                key={key}
-                onClick={() => { setRosterPage(0); setRosterStatus(key as any); }}
-                className={cn(
-                  "inline-flex h-7 items-center whitespace-nowrap rounded-full px-[11px] text-[12px] transition-colors",
-                  rosterStatus === key
-                    ? "bg-foreground font-bold text-background"
-                    : "border border-border bg-card font-semibold text-muted-foreground hover:text-foreground",
-                )}
-              >
-                {label} {count ?? 0}
-              </button>
-            ))}
-          </div>
-          {rosterLoading ? <Clock3 className="h-4 w-4 animate-pulse text-muted-foreground" /> : null}
+          <Segmented
+            ariaLabel="Filtrer par statut"
+            value={rosterStatus}
+            onChange={(v) => { setRosterPage(0); setRosterStatus(v); }}
+            items={[
+              { value: "all", label: "Tous", count: rosterCounts.all ?? 0 },
+              { value: "active", label: "Actifs", count: rosterCounts.active ?? 0 },
+              { value: "expired", label: "Expirés", count: rosterCounts.expired ?? 0 },
+              { value: "pending", label: "En attente", count: rosterCounts.pending ?? 0 },
+            ]}
+          />
         </div>
-
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-3xl bg-card shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
-          <div className={cn(ROSTER_GRID, "flex-none border-b border-border px-6 py-[11px]")}>
-            <span className={LB}>Nom complet</span>
-            <span className={LB}>Téléphone</span>
-            <span className={LB}>Abonnement</span>
-            <span className={LB}>Fin</span>
-            <span className={LB}>Statut</span>
-            <span className={cn(LB, "text-right")}>Actions</span>
-          </div>
-
-          <div className="min-h-0 flex-1 overflow-y-auto">
-            {roster.length === 0 ? (
-              <div className="flex h-full min-h-[240px] flex-col items-center justify-center gap-2 text-center">
-                <UsersIcon className="h-8 w-8 text-muted-foreground/40" />
-                <p className="text-[13px] font-semibold text-foreground">Aucun membre ne correspond</p>
-                <p className="max-w-[340px] text-[11.5px] text-muted-foreground">
-                  Ajustez la recherche ou le filtre, ou synchronisez pour charger le répertoire.
-                </p>
-              </div>
-            ) : roster.map((m) => {
-              const flag = m.hasConflict ? "conflit"
-                : m.offlinePending ? "créé hors ligne"
-                : m.pendingDelete ? "suppression…"
-                : (m.pendingMutations?.length ?? 0) > 0 ? "sync en attente"
-                : null;
-              const flagTone = m.hasConflict ? "no" : m.offlinePending || m.pendingDelete ? "wn" : "flat";
-              const st = statusBadge(m.status);
-              return (
-                <div
-                  key={`${m.userId}-${m.activeMembershipId || "na"}`}
-                  className={cn(
-                    ROSTER_GRID,
-                    "border-b border-border/60 px-6 py-[9px] last:border-b-0",
-                    m.hasConflict && "bg-primary/[0.035]",
-                  )}
-                >
-                  <div className="flex min-w-0 items-center gap-[11px]">
-                    <span className={cn(
-                      "flex h-8 w-8 shrink-0 items-center justify-center rounded-[18px] text-[12px] font-bold",
-                      m.hasConflict ? "bg-primary/[0.09] text-primary"
-                        : m.offlinePending ? "bg-amber-500/[0.14] text-amber-700 dark:text-amber-400"
-                        : "bg-muted text-muted-foreground",
-                    )}>
-                      {initialsOf(m.fullName)}
-                    </span>
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-[7px]">
-                        <span className="truncate text-[13.5px] font-semibold text-foreground">{m.fullName || "—"}</span>
-                        {flag ? <RosterChip tone={flagTone as any}>{flag}</RosterChip> : null}
-                      </div>
-                      <div className="truncate text-[11px] text-muted-foreground">{m.email || m.accountUsernameId || ""}</div>
-                    </div>
-                  </div>
-
-                  <span className="truncate font-mono text-[12px] text-muted-foreground">{m.phone || "—"}</span>
-                  <span className="truncate text-[12px] text-muted-foreground">{m.membershipTitle || (m.membershipId ?? "—")}</span>
-                  <span className="truncate font-mono text-[12px] text-muted-foreground">
-                    {n(m.validTo) ? String(m.validTo).slice(0, 10) : "—"}
-                  </span>
-                  <span>
-                    <RosterChip tone={st === "success" ? "ok" : st === "destructive" ? "no" : st === "warning" ? "wn" : "flat"}>
-                      {m.status || "—"}
-                    </RosterChip>
-                  </span>
-
-                  <div className="flex items-center justify-end gap-[5px]">
-                    {!m.offlinePending && Number(m.activeMembershipId) > 0 ? (
-                      <>
-                        <IconAction title="Modifier l'abonnement" disabled={mutBusy} onClick={() => openEdit(m)}><Pencil className="h-3.5 w-3.5" /></IconAction>
-                        <IconAction title="Geler l'abonnement" disabled={mutBusy} onClick={() => setFreezeTarget(m)}><Snowflake className="h-3.5 w-3.5" /></IconAction>
-                        <IconAction title="Supprimer l'abonnement" disabled={mutBusy} onClick={() => setDeleteTarget(m)}><Trash2 className="h-3.5 w-3.5" /></IconAction>
-                      </>
-                    ) : null}
-                    <IconAction title="Ajouter / remplacer la photo" disabled={photoBusy} onClick={() => pickPhoto(m)}><ImagePlus className="h-3.5 w-3.5" /></IconAction>
-                    <IconAction title="Enrôler une empreinte" onClick={() => setEnrollMember(m)}><Fingerprint className="h-3.5 w-3.5" /></IconAction>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          <div className="flex flex-none items-center justify-between border-t border-border px-6 py-2.5">
-            <span className="text-[11.5px] text-muted-foreground">
-              {rosterTotal} membre{rosterTotal > 1 ? "s" : ""} · page {rosterPage + 1} / {rosterTotalPages}
-            </span>
-            <div className="flex gap-1.5">
-              <Button
-                variant="outline"
-                className="h-[26px] gap-1 rounded-[14px] px-2.5 text-[11.5px] font-semibold"
-                disabled={rosterPage <= 0}
-                onClick={() => setRosterPage((p) => Math.max(0, p - 1))}
-              >
-                <ChevronLeft className="h-3.5 w-3.5" />Précédent
-              </Button>
-              <Button
-                variant="outline"
-                className="h-[26px] gap-1 rounded-[14px] px-2.5 text-[11.5px] font-semibold"
-                disabled={rosterPage + 1 >= rosterTotalPages}
-                onClick={() => setRosterPage((p) => p + 1)}
-              >
-                Suivant<ChevronRight className="h-3.5 w-3.5" />
-              </Button>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <AlertDialog open={decisionOpen} onOpenChange={setDecisionOpen}>
-        <AlertDialogContent className="rounded-3xl">
-          <AlertDialogHeader>
-            <AlertDialogTitle className="font-display text-[18px] font-extrabold tracking-[-0.02em]">Creation failed</AlertDialogTitle>
-            <AlertDialogDescription className="space-y-2">
-              {conflictHint ? <p className="font-medium text-foreground">{conflictHint}</p> : null}
-              <p>{decision?.attempt.error || "Unknown error"}</p>
-              <p>failure_type=<code>{decision?.attempt.failureType || "unknown"}</code> | failure_code=<code>{decision?.attempt.failureCode || "-"}</code> | http=<code>{decision?.attempt.lastHttpStatus ?? "-"}</code></p>
-              <p>Modify values or save this row for later retry.</p>
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel asChild>
-              <Button variant={saveLaterRecommended ? "outline" : "default"}>Modify{saveLaterRecommended ? "" : " (Recommended)"}</Button>
-            </AlertDialogCancel>
-            <AlertDialogAction
-              asChild
-              onClick={(e) => {
-                e.preventDefault();
-                const d = decision;
-                if (!d) {
-                  setDecisionOpen(false);
-                  return;
-                }
-                void runAction(
-                  () => post("/offline-creations/queue", {
-                    creationKind: d.creationKind,
-                    payload: d.payload,
-                    failure: {
-                      failureType: d.attempt.failureType,
-                      failureCode: d.attempt.failureCode,
-                      lastHttpStatus: d.attempt.lastHttpStatus,
-                      error: d.attempt.error,
-                    },
-                  }),
-                  "Creation saved to offline queue.",
-                );
-                setDecisionOpen(false);
-                setDecision(null);
-              }}
-            >
-              <Button variant={saveLaterRecommended ? "default" : "outline"}>Save later{saveLaterRecommended ? " (Recommended)" : ""}</Button>
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      {/* ----- lifecycle changes queue ----- */}
-      <Card className={cn(!showForms && "hidden")}>
-        <CardHeader>
-          <div className="flex items-center justify-between gap-2 flex-wrap">
-            <CardTitle className="text-sm">Lifecycle changes queue</CardTitle>
-            <Button size="sm" variant="outline" onClick={() => runMutationAction(() => post("/mutations/process-due", {}), "Sync run executed.")}>
-              <Repeat className="h-3.5 w-3.5" /> Sync now
-            </Button>
-          </div>
-        </CardHeader>
-        <CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Op</TableHead>
-                <TableHead>AM id</TableHead>
-                <TableHead>State</TableHead>
-                <TableHead>Money</TableHead>
-                <TableHead>Error</TableHead>
-                <TableHead className="text-right">Actions</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {mutations.length === 0 ? (
-                <TableRow><TableCell colSpan={6} className="h-16 text-center text-muted-foreground">No queued lifecycle changes.</TableCell></TableRow>
-              ) : mutations.map((mu) => (
-                <TableRow key={mu.local_id}>
-                  <TableCell>{mu.op_kind}</TableCell>
-                  <TableCell className="text-xs">{mu.target_id}</TableCell>
-                  <TableCell>
-                    <Badge variant={mu.state === "conflict" || mu.state === "failed_terminal" ? "destructive" : (mu.state === "succeeded" || mu.state === "reconciled") ? "success" : mu.state === "blocked_auth" ? "warning" : "outline"}>{mu.state}</Badge>
-                  </TableCell>
-                  <TableCell>{mu.money ? <Badge variant="warning">money</Badge> : "-"}</TableCell>
-                  <TableCell className="max-w-[240px] truncate text-xs" title={mu.last_error_message || ""}>{mu.last_error_message || "-"}</TableCell>
-                  <TableCell className="text-right">
-                    <div className="flex items-center justify-end gap-1">
-                      {mu.state === "conflict" ? (
-                        <Button size="sm" variant="outline" onClick={() => runMutationAction(() => post(`/mutations/${mu.local_id}/resolve`, { action: "abort" }), "Conflict aborted.")}>Abort</Button>
-                      ) : null}
-                      {MUTATION_ACTIVE_STATES.includes(mu.state) && mu.state !== "conflict" ? (
-                        <Button size="sm" variant="outline" onClick={() => runMutationAction(() => post(`/mutations/${mu.local_id}/retry`, {}), "Retried.")}>Retry</Button>
-                      ) : null}
-                      {MUTATION_ACTIVE_STATES.includes(mu.state) ? (
-                        <Button size="sm" variant="outline" onClick={() => runMutationAction(() => post(`/mutations/${mu.local_id}/cancel`, {}), "Cancelled.")}>Cancel</Button>
-                      ) : null}
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
-      </div>
-
-      {/* ── Le rail ───────────────────────────────────────────────────────
-          Everything below is derived from flags the backend already sets on
-          each roster row — no state is inferred or invented here. */}
-      <div className="flex w-[330px] flex-none flex-col gap-[11px]">
-        <div className="flex flex-none items-center gap-[9px]">
-          <span className={cn(
-            "inline-flex h-[22px] items-center gap-1.5 rounded-lg px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em]",
-            attentionCount > 0 ? "bg-primary/[0.08] text-primary" : "bg-muted text-muted-foreground",
-          )}>
-            <AlertCircle className="h-3 w-3" />À traiter
-          </span>
-          {attentionCount > 0 && (
-            <span className="text-[11.5px] text-muted-foreground">
-              {attentionCount} fiche{attentionCount > 1 ? "s" : ""}
-            </span>
-          )}
-        </div>
-
-        {attentionCount > 0 ? (
-          <div className={cn(
-            "flex-none rounded-3xl bg-card px-5 py-[17px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]",
-            railFacts.conflicts.length > 0 && "border-[1.5px] border-primary/30",
-          )}>
-            {railFacts.conflicts.length > 0 && (
-              <>
-                <div className="mb-[11px] flex items-center gap-3">
-                  <span className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-[18px] bg-primary/[0.09] text-primary">
-                    <GitMerge className="h-5 w-5" />
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="text-[13.5px] font-bold text-foreground">
-                      {railFacts.conflicts.length} conflit{railFacts.conflicts.length > 1 ? "s" : ""} à arbitrer
-                    </div>
-                    <div className="mt-0.5 truncate text-[11px] leading-[1.45] text-muted-foreground">
-                      {firstNames(railFacts.conflicts)} — modifié hors ligne <b className="text-foreground">et</b> sur le serveur
-                    </div>
-                  </div>
-                </div>
-                <Button
-                  variant="outline"
-                  className="h-8 w-full justify-center gap-1.5 rounded-[14px] border-[1.5px] border-primary/45 text-[12px] font-semibold text-primary hover:bg-primary/5"
-                  onClick={() => setShowForms(true)}
-                >
-                  <GitMerge className="h-[15px] w-[15px] " />Ouvrir la file d'attente
-                </Button>
-              </>
-            )}
-
-            {railFacts.conflicts.length > 0 && (railFacts.offlineNew.length > 0 || railFacts.syncing.length > 0 || railFacts.deleting.length > 0) && (
-              <div className="my-3.5 h-px bg-border" />
-            )}
-
-            {(railFacts.offlineNew.length > 0 || railFacts.syncing.length > 0 || railFacts.deleting.length > 0) && (
-              <>
-                <div className="mb-[11px] flex items-center gap-3">
-                  <span className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-[18px] bg-amber-500/[0.14] text-amber-700 dark:text-amber-400">
-                    <CloudUpload className="h-5 w-5" />
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="text-[13.5px] font-bold text-foreground">
-                      {railFacts.offlineNew.length + railFacts.syncing.length + railFacts.deleting.length} en attente de synchro
-                    </div>
-                    <div className="mt-0.5 truncate text-[11px] leading-[1.45] text-muted-foreground">
-                      {railFacts.offlineNew.length > 0 && `${firstNames(railFacts.offlineNew)} — créés hors ligne`}
-                      {railFacts.offlineNew.length > 0 && railFacts.syncing.length > 0 && " · "}
-                      {railFacts.syncing.length > 0 && `${railFacts.syncing.length} modification${railFacts.syncing.length > 1 ? "s" : ""}`}
-                      {railFacts.deleting.length > 0 && ` · ${railFacts.deleting.length} suppression${railFacts.deleting.length > 1 ? "s" : ""}`}
-                    </div>
-                  </div>
-                </div>
-                <Button
-                  variant="outline"
-                  className="h-8 w-full justify-center gap-1.5 rounded-[14px] text-[12px] font-semibold"
-                  onClick={() => runAction(() => post("/offline-creations/process-due", {}), "Manual retry executed.")}
-                >
-                  <RefreshCw className="h-[15px] w-[15px]" />Envoyer maintenant
-                </Button>
-              </>
-            )}
-          </div>
-        ) : (
-          <div className="flex-none rounded-3xl bg-card px-5 py-[17px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
-            <div className="flex items-center gap-3">
-              <span className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-[18px] bg-emerald-500/[0.055] text-emerald-700 dark:text-emerald-400">
-                <CheckCircle2 className="h-5 w-5" />
+        <FlexTable
+          label="Répertoire des abonnements"
+          columns={[
+            { label: "Nom complet", flex: 2.4 },
+            { label: "Abonnement", flex: 1.3 },
+            { label: "Fin", flex: 1.05 },
+            { label: "Statut", flex: 0.8 },
+            { label: "Actions", flex: 1.75, align: "right" },
+          ]}
+          empty={(
+            <div className="flex flex-col items-center gap-1.5">
+              <UsersIcon className="h-8 w-8 text-muted-foreground/40" />
+              <span className="font-semibold text-foreground">Aucun membre ne correspond</span>
+              <span className="max-w-[340px] text-[12.5px]">
+                Ajustez la recherche ou le filtre, ou synchronisez pour charger le répertoire.
               </span>
-              <div className="min-w-0 flex-1">
-                <div className="text-[13.5px] font-bold text-foreground">Rien à traiter</div>
-                <div className="mt-0.5 text-[11px] leading-[1.45] text-muted-foreground">
-                  Aucun conflit ni fiche en attente sur cette page.
-                </div>
-              </div>
             </div>
-          </div>
-        )}
+          )}
+          footer={(
+            <>
+              <span className="flex-1">
+                {rosterTotal} abonnement{rosterTotal > 1 ? "s" : ""} · page {rosterPage + 1} sur {rosterTotalPages}
+              </span>
+              <ActionButton kind="outline" size="sm" icon={ChevronLeft} disabled={rosterPage <= 0} onClick={() => setRosterPage((p) => Math.max(0, p - 1))}>
+                Précédent
+              </ActionButton>
+              <ActionButton kind="outline" size="sm" disabled={rosterPage + 1 >= rosterTotalPages} onClick={() => setRosterPage((p) => p + 1)}>
+                Suivant<ChevronRight />
+              </ActionButton>
+            </>
+          )}
+        >
+          {roster.map((m) => {
+            const st = statusOf(m.status);
+            const flag = rowFlag(m);
+            const left = daysLeftText(m);
+            const key = memberKey(m);
+            return (
+              <FlexRow key={key} minHeight={58} selected={key === selectedKey}>
+                <FlexCell flex={2.4}>
+                  <Avatar initials={initialsOf(m.fullName || "")} tone={m.hasConflict ? "error" : st.tone} />
+                  <CellText
+                    title={m.fullName || "—"}
+                    sub={m.email || m.accountUsernameId || ""}
+                    strong
+                    flags={flag ? [flag] : undefined}
+                  />
+                </FlexCell>
+                <FlexCell flex={1.3}>
+                  <CellText title={m.membershipTitle || (m.membershipId ?? "—")} sub={m.phone || ""} subMono />
+                </FlexCell>
+                <FlexCell flex={1.05}>
+                  <CellText
+                    title={frDate(m.validTo)}
+                    sub={left}
+                    mono
+                    subClassName={m.status === "expired" ? INK.error : undefined}
+                  />
+                </FlexCell>
+                <FlexCell flex={0.8}><Chip tone={st.tone}>{st.l}</Chip></FlexCell>
+                <FlexCell flex={1.75} align="right" className="gap-1">
+                  <ActionButton kind="outline" size="xs" iconOnly icon={Eye} title="Voir la fiche" onClick={() => setSelectedKey(key)}>Voir la fiche</ActionButton>
+                  {canMutate(m) ? (
+                    <>
+                      <ActionButton kind="outline" size="xs" iconOnly icon={Pencil} title="Modifier l'abonnement" disabled={mutBusy} onClick={() => openDialogFor(() => openEdit(m))}>Modifier l'abonnement</ActionButton>
+                      <ActionButton kind="outline" size="xs" iconOnly icon={Snowflake} title="Geler l'abonnement" disabled={mutBusy} onClick={() => openDialogFor(() => setFreezeTarget(m))}>Geler l'abonnement</ActionButton>
+                    </>
+                  ) : null}
+                  <ActionButton kind="outline" size="xs" iconOnly icon={Fingerprint} title="Enrôler une empreinte" onClick={() => setEnrollMember(m)}>Enrôler une empreinte</ActionButton>
+                  {canMutate(m) ? (
+                    <ActionButton kind="danger" size="xs" iconOnly icon={Trash2} title="Supprimer l'abonnement" disabled={mutBusy} onClick={() => openDialogFor(() => setDeleteTarget(m))}>Supprimer l'abonnement</ActionButton>
+                  ) : null}
+                </FlexCell>
+              </FlexRow>
+            );
+          })}
+        </FlexTable>
+      </Panel>
 
-        <div className="mt-[3px] flex flex-none items-center gap-[9px]">
-          <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-muted px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em] text-muted-foreground">
-            <UsersIcon className="h-3 w-3" />L'effectif
-          </span>
+      {selected ? renderFiche(selected) : (
+        <div className="col-span-4 flex flex-col gap-[18px]">
+          <Panel>
+            <PanelHeader title="À traiter" sub={`Sur la page affichée (${roster.length} abonnement${roster.length > 1 ? "s" : ""})`} />
+            <PanelList>
+              {railFacts.conflicts.length > 0 && (
+                <ListRow
+                  icon={TriangleAlert}
+                  tone="error"
+                  wrap
+                  title={`${railFacts.conflicts.length} conflit${railFacts.conflicts.length > 1 ? "s" : ""} à arbitrer`}
+                  sub={`${firstNames(railFacts.conflicts)} — modifié hors ligne et sur le serveur`}
+                  actions={<ActionButton kind="outline" size="sm" onClick={() => setTab("mutations")}>Ouvrir la file</ActionButton>}
+                />
+              )}
+              {waitingCount > 0 && (
+                <ListRow
+                  icon={CloudUpload}
+                  tone="warning"
+                  wrap
+                  title={`${waitingCount} en attente de synchro`}
+                  sub={[
+                    railFacts.offlineNew.length > 0 ? `${firstNames(railFacts.offlineNew)} — créés hors ligne` : "",
+                    railFacts.syncing.length > 0 ? `${railFacts.syncing.length} modification${railFacts.syncing.length > 1 ? "s" : ""}` : "",
+                    railFacts.deleting.length > 0 ? `${railFacts.deleting.length} suppression${railFacts.deleting.length > 1 ? "s" : ""}` : "",
+                  ].filter(Boolean).join(" · ")}
+                  actions={(
+                    <ActionButton
+                      kind="outline"
+                      size="sm"
+                      icon={RefreshCw}
+                      onClick={() => {
+                        // Offline creations and offline changes/deletions are two queues.
+                        if (railFacts.offlineNew.length > 0) void runAction(() => post("/offline-creations/process-due", {}), "Nouvel essai lancé.");
+                        if (railFacts.syncing.length + railFacts.deleting.length > 0) void runMutationAction(() => post("/mutations/process-due", {}), "Envoi lancé.");
+                      }}
+                    >
+                      Envoyer maintenant
+                    </ActionButton>
+                  )}
+                />
+              )}
+              {railFacts.conflicts.length === 0 && waitingCount === 0 && (
+                <ListRow icon={CircleCheck} tone="success" wrap title="Rien à traiter" sub="Aucun conflit ni fiche en attente sur cette page." />
+              )}
+            </PanelList>
+          </Panel>
+
+          <Panel>
+            <PanelHeader title="L'effectif" sub="Un membre peut avoir plusieurs abonnements" />
+            <div className="flex items-baseline gap-2.5 px-[18px] pt-3">
+              <span className="font-num text-[30px] font-bold leading-none">{allCount}</span>
+              <span className="text-[13px] text-muted-foreground">abonnement{allCount > 1 ? "s" : ""}</span>
+            </div>
+            <PanelList>
+              {([
+                ["Actifs", rosterCounts.active ?? 0, CircleCheck, "success"],
+                ["Expirés", rosterCounts.expired ?? 0, CircleX, "error"],
+                ["En attente (créés hors ligne)", rosterCounts.pending ?? 0, CloudUpload, "info"],
+              ] as const).map(([l, v, icon, tone]) => (
+                <ListRow
+                  key={l}
+                  icon={icon}
+                  tone={tone}
+                  title={l}
+                  value={String(v)}
+                  bar={allCount > 0 ? (v / allCount) * 100 : 0}
+                  barTone={tone}
+                />
+              ))}
+            </PanelList>
+          </Panel>
         </div>
-        <div className="flex min-h-0 flex-1 flex-col gap-[11px] overflow-y-auto rounded-[18px] bg-card px-5 py-4 shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
-          <div className="mb-0.5 flex items-baseline gap-2.5">
-            <span className="num text-[30px] leading-none">{rosterCounts.all ?? 0}</span>
-            <span className="text-[13px] text-muted-foreground">membre{(rosterCounts.all ?? 0) > 1 ? "s" : ""}</span>
-          </div>
-          <div className="h-px bg-border" />
-          <div className="flex items-center justify-between gap-2.5">
-            <span className="text-[12px] text-muted-foreground">Actifs</span>
-            <span className="text-[12.5px] font-bold text-emerald-700 dark:text-emerald-400">{rosterCounts.active ?? 0}</span>
-          </div>
-          <div className="flex items-center justify-between gap-2.5">
-            <span className="text-[12px] text-muted-foreground">Expirés</span>
-            <span className="text-[12.5px] font-bold text-primary">{rosterCounts.expired ?? 0}</span>
-          </div>
-          <div className="flex items-center justify-between gap-2.5">
-            <span className="text-[12px] text-muted-foreground">En attente</span>
-            <span className="text-[12.5px] font-bold text-amber-700 dark:text-amber-400">{rosterCounts.pending ?? 0}</span>
-          </div>
-          <p className="mt-auto pt-2 text-[10.5px] leading-[1.5] text-muted-foreground">
-            Les indicateurs « à traiter » portent sur la page affichée ({roster.length} fiche
-            {roster.length > 1 ? "s" : ""}) ; les totaux ci-dessus portent sur tout le répertoire.
+      )}
+    </PageGrid>
+  );
+
+  // ── Tab: Créations hors ligne ─────────────────────────────────────────
+  const creationsTab = (
+    <Panel>
+      <PanelHeader
+        title="Créations en attente"
+        sub="Tentées en ligne d'abord ; quand la création échoue et que vous choisissez « Enregistrer pour plus tard », elle attend ici"
+      />
+      <FlexTable
+        label="Créations en attente"
+        columns={[
+          { label: "Membre", flex: 1.7 },
+          { label: "Type", flex: 1.1 },
+          { label: "État", flex: 1.15 },
+          { label: "Essai auto", flex: 0.7 },
+          { label: "Échecs", flex: 0.55, align: "right" },
+          { label: "Prochain essai", flex: 1.1 },
+          { label: "Dernière erreur", flex: 1.5 },
+          { label: "Actions", flex: 1.55, align: "right" },
+        ]}
+        empty="Aucune création en attente."
+      >
+        {activeRows.map((row) => {
+          const st = creationState(row.state);
+          return (
+            <FlexRow key={row.local_id} minHeight={60}>
+              <FlexCell flex={1.7}><CellText title={payloadName(row.payload)} sub={row.local_id} strong subMono /></FlexCell>
+              <FlexCell flex={1.1}><CellText title={KIND_FR[row.creation_kind] ?? row.creation_kind} /></FlexCell>
+              <FlexCell flex={1.15}><Chip tone={st.tone}>{st.l}</Chip></FlexCell>
+              <FlexCell flex={0.7}><CellText title={row.try_to_create ? "oui" : "non"} /></FlexCell>
+              <FlexCell flex={0.55} align="right"><CellText title={String(row.failure_count ?? 0)} /></FlexCell>
+              <FlexCell flex={1.1}><CellText title={ts(row.next_retry_at)} mono titleClassName="text-[12.5px] text-muted-foreground" /></FlexCell>
+              <FlexCell flex={1.5} title={row.last_error_message || ""}>
+                <CellText title={row.last_error_message || "—"} titleClassName={row.last_error_message ? INK.error : "text-muted-foreground"} />
+              </FlexCell>
+              <FlexCell flex={1.55} align="right" className="gap-1">
+                <ActionButton kind="outline" size="xs" iconOnly icon={Pencil} title="Modifier" onClick={() => editRow(row)}>Modifier</ActionButton>
+                <ActionButton kind="outline" size="xs" iconOnly icon={RefreshCw} title="Réessayer" onClick={() => runAction(() => post(`/offline-creations/${row.local_id}/retry`, {}), "Nouvel essai lancé pour cette création.")}>Réessayer</ActionButton>
+                <ActionButton
+                  kind="outline" size="xs" iconOnly
+                  icon={row.try_to_create ? CirclePause : CirclePlay}
+                  title={row.try_to_create ? "Mettre en pause l'essai auto" : "Reprendre l'essai auto"}
+                  onClick={() => runAction(() => post(`/offline-creations/${row.local_id}/toggle`, { enabled: !row.try_to_create }), "Essai automatique mis à jour.")}
+                >
+                  {row.try_to_create ? "Mettre en pause l'essai auto" : "Reprendre l'essai auto"}
+                </ActionButton>
+                <ActionButton kind="outline" size="xs" iconOnly icon={Copy} title="Dupliquer" onClick={() => runAction(() => post(`/offline-creations/${row.local_id}/duplicate`, {}), "Création dupliquée.")}>Dupliquer</ActionButton>
+                <ActionButton kind="danger" size="xs" iconOnly icon={X} title="Annuler la création" onClick={() => runAction(() => post(`/offline-creations/${row.local_id}/cancel`, {}), "Création annulée.")}>Annuler la création</ActionButton>
+              </FlexCell>
+            </FlexRow>
+          );
+        })}
+      </FlexTable>
+    </Panel>
+  );
+
+  // ── Tab: Historique traité ────────────────────────────────────────────
+  const HISTORY_FILTER_FR: Record<"all" | OfflineCreationState, string> = {
+    all: "Tous", succeeded: "Créés", reconciled: "Rapprochés", cancelled: "Annulés",
+    failed_terminal: "Échec définitif", archived: "Archivés",
+    pending: "En attente", processing: "Envoi", failed_retryable: "Échec", blocked_auth: "Bloqués",
+  };
+  const historyTab = (
+    <Panel>
+      <PanelHeader title="Historique traité" sub="Créations terminées : 500 dernières lignes">
+        <Segmented<"all" | OfflineCreationState>
+          ariaLabel="Filtrer par état final"
+          value={historyFilter}
+          onChange={setHistoryFilter}
+          items={(["all", ...HISTORY_STATES] as ("all" | OfflineCreationState)[]).map((s) => ({ value: s, label: HISTORY_FILTER_FR[s] }))}
+        />
+      </PanelHeader>
+      <FlexTable
+        label="Historique traité"
+        columns={[
+          { label: "Membre", flex: 1.6 },
+          { label: "Type", flex: 1.1 },
+          { label: "État final", flex: 1 },
+          { label: "Mis à jour", flex: 1.1 },
+          { label: "Type d'échec", flex: 0.9 },
+          { label: "Message", flex: 1.8 },
+          { label: "Actions", flex: 0.8, align: "right" },
+        ]}
+        empty="Aucune création pour ce filtre."
+      >
+        {historyRows.map((row) => {
+          const st = creationState(row.state);
+          return (
+            <FlexRow key={row.local_id} minHeight={58}>
+              <FlexCell flex={1.6}><CellText title={payloadName(row.payload)} sub={row.local_id} strong subMono /></FlexCell>
+              <FlexCell flex={1.1}><CellText title={KIND_FR[row.creation_kind] ?? row.creation_kind} /></FlexCell>
+              <FlexCell flex={1}><Chip tone={st.tone}>{st.l}</Chip></FlexCell>
+              <FlexCell flex={1.1}><CellText title={ts(row.updated_at)} mono titleClassName="text-[12.5px] text-muted-foreground" /></FlexCell>
+              <FlexCell flex={0.9}>
+                <CellText title={row.failure_type ? (FAILURE_TYPE_FR[row.failure_type] ?? row.failure_type) : "—"} titleClassName="text-muted-foreground" />
+              </FlexCell>
+              <FlexCell flex={1.8} title={row.last_error_message || ""}>
+                <CellText title={row.last_error_message || "—"} titleClassName={row.last_error_message ? undefined : "text-muted-foreground"} />
+              </FlexCell>
+              <FlexCell flex={0.8} align="right" className="gap-1">
+                <ActionButton kind="outline" size="xs" iconOnly icon={Copy} title="Dupliquer" onClick={() => runAction(() => post(`/offline-creations/${row.local_id}/duplicate`, {}), "Création dupliquée.")}>Dupliquer</ActionButton>
+                {row.state !== "archived" ? (
+                  <ActionButton kind="outline" size="xs" iconOnly icon={Archive} title="Archiver" onClick={() => runAction(() => post(`/offline-creations/${row.local_id}/archive`, {}), "Création archivée.")}>Archiver</ActionButton>
+                ) : null}
+              </FlexCell>
+            </FlexRow>
+          );
+        })}
+      </FlexTable>
+    </Panel>
+  );
+
+  // ── Tab: Modifications d'abonnement ───────────────────────────────────
+  const mutationsTab = (
+    <Panel>
+      <PanelHeader
+        title="Modifications d'abonnement"
+        sub="Modifier, geler, supprimer : appliqué en ligne si possible, sinon mis en file et envoyé automatiquement"
+      />
+      <FlexTable
+        label="Modifications d'abonnement"
+        columns={[
+          { label: "Opération", flex: 1.2 },
+          { label: "Abonnement", flex: 0.9 },
+          { label: "État", flex: 1.1 },
+          { label: "Argent", flex: 0.6 },
+          { label: "Erreur", flex: 2 },
+          { label: "Actions", flex: 1.9, align: "right" },
+        ]}
+        empty="Aucune modification en file."
+      >
+        {mutations.map((mu) => {
+          const st = mutationState(mu.state);
+          const days = mu.op_kind === "freeze_create" ? Number(mu.payload?.durationInDays) : NaN;
+          const op = Number.isFinite(days) && days > 0 ? `${opLabel(mu.op_kind)} · ${days} jour${days > 1 ? "s" : ""}` : opLabel(mu.op_kind);
+          return (
+            <FlexRow key={mu.local_id} minHeight={60}>
+              <FlexCell flex={1.2}><CellText title={op} strong /></FlexCell>
+              <FlexCell flex={0.9}><CellText title={`#${mu.target_id}`} mono /></FlexCell>
+              <FlexCell flex={1.1}><Chip tone={st.tone}>{st.l}</Chip></FlexCell>
+              <FlexCell flex={0.6}>{mu.money ? <Chip tone="warning" size="sm">argent</Chip> : <CellText title="—" titleClassName="text-muted-foreground" />}</FlexCell>
+              <FlexCell flex={2} title={mu.last_error_message || ""}>
+                <CellText title={mu.last_error_message || "—"} titleClassName={mu.last_error_message ? INK.error : "text-muted-foreground"} />
+              </FlexCell>
+              <FlexCell flex={1.9} align="right" className="gap-1.5">
+                {mu.state === "conflict" ? (
+                  <ActionButton kind="danger" size="sm" onClick={() => runMutationAction(() => post(`/mutations/${mu.local_id}/resolve`, { action: "abort" }), "Modification abandonnée.")}>
+                    Abandonner ma modification
+                  </ActionButton>
+                ) : null}
+                {MUTATION_ACTIVE_STATES.includes(mu.state) && mu.state !== "conflict" ? (
+                  <ActionButton kind="outline" size="sm" onClick={() => runMutationAction(() => post(`/mutations/${mu.local_id}/retry`, {}), "Nouvel essai lancé.")}>Réessayer</ActionButton>
+                ) : null}
+                {MUTATION_ACTIVE_STATES.includes(mu.state) ? (
+                  <ActionButton kind="danger" size="sm" onClick={() => runMutationAction(() => post(`/mutations/${mu.local_id}/cancel`, {}), "Modification annulée.")}>Annuler</ActionButton>
+                ) : null}
+              </FlexCell>
+            </FlexRow>
+          );
+        })}
+      </FlexTable>
+    </Panel>
+  );
+
+  const editingKind = editing?.creation_kind ?? null;
+  const formKind: OfflineCreationKind = editingKind ?? memberTab;
+
+  return (
+    <div className="flex flex-col gap-[18px]">
+      <LineTabs<UsersTab>
+        className="-mt-1"
+        value={tab}
+        onChange={setTab}
+        items={[
+          { value: "roster", label: "Répertoire", icon: UsersIcon, count: allCount },
+          { value: "creations", label: "Créations hors ligne", icon: CloudUpload, count: activeRows.length, countTone: activeRows.length > 0 ? "warning" : undefined },
+          { value: "history", label: "Historique traité", icon: History },
+          {
+            value: "mutations", label: "Modifications d'abonnement", icon: ArrowRightLeft,
+            count: activeMutations.length, countTone: hasMutationConflict ? "error" : activeMutations.length > 0 ? "warning" : undefined,
+          },
+        ]}
+      />
+
+      {error ? <Note tone="error">Impossible de charger la copie locale des membres : {error}</Note> : null}
+      {queueError ? <Note tone="error">{queueError}</Note> : null}
+      {message ? <Note tone="success">{message}</Note> : null}
+
+      {tab === "roster" && rosterTab}
+      {tab === "creations" && creationsTab}
+      {tab === "history" && historyTab}
+      {tab === "mutations" && mutationsTab}
+
+      {/* ----- Nouveau membre / abonnement pour un membre existant ----- */}
+      <DialogFrame
+        open={memberOpen}
+        onOpenChange={onMemberOpenChange}
+        lockOutside
+        width={640}
+        title={formKind === "account_plus_membership" ? "Nouveau membre" : "Nouvel abonnement"}
+        sub={formKind === "account_plus_membership"
+          ? "Compte + premier abonnement · envoyé en ligne d'abord ; en cas d'échec, à corriger ou à garder pour plus tard"
+          : "Pour un membre déjà présent dans la copie locale · envoyé en ligne d'abord ; en cas d'échec, à corriger ou à garder pour plus tard"}
+        tabs={editingKind ? undefined : (
+          <LineTabs<OfflineCreationKind>
+            size="dialog"
+            value={memberTab}
+            onChange={setMemberTab}
+            items={[
+              { value: "account_plus_membership", label: "Nouveau membre" },
+              { value: "membership_only", label: "Membre existant" },
+            ]}
+          />
+        )}
+        footer={(
+          <>
+            <ActionButton kind="outline" className="px-4" onClick={() => onMemberOpenChange(false)}>
+              {editingKind ? "Annuler la modification" : "Fermer"}
+            </ActionButton>
+            {formKind === "account_plus_membership" ? (
+              <ActionButton kind="primary" className="px-4" onClick={submitAccount}>
+                {editingKind ? "Enregistrer la création en attente" : "Créer le membre"}
+              </ActionButton>
+            ) : (
+              <ActionButton kind="primary" className="px-4" onClick={submitMembership}>
+                {editingKind ? "Enregistrer la création en attente" : "Créer l'abonnement"}
+              </ActionButton>
+            )}
+          </>
+        )}
+      >
+        {editing ? (
+          <Note className="mb-1">
+            Modification de la création en attente <span className="font-mono">{editing.local_id}</span> : corrigez les valeurs puis enregistrez pour qu'elle reste valide.
+          </Note>
+        ) : null}
+        {formKind === "account_plus_membership" ? (
+          <FieldGrid>
+            <FieldSection>Identité</FieldSection>
+            <FormField label="Prénom"><FieldInput value={accountForm.firstname} onChange={(e) => setAccount({ firstname: e.target.value })} /></FormField>
+            <FormField label="Nom"><FieldInput value={accountForm.lastname} onChange={(e) => setAccount({ lastname: e.target.value })} /></FormField>
+            <FormField label="E-mail"><FieldInput value={accountForm.email} onChange={(e) => setAccount({ email: e.target.value })} /></FormField>
+            <FormField label="Téléphone"><FieldInput value={accountForm.phone} onChange={(e) => setAccount({ phone: e.target.value })} /></FormField>
+            <FormField label="Mot de passe (8 caractères min.)"><FieldInput type="password" value={accountForm.password} onChange={(e) => setAccount({ password: e.target.value })} /></FormField>
+            <FormField label="Identifiant compte (facultatif)"><FieldInput value={accountForm.accountUsernameId} onChange={(e) => setAccount({ accountUsernameId: e.target.value })} /></FormField>
+
+            <FieldSection>Profil</FieldSection>
+            <FormField label="CIN"><FieldInput className="font-mono" value={accountForm.cin} onChange={(e) => setAccount({ cin: e.target.value })} /></FormField>
+            <FormField label="Date de naissance"><FieldInput type="date" value={accountForm.birthday} onChange={(e) => setAccount({ birthday: e.target.value })} /></FormField>
+            <FormField label="Genre">
+              <Select value={accountForm.gender || NONE} onValueChange={(v) => setAccount({ gender: v === NONE ? "" : v })}>
+                <FieldSelectTrigger><SelectValue placeholder="—" /></FieldSelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NONE}>—</SelectItem>
+                  {GENDERS.map((g) => <SelectItem key={g.v} value={g.v}>{g.l}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </FormField>
+            <FormField label="Groupe sanguin">
+              <Select value={accountForm.bloodType || NONE} onValueChange={(v) => setAccount({ bloodType: v === NONE ? "" : v })}>
+                <FieldSelectTrigger><SelectValue placeholder="—" /></FieldSelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NONE}>—</SelectItem>
+                  {BLOOD_TYPES.map((b) => <SelectItem key={b} value={b}>{b === "UNDEFINED" ? "Non précisé" : b.replace("_PLUS", "+").replace("_MINUS", "-")}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </FormField>
+            <FormField label="Gouvernorat">
+              <Select value={accountForm.city || NONE} onValueChange={(v) => setAccount({ city: v === NONE ? "" : v })}>
+                <FieldSelectTrigger><SelectValue placeholder="—" /></FieldSelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NONE}>—</SelectItem>
+                  {CITIES.map((c) => <SelectItem key={c.v} value={c.v}>{c.l}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </FormField>
+            <FormField label="Contact d'urgence"><FieldInput value={accountForm.emergencyContactName} onChange={(e) => setAccount({ emergencyContactName: e.target.value })} /></FormField>
+            <FormField label="Téléphone d'urgence"><FieldInput value={accountForm.emergencyContactPhone} onChange={(e) => setAccount({ emergencyContactPhone: e.target.value })} /></FormField>
+
+            <FieldSection>Abonnement</FieldSection>
+            <MembershipSelect value={accountForm.membershipId} memberships={memberships} onChange={(v) => setAccount({ membershipId: v })} />
+            <FormField label="Date de début"><FieldInput type="date" value={accountForm.startDate} onChange={(e) => setAccount({ startDate: e.target.value })} /></FormField>
+            <FormField label="Date de fin"><FieldInput type="date" value={accountForm.endDate} onChange={(e) => setAccount({ endDate: e.target.value })} /></FormField>
+            <CardField label="N° de carte" value={accountForm.cardId} onChange={(v) => setAccount({ cardId: v })}
+              scanKey="a.cardId" scanning={scanning} onScan={() => scanCard("a.cardId", (c) => setAccount({ cardId: c }))} />
+            <CardField label="Deuxième carte" value={accountForm.secondCardId} onChange={(v) => setAccount({ secondCardId: v })}
+              scanKey="a.secondCardId" scanning={scanning} onScan={() => scanCard("a.secondCardId", (c) => setAccount({ secondCardId: c }))} />
+            <FormField label="Note (facultatif)" full><FieldInput value={accountForm.note} onChange={(e) => setAccount({ note: e.target.value })} /></FormField>
+
+            <PaymentFields form={accountForm} set={setAccount} />
+          </FieldGrid>
+        ) : (
+          <FieldGrid>
+            <FieldSection>Membre</FieldSection>
+            <FormField label="Identifiant compte" full>
+              <FieldInput value={membershipForm.accountUsernameId} onChange={(e) => setMembership({ accountUsernameId: e.target.value })} />
+            </FormField>
+
+            <FieldSection>Abonnement</FieldSection>
+            <MembershipSelect value={membershipForm.membershipId} memberships={memberships} onChange={(v) => setMembership({ membershipId: v })} />
+            <FormField label="Date de début"><FieldInput type="date" value={membershipForm.startDate} onChange={(e) => setMembership({ startDate: e.target.value })} /></FormField>
+            <FormField label="Date de fin"><FieldInput type="date" value={membershipForm.endDate} onChange={(e) => setMembership({ endDate: e.target.value })} /></FormField>
+            <CardField label="N° de carte" value={membershipForm.cardId} onChange={(v) => setMembership({ cardId: v })}
+              scanKey="m.cardId" scanning={scanning} onScan={() => scanCard("m.cardId", (c) => setMembership({ cardId: c }))} />
+            <CardField label="Deuxième carte" value={membershipForm.secondCardId} onChange={(v) => setMembership({ secondCardId: v })}
+              scanKey="m.secondCardId" scanning={scanning} onScan={() => scanCard("m.secondCardId", (c) => setMembership({ secondCardId: c }))} />
+            <FormField label="Note (facultatif)" full><FieldInput value={membershipForm.note} onChange={(e) => setMembership({ note: e.target.value })} /></FormField>
+
+            <PaymentFields form={membershipForm} set={setMembership} />
+          </FieldGrid>
+        )}
+        <DialogMessages error={queueError} message={message} />
+      </DialogFrame>
+
+      {/* ----- creation failed: modify or save for later ----- */}
+      <ConfirmDialog
+        open={decisionOpen}
+        onOpenChange={setDecisionOpen}
+        width={520}
+        title="Échec de la création"
+        description="Modifiez les valeurs, ou enregistrez cette création pour un nouvel essai plus tard."
+        cancelLabel={`Modifier${saveLaterRecommended ? "" : " (recommandé)"}`}
+        confirmKind={saveLaterRecommended ? "primary" : "outline"}
+        confirmLabel={`Enregistrer pour plus tard${saveLaterRecommended ? " (recommandé)" : ""}`}
+        onConfirm={() => {
+          const d = decision;
+          if (!d) {
+            setDecisionOpen(false);
+            return;
+          }
+          void runAction(
+            async () => {
+              await post("/offline-creations/queue", {
+                creationKind: d.creationKind,
+                payload: d.payload,
+                failure: {
+                  failureType: d.attempt.failureType,
+                  failureCode: d.attempt.failureCode,
+                  lastHttpStatus: d.attempt.lastHttpStatus,
+                  error: d.attempt.error,
+                },
+              });
+              // Queued: clear that form so a later « Nouveau membre » does not resend it.
+              if (d.creationKind === "membership_only") setMembershipForm({ ...MEMBERSHIP_FORM_INIT });
+              else setAccountForm({ ...ACCOUNT_FORM_INIT });
+            },
+            "Création enregistrée dans la file hors ligne.",
+          );
+          setDecisionOpen(false);
+          setDecision(null);
+          setMemberOpen(false);
+        }}
+      >
+        <div className="space-y-2 text-[13.5px]">
+          {conflictHint ? <Note tone="warning">{conflictHint}</Note> : null}
+          <p className="text-foreground">{decision?.attempt.error || "Erreur inconnue"}</p>
+          <p className="font-mono text-[12px] text-muted-foreground">
+            failure_type={decision?.attempt.failureType || "unknown"} | failure_code={decision?.attempt.failureCode || "-"} | http={decision?.attempt.lastHttpStatus ?? "-"}
           </p>
         </div>
-      </div>
+      </ConfirmDialog>
 
       {/* ----- edit membership dialog ----- */}
-      <AlertDialog open={!!editTarget} onOpenChange={(o) => { if (!o) setEditTarget(null); }}>
-        <AlertDialogContent className="rounded-3xl">
-          <AlertDialogHeader>
-            <AlertDialogTitle className="font-display text-[18px] font-extrabold tracking-[-0.02em]">Edit membership — {editTarget?.fullName}</AlertDialogTitle>
-            <AlertDialogDescription>Applies online if connected, otherwise queues and syncs automatically.</AlertDialogDescription>
-          </AlertDialogHeader>
-          <div className="space-y-2">
-            <div className="grid grid-cols-2 gap-2">
-              <div className="space-y-1"><Label>startDate</Label><Input type="date" value={editForm.startDate} onChange={(e) => setEditForm((s) => ({ ...s, startDate: e.target.value }))} /></div>
-              <div className="space-y-1"><Label>endDate</Label><Input type="date" value={editForm.endDate} onChange={(e) => setEditForm((s) => ({ ...s, endDate: e.target.value }))} /></div>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              <div className="space-y-1">
-                <Label>cardId</Label>
-                <div className="flex gap-1">
-                  <Input value={editForm.cardId} onChange={(e) => setEditForm((s) => ({ ...s, cardId: e.target.value }))} />
-                  <Button type="button" size="sm" variant="outline" disabled={!!scanning} onClick={() => scanCard("edit.cardId", (c) => setEditForm((s) => ({ ...s, cardId: c })))}>{scanning === "edit.cardId" ? <Clock3 className="h-3.5 w-3.5 animate-pulse" /> : <ScanLine className="h-3.5 w-3.5" />}</Button>
-                </div>
-              </div>
-              <div className="space-y-1">
-                <Label>secondCardId</Label>
-                <div className="flex gap-1">
-                  <Input value={editForm.secondCardId} onChange={(e) => setEditForm((s) => ({ ...s, secondCardId: e.target.value }))} />
-                  <Button type="button" size="sm" variant="outline" disabled={!!scanning} onClick={() => scanCard("edit.secondCardId", (c) => setEditForm((s) => ({ ...s, secondCardId: c })))}>{scanning === "edit.secondCardId" ? <Clock3 className="h-3.5 w-3.5 animate-pulse" /> : <ScanLine className="h-3.5 w-3.5" />}</Button>
-                </div>
-              </div>
-            </div>
-            <div className="space-y-1"><Label>note (optional)</Label><Input value={editForm.note} onChange={(e) => setEditForm((s) => ({ ...s, note: e.target.value }))} /></div>
-          </div>
-          <AlertDialogFooter>
-            <AlertDialogCancel asChild><Button variant="outline">Cancel</Button></AlertDialogCancel>
-            <Button onClick={submitEdit} disabled={mutBusy}><Save className="h-4 w-4" /> Save changes</Button>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <DialogFrame
+        open={!!editTarget}
+        onOpenChange={(o) => { if (!o) setEditTarget(null); }}
+        lockOutside
+        width={560}
+        title={`Modifier l'abonnement — ${editTarget?.fullName || ""}`}
+        sub="Appliqué en ligne si possible, sinon mis en file et synchronisé automatiquement"
+        footer={(
+          <>
+            <ActionButton kind="outline" className="px-4" onClick={() => setEditTarget(null)}>Annuler</ActionButton>
+            <ActionButton kind="primary" className="px-4" onClick={submitEdit} disabled={mutBusy}>Enregistrer</ActionButton>
+          </>
+        )}
+      >
+        <FieldGrid>
+          <FormField label="Date de début"><FieldInput type="date" value={editForm.startDate} onChange={(e) => setEditForm((s) => ({ ...s, startDate: e.target.value }))} /></FormField>
+          <FormField label="Date de fin"><FieldInput type="date" value={editForm.endDate} onChange={(e) => setEditForm((s) => ({ ...s, endDate: e.target.value }))} /></FormField>
+          <CardField label="N° de carte" value={editForm.cardId} onChange={(v) => setEditForm((s) => ({ ...s, cardId: v }))}
+            scanKey="edit.cardId" scanning={scanning} onScan={() => scanCard("edit.cardId", (c) => setEditForm((s) => ({ ...s, cardId: c })))} />
+          <CardField label="Deuxième carte" value={editForm.secondCardId} onChange={(v) => setEditForm((s) => ({ ...s, secondCardId: v }))}
+            scanKey="edit.secondCardId" scanning={scanning} onScan={() => scanCard("edit.secondCardId", (c) => setEditForm((s) => ({ ...s, secondCardId: c })))} />
+          <FormField label="Note (facultatif)" full><FieldInput value={editForm.note} onChange={(e) => setEditForm((s) => ({ ...s, note: e.target.value }))} /></FormField>
+        </FieldGrid>
+        <DialogMessages error={queueError} message={message} />
+      </DialogFrame>
 
       {/* ----- freeze membership dialog ----- */}
-      <AlertDialog open={!!freezeTarget} onOpenChange={(o) => { if (!o) setFreezeTarget(null); }}>
-        <AlertDialogContent className="rounded-3xl">
-          <AlertDialogHeader>
-            <AlertDialogTitle className="font-display text-[18px] font-extrabold tracking-[-0.02em]">Freeze membership — {freezeTarget?.fullName}</AlertDialogTitle>
-            <AlertDialogDescription>Pauses the membership for the given duration.</AlertDialogDescription>
-          </AlertDialogHeader>
-          <div className="space-y-2">
-            <div className="grid grid-cols-2 gap-2">
-              <div className="space-y-1"><Label>start date</Label><Input type="date" value={freezeForm.startFreezeDate} onChange={(e) => setFreezeForm((s) => ({ ...s, startFreezeDate: e.target.value }))} /></div>
-              <div className="space-y-1"><Label>duration (days)</Label><Input type="number" value={freezeForm.durationInDays} onChange={(e) => setFreezeForm((s) => ({ ...s, durationInDays: e.target.value }))} /></div>
-            </div>
-            <div className="space-y-1"><Label>reason (optional)</Label><Input value={freezeForm.reason} onChange={(e) => setFreezeForm((s) => ({ ...s, reason: e.target.value }))} /></div>
-            <div className="space-y-1"><Label>note (optional)</Label><Input value={freezeForm.note} onChange={(e) => setFreezeForm((s) => ({ ...s, note: e.target.value }))} /></div>
-          </div>
-          <AlertDialogFooter>
-            <AlertDialogCancel asChild><Button variant="outline">Cancel</Button></AlertDialogCancel>
-            <Button onClick={submitFreeze} disabled={mutBusy}><Snowflake className="h-4 w-4" /> Freeze</Button>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <DialogFrame
+        open={!!freezeTarget}
+        onOpenChange={(o) => { if (!o) setFreezeTarget(null); }}
+        lockOutside
+        width={520}
+        title={`Geler l'abonnement — ${freezeTarget?.fullName || ""}`}
+        sub="Met l'abonnement en pause pour la durée choisie"
+        footer={(
+          <>
+            <ActionButton kind="outline" className="px-4" onClick={() => setFreezeTarget(null)}>Annuler</ActionButton>
+            <ActionButton kind="primary" className="px-4" icon={Snowflake} onClick={submitFreeze} disabled={mutBusy}>Geler</ActionButton>
+          </>
+        )}
+      >
+        <FieldGrid>
+          <FormField label="Date de début"><FieldInput type="date" value={freezeForm.startFreezeDate} onChange={(e) => setFreezeForm((s) => ({ ...s, startFreezeDate: e.target.value }))} /></FormField>
+          <FormField label="Durée (jours)"><FieldInput type="number" value={freezeForm.durationInDays} onChange={(e) => setFreezeForm((s) => ({ ...s, durationInDays: e.target.value }))} /></FormField>
+          <FormField label="Motif (facultatif)" full><FieldInput value={freezeForm.reason} onChange={(e) => setFreezeForm((s) => ({ ...s, reason: e.target.value }))} /></FormField>
+          <FormField label="Note (facultatif)" full><FieldInput value={freezeForm.note} onChange={(e) => setFreezeForm((s) => ({ ...s, note: e.target.value }))} /></FormField>
+        </FieldGrid>
+        <DialogMessages error={queueError} message={message} />
+      </DialogFrame>
 
       {/* ----- delete membership confirm ----- */}
-      <AlertDialog open={!!deleteTarget} onOpenChange={(o) => { if (!o) setDeleteTarget(null); }}>
-        <AlertDialogContent className="rounded-3xl">
-          <AlertDialogHeader>
-            <AlertDialogTitle className="font-display text-[18px] font-extrabold tracking-[-0.02em]">Delete membership — {deleteTarget?.fullName}?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This removes the membership and drops the member's card from the turnstiles. Applies online if connected, otherwise queues and syncs automatically.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel asChild><Button variant="outline">Cancel</Button></AlertDialogCancel>
-            <Button variant="destructive" onClick={confirmDelete} disabled={mutBusy}><Trash2 className="h-4 w-4" /> Delete</Button>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={!!deleteTarget}
+        onOpenChange={(o) => { if (!o) setDeleteTarget(null); }}
+        title={`Supprimer l'abonnement — ${deleteTarget?.fullName || ""} ?`}
+        description="Retire l'abonnement et la carte du membre des tourniquets. Appliqué en ligne si possible, sinon mis en file et synchronisé automatiquement."
+        confirmLabel="Supprimer"
+        confirmKind="danger"
+        confirmDisabled={mutBusy}
+        onConfirm={() => { void confirmDelete(); }}
+      >
+        {queueError ? <Note tone="error">{queueError}</Note> : null}
+      </ConfirmDialog>
 
       <EnrollDialog member={enrollMember} onClose={() => setEnrollMember(null)} />
       <input ref={photoInputRef} type="file" accept="image/*" className="hidden" onChange={onPhotoFile} />

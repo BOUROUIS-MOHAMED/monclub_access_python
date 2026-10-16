@@ -1,11 +1,10 @@
-// Logs — Access v3, from `Access v3 - Partie 2 Diagnostic.dc.html` (screen 04).
+// Logs — Access v5 (board S19).
 //
-// "La console reste la console" — the mono stream is the subject at full height.
-// What the page gains is the rail: it lifts the ERROR lines out of the scroll
-// instead of letting them drown, and summarises the buffer by level and by
-// category.
+// The console is the subject: the mono stream at full height on the left. The
+// rail lifts the last ERROR lines out of the scroll (verbatim — log content is
+// never translated) and summarises the buffer by category (click = filter).
 //
-// NOTE ON THE SHARED COMPONENT: the previous implementation delegated to
+// NOTE ON THE SHARED COMPONENT: an earlier implementation delegated to
 // <LiveLogWorkbench>, which is ALSO rendered by tv/pages/TvLogsPage.tsx. That
 // component is deliberately left untouched so the TV app is not restyled as a
 // side effect; this page instead builds on the same shared, already-tested
@@ -14,13 +13,15 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { LogLine } from "@/api/types";
-import { get, openSSE } from "@/api/client";
+import { get, openSSE, post } from "@/api/client";
 import { usePageChrome } from "@/context/PageChromeContext";
-import { Button } from "@/components/ui/button";
+import { ActionButton } from "@/components/ui/action-button";
+import { Segmented } from "@/components/ui/segmented";
+import { ListRow, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
 import { cn } from "@/lib/utils";
 import { formatLogClock, normalizeLogLine, upsertLogLine } from "@/lib/logs";
 import {
-  Search, Download, Trash2, FolderOpen, AlertCircle, FileText, Pause, Play,
+  Search, Download, Trash2, FolderOpen, CircleX, FileText, Pause, Play, CircleCheck, Tag, Send, X,
 } from "lucide-react";
 
 const RECENT_LIMIT = 500;
@@ -44,20 +45,7 @@ function categoryOf(line: LogLine): string {
   return String(line.tokens?.category || "").trim().toUpperCase() || "—";
 }
 
-function Chip({ tone, children, className }: { tone: "ok" | "no" | "wn"; children: React.ReactNode; className?: string }) {
-  const tones = {
-    ok: "bg-emerald-500/[0.055] text-emerald-700 dark:text-emerald-400",
-    no: "bg-primary/[0.09] text-primary",
-    wn: "bg-amber-500/[0.14] text-amber-700 dark:text-amber-400",
-  } as const;
-  return (
-    <span className={cn("inline-flex h-[17px] shrink-0 items-center justify-center rounded-lg text-[9.5px] font-bold", tones[tone], className)}>
-      {children}
-    </span>
-  );
-}
-
-const BUCKET_TONE = { ERROR: "no", WARNING: "wn", INFO: "ok" } as const;
+const LEVEL_INK = { ERROR: "text-error-ink", WARNING: "text-warning-ink", INFO: "text-success-ink" } as const;
 
 export default function LogsPage() {
   const [logs, setLogs] = useState<LogLine[]>([]);
@@ -66,6 +54,11 @@ export default function LogsPage() {
   const [category, setCategory] = useState<string>("ALL");
   const [live, setLive] = useState(false);
   const [follow, setFollow] = useState(true);
+  // « Envoyer à MonClub » — POST /logs/flush (the same call as the web dashboard's
+  // « Sync logs now »): closes the current log file and queues it for upload. The
+  // answer says what was queued, not that the upload finished, and the text says so.
+  const [uploading, setUploading] = useState(false);
+  const [uploadNote, setUploadNote] = useState<{ tone: "info" | "error"; text: string } | null>(null);
   const logsRef = useRef<LogLine[]>([]);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -126,7 +119,7 @@ export default function LogsPage() {
     });
   }, [logs, search, level, category]);
 
-  /** The design's point: the errors, lifted out of the scroll. */
+  /** The errors, lifted out of the scroll. */
   const errors = useMemo(
     () => logs.filter((l) => bucketOf(l) === "ERROR").slice(-4).reverse(),
     [logs],
@@ -152,219 +145,187 @@ export default function LogsPage() {
 
   const handleClear = useCallback(() => { logsRef.current = []; setLogs([]); }, []);
   const handleOpenFolder = useCallback(() => {
-    void get<{ ok: boolean; path: string }>("/logs/open-dir").catch(() => {});
+    // The route is POST-only (access/local_api_routes.py); a GET never opened the folder.
+    void post<{ ok: boolean; path: string }>("/logs/open-dir").catch(() => {});
+  }, []);
+  const handleUpload = useCallback(async () => {
+    setUploading(true);
+    setUploadNote(null);
+    try {
+      const res = await post<{ ok?: boolean; pendingNow?: string[] }>("/logs/flush");
+      const n = Array.isArray(res?.pendingNow) ? res.pendingNow.length : 0;
+      setUploadNote({
+        tone: "info",
+        text: n > 0
+          ? `Journal mis en file d'envoi vers MonClub : ${n} fichier${n > 1 ? "s" : ""} en attente. L'envoi se fait en arrière-plan dès que le serveur répond.`
+          : "Journal mis en file d'envoi vers MonClub. L'envoi se fait en arrière-plan dès que le serveur répond.",
+      });
+    } catch (e) {
+      setUploadNote({ tone: "error", text: `Envoi impossible : ${e instanceof Error ? e.message : String(e)}` });
+    } finally {
+      setUploading(false);
+    }
   }, []);
 
   usePageChrome(() => ({
     fill: true,
-    subtitle: `${logs.length} ligne${logs.length > 1 ? "s" : ""}${follow ? " · suivi automatique" : ""}`,
+    subtitle: `${logs.length} ligne${logs.length > 1 ? "s" : ""} chargée${logs.length > 1 ? "s" : ""}${follow ? " · suivi automatique" : " · défilement figé"}`,
     actions: (
       <>
-        <Button variant="outline" className="h-[30px] gap-1.5 rounded-[14px] px-[13px] text-[12px] font-semibold" onClick={handleOpenFolder}>
-          <FolderOpen className="h-[15px] w-[15px]" />Dossier
-        </Button>
-        <Button variant="outline" className="h-[30px] gap-1.5 rounded-[14px] px-[13px] text-[12px] font-semibold" onClick={handleExport}>
-          <Download className="h-[15px] w-[15px]" />Exporter
-        </Button>
-        <Button variant="outline" className="h-[30px] gap-1.5 rounded-[14px] px-[13px] text-[12px] font-semibold" onClick={handleClear}>
-          <Trash2 className="h-[15px] w-[15px]" />Vider
-        </Button>
+        <ActionButton kind="outline" icon={FolderOpen} onClick={handleOpenFolder}>Dossier</ActionButton>
+        <ActionButton kind="outline" icon={Download} onClick={handleExport}>Exporter</ActionButton>
+        <ActionButton kind="outline" icon={Trash2} onClick={handleClear}>Vider</ActionButton>
+        <ActionButton kind="outline" icon={Send} spin={uploading} disabled={uploading} onClick={() => { void handleUpload(); }}>
+          Envoyer à MonClub
+        </ActionButton>
       </>
     ),
-  }), [logs.length, follow, handleExport, handleClear, handleOpenFolder]);
-
-  const pill = (active: boolean) =>
-    cn(
-      "inline-flex h-7 items-center whitespace-nowrap rounded-full px-[11px] text-[12px] transition-colors",
-      active
-        ? "bg-foreground font-bold text-background"
-        : "border border-border bg-card font-semibold text-muted-foreground hover:text-foreground",
-    );
+  }), [logs.length, follow, uploading, handleExport, handleClear, handleOpenFolder, handleUpload]);
 
   return (
-    <div className="flex h-full min-h-0 gap-4">
+    <div className="grid h-full min-h-0 grid-cols-12 gap-[18px]">
       {/* ── La console ──────────────────────────────────────────────────── */}
-      <div className="flex min-w-0 flex-1 flex-col gap-[11px]">
-        <div className="flex flex-none items-center gap-[9px]">
-          <div className="flex h-[34px] max-w-[300px] flex-1 items-center gap-[9px] rounded-xl border border-border bg-card px-3">
+      <Panel className="col-span-8 flex min-h-0 flex-col">
+        <PanelHeader title={category !== "ALL" ? `Console · ${category}` : "Console"} className="flex-none">
+          <span className="inline-flex items-center gap-[7px] text-[12.5px] text-muted-foreground">
+            <span className="relative inline-block h-[7px] w-[7px]">
+              {live && <span className="absolute inset-0 animate-ping rounded-full bg-success opacity-60" />}
+              <span className={cn("absolute inset-0 rounded-full", live ? "bg-success" : "bg-grey/60")} />
+            </span>
+            {live ? "en direct" : "hors ligne"}
+          </span>
+          {category !== "ALL" && (
+            <ActionButton kind="ghost" size="sm" onClick={() => setCategory("ALL")}>Tout afficher</ActionButton>
+          )}
+          <ActionButton kind="outline" size="md" icon={follow ? Pause : Play} onClick={() => setFollow((f) => !f)}>
+            {follow ? "Suivi" : "Figé"}
+          </ActionButton>
+        </PanelHeader>
+        <div className="flex flex-none flex-wrap items-center gap-2.5 px-[18px] pt-3">
+          <div className="flex h-9 min-w-[180px] flex-1 items-center gap-2 rounded-lg border border-grey/32 bg-card px-3 focus-within:border-primary">
             <Search className="h-[17px] w-[17px] shrink-0 text-muted-foreground" />
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Filtrer les messages…"
-              className="min-w-0 flex-1 bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground"
+              aria-label="Filtrer les messages"
+              className="min-w-0 flex-1 bg-transparent text-[13.5px] text-foreground outline-none placeholder:text-muted-foreground"
             />
           </div>
-          <div className="flex gap-[5px]">
-            <button className={pill(level === "ALL")} onClick={() => setLevel("ALL")}>Tous {logs.length}</button>
-            <button className={pill(level === "ERROR")} onClick={() => setLevel("ERROR")}>Erreurs {counts.byBucket.ERROR}</button>
-            <button className={pill(level === "WARNING")} onClick={() => setLevel("WARNING")}>Alertes {counts.byBucket.WARNING}</button>
-            <button className={pill(level === "INFO")} onClick={() => setLevel("INFO")}>Infos {counts.byBucket.INFO}</button>
-          </div>
-          <Button
-            variant="outline"
-            className="ml-auto h-[30px] gap-1.5 rounded-[14px] px-[13px] text-[12px] font-semibold"
-            onClick={() => setFollow((f) => !f)}
-          >
-            {follow ? <Pause className="h-[15px] w-[15px]" /> : <Play className="h-[15px] w-[15px]" />}
-            {follow ? "Suivi" : "Figé"}
-          </Button>
+          <Segmented<LevelKey>
+            ariaLabel="Filtrer par niveau"
+            value={level}
+            onChange={setLevel}
+            items={[
+              { value: "ALL", label: "Tous", count: logs.length },
+              { value: "ERROR", label: "Erreurs", count: counts.byBucket.ERROR },
+              { value: "WARNING", label: "Alertes", count: counts.byBucket.WARNING },
+              { value: "INFO", label: "Infos", count: counts.byBucket.INFO },
+            ]}
+          />
         </div>
 
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-3xl bg-card shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
-          <div className="flex flex-none items-center justify-between gap-3.5 border-b border-border px-6 py-3">
-            <span className="text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground">
-              Flux{category !== "ALL" ? ` · ${category}` : ""}
-            </span>
-            <div className="flex items-center gap-3">
-              {category !== "ALL" && (
-                <button className="text-[11px] font-semibold text-primary" onClick={() => setCategory("ALL")}>
-                  tout afficher
-                </button>
-              )}
-              <span className="inline-flex items-center gap-[7px] text-[11.5px] text-muted-foreground">
-                <span className="relative inline-block h-[7px] w-[7px]">
-                  {live && <span className="absolute inset-0 animate-ping rounded-full bg-emerald-500 opacity-60" />}
-                  <span className={cn("absolute inset-0 rounded-full", live ? "bg-emerald-500" : "bg-muted-foreground/50")} />
-                </span>
-                {live ? "en direct" : "hors ligne"}
-              </span>
+        <div ref={scrollRef} className="mt-3 min-h-0 flex-1 overflow-y-auto border-t border-dashed border-grey/20 px-[18px] py-2.5 font-mono text-[12px] leading-[1.85]">
+          {visible.length === 0 && (
+            <div className="flex h-full min-h-[220px] flex-col items-center justify-center gap-2 text-center font-sans">
+              <FileText className="h-7 w-7 text-muted-foreground/40" />
+              <p className="text-[13.5px] font-semibold text-foreground">
+                {logs.length === 0 ? "Aucune ligne de log capturée" : "Aucune ligne ne correspond au filtre"}
+              </p>
             </div>
-          </div>
-
-          <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-6 py-2.5 font-mono text-[11.5px] font-medium leading-[1.9]">
-            {visible.length === 0 && (
-              <div className="flex h-full min-h-[220px] flex-col items-center justify-center gap-2 text-center font-sans">
-                <FileText className="h-7 w-7 text-muted-foreground/40" />
-                <p className="text-[13px] font-semibold text-foreground">
-                  {logs.length === 0 ? "Aucune ligne de log capturée" : "Aucune ligne ne correspond au filtre"}
-                </p>
-              </div>
-            )}
-            {visible.map((l, i) => {
-              const b = bucketOf(l);
-              return (
-                <div
-                  key={String(l.id ?? `${l.ts}-${i}`)}
-                  className={cn(
-                    "flex gap-3",
-                    b === "ERROR" && "-mx-2 rounded-lg bg-primary/[0.05] px-2",
+          )}
+          {visible.map((l, i) => {
+            const b = bucketOf(l);
+            return (
+              <div
+                key={String(l.id ?? `${l.ts}-${i}`)}
+                className={cn("flex gap-3", b === "ERROR" && "-mx-2 rounded-md bg-error/10 px-2")}
+              >
+                <span className="w-[64px] shrink-0 text-muted-foreground">{formatLogClock(l.lastSeenAt || l.ts)}</span>
+                <span className={cn("w-[46px] shrink-0 font-bold", LEVEL_INK[b])}>{b === "WARNING" ? "WARN" : b}</span>
+                <span className="w-[56px] shrink-0 truncate text-muted-foreground">{categoryOf(l)}</span>
+                <span className="min-w-0 break-all text-foreground">
+                  {l.rawText || l.text}
+                  {(l.repeatCount ?? 0) > 1 && (
+                    <span className="ml-2 text-muted-foreground">×{l.repeatCount}</span>
                   )}
-                >
-                  <span className="shrink-0 text-muted-foreground">{formatLogClock(l.lastSeenAt || l.ts)}</span>
-                  <Chip tone={BUCKET_TONE[b]} className="w-[46px]">{b === "WARNING" ? "WARN" : b}</Chip>
-                  <span className="w-[52px] shrink-0 truncate text-muted-foreground">{categoryOf(l)}</span>
-                  <span className={cn("min-w-0 break-all", b === "ERROR" ? "text-primary" : b === "WARNING" ? "text-amber-700 dark:text-amber-400" : "text-foreground")}>
-                    {l.rawText || l.text}
-                    {(l.repeatCount ?? 0) > 1 && (
-                      <span className="ml-2 text-muted-foreground">×{l.repeatCount}</span>
-                    )}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
+                </span>
+              </div>
+            );
+          })}
         </div>
-      </div>
+      </Panel>
 
       {/* ── Le rail ─────────────────────────────────────────────────────── */}
-      <div className="flex w-[330px] flex-none flex-col gap-[11px]">
-        <div className="flex flex-none items-center gap-[9px]">
-          <span className={cn(
-            "inline-flex h-[22px] items-center gap-1.5 rounded-lg px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em]",
-            errors.length ? "bg-primary/[0.08] text-primary" : "bg-muted text-muted-foreground",
-          )}>
-            <AlertCircle className="h-3 w-3" />À traiter
-          </span>
-          <span className="text-[11.5px] text-muted-foreground">
-            {counts.byBucket.ERROR} erreur{counts.byBucket.ERROR > 1 ? "s" : ""}
-          </span>
-        </div>
-
-        {errors.length > 0 ? (
-          <div className="flex max-h-[46%] flex-none flex-col gap-2 overflow-y-auto">
-            {errors.map((l, i) => (
-              <div
-                key={String(l.id ?? `err-${i}`)}
-                className="flex-none rounded-3xl border-[1.5px] border-primary/30 bg-card px-5 py-4 shadow-[0_8px_20px_rgba(0,0,0,0.08)]"
-              >
-                <div className="mb-2 flex items-center gap-2.5">
-                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[18px] bg-primary/[0.09] text-primary">
-                    <AlertCircle className="h-[19px] w-[19px]" />
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-[13px] font-bold text-foreground">{categoryOf(l)}</div>
-                    <div className="mt-0.5 font-mono text-[11px] text-muted-foreground">
-                      {formatLogClock(l.lastSeenAt || l.ts)}
-                      {(l.repeatCount ?? 0) > 1 ? ` · ×${l.repeatCount}` : ""}
-                    </div>
-                  </div>
-                </div>
-                {/* The raw message, verbatim — no invented translation. */}
-                <p className="break-all font-mono text-[11px] leading-[1.55] text-primary">
-                  {l.rawText || l.text}
-                </p>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="flex-none rounded-3xl bg-card px-5 py-4 shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
-            <div className="text-[13px] font-bold text-foreground">Aucune erreur</div>
-            <div className="mt-1 text-[11.5px] text-muted-foreground">
-              Rien d'anormal dans les {logs.length} dernières lignes chargées.
-            </div>
+      <div className="col-span-4 flex min-h-0 flex-col gap-[18px] overflow-y-auto">
+        {uploadNote && (
+          <div
+            role="status"
+            className={cn(
+              "flex flex-none items-start gap-2.5 rounded-2xl px-4 py-3 text-[13px] leading-normal",
+              uploadNote.tone === "error" ? "bg-error/16 text-error-ink" : "bg-info/16 text-info-ink",
+            )}
+          >
+            {uploadNote.tone === "error"
+              ? <CircleX className="mt-px h-[17px] w-[17px] shrink-0" />
+              : <Send className="mt-px h-[17px] w-[17px] shrink-0" />}
+            <span className="min-w-0 flex-1">{uploadNote.text}</span>
+            <button type="button" aria-label="Fermer" onClick={() => setUploadNote(null)} className="shrink-0 cursor-pointer opacity-70 hover:opacity-100">
+              <X className="h-4 w-4" />
+            </button>
           </div>
         )}
+        <Panel className="flex-none">
+          <PanelHeader
+            title="À traiter"
+            sub={errors.length ? "Dernières erreurs, telles qu'écrites dans le journal" : undefined}
+          />
+          <PanelList>
+            {errors.length > 0 ? errors.map((l, i) => (
+              <ListRow
+                key={String(l.id ?? `err-${i}`)}
+                icon={CircleX}
+                tone="error"
+                wrap
+                mono
+                title={<span className="break-all text-[12.5px]">{l.rawText || l.text}</span>}
+                sub={`${categoryOf(l)} · ${formatLogClock(l.lastSeenAt || l.ts)}${(l.repeatCount ?? 0) > 1 ? ` · ×${l.repeatCount}` : ""}`}
+              />
+            )) : (
+              <ListRow
+                icon={CircleCheck}
+                tone="success"
+                wrap
+                title="Aucune erreur"
+                sub={`Rien d'anormal dans les ${logs.length} dernières lignes chargées.`}
+              />
+            )}
+          </PanelList>
+        </Panel>
 
-        <div className="mt-[3px] flex flex-none items-center gap-[9px]">
-          <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-muted px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em] text-muted-foreground">
-            <FileText className="h-3 w-3" />Tampon courant
-          </span>
-        </div>
-        <div className="flex min-h-0 flex-1 flex-col gap-[9px] overflow-y-auto rounded-[18px] bg-card px-5 py-4 shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
-          <div className="flex items-baseline gap-2.5">
-            <span className="num text-[30px] leading-none">{logs.length}</span>
-            <span className="text-[13px] text-muted-foreground">ligne{logs.length > 1 ? "s" : ""} chargée{logs.length > 1 ? "s" : ""}</span>
-          </div>
-          <div className="h-px bg-border" />
-          <div className="flex items-center justify-between gap-2.5">
-            <span className="text-[12px] text-muted-foreground">Erreurs</span>
-            <span className="text-[12.5px] font-bold text-primary">{counts.byBucket.ERROR}</span>
-          </div>
-          <div className="flex items-center justify-between gap-2.5">
-            <span className="text-[12px] text-muted-foreground">Alertes</span>
-            <span className="text-[12.5px] font-bold text-amber-700 dark:text-amber-400">{counts.byBucket.WARNING}</span>
-          </div>
-          <div className="flex items-center justify-between gap-2.5">
-            <span className="text-[12px] text-muted-foreground">Infos</span>
-            <span className="text-[12.5px] font-bold text-emerald-700 dark:text-emerald-400">{counts.byBucket.INFO}</span>
-          </div>
-          {counts.byCategory.length > 0 && (
-            <>
-              <div className="h-px bg-border" />
-              <div className="mb-0.5 text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground">
-                Par catégorie
-              </div>
-              {counts.byCategory.map(([cat, n]) => (
-                <button
-                  key={cat}
-                  onClick={() => setCategory((c) => (c === cat ? "ALL" : cat))}
-                  className={cn(
-                    "flex items-center justify-between gap-2.5 rounded-lg px-1 py-0.5 text-left transition-colors hover:bg-muted",
-                    category === cat && "bg-muted",
-                  )}
-                >
-                  <span className="font-mono text-[12px] text-muted-foreground">{cat}</span>
-                  <span className="text-[12px] font-semibold text-foreground">{n}</span>
-                </button>
-              ))}
-            </>
-          )}
-          <p className="mt-auto pt-2 text-[10.5px] leading-[1.5] text-muted-foreground">
+        <Panel className="flex-none">
+          <PanelHeader title="Par catégorie" sub="Cliquez une catégorie pour filtrer la console" />
+          <PanelList>
+            {counts.byCategory.length === 0 && (
+              <div className="py-2 text-[13px] text-muted-foreground">Aucune ligne chargée.</div>
+            )}
+            {counts.byCategory.map(([cat, n]) => (
+              <button
+                key={cat}
+                type="button"
+                aria-pressed={category === cat}
+                onClick={() => setCategory((c) => (c === cat ? "ALL" : cat))}
+                className="block w-full cursor-pointer text-left"
+              >
+                <ListRow icon={Tag} tone="grey" title={cat} mono value={String(n)} valueMono selected={category === cat} className="hover:bg-muted" />
+              </button>
+            ))}
+          </PanelList>
+          <div className="border-t border-dashed border-grey/20 px-[18px] py-3 text-[12px] leading-normal text-muted-foreground">
             Compteurs calculés sur le tampon chargé ({RECENT_LIMIT} dernières lignes au démarrage,
             puis le flux en direct) — pas sur la journée entière.
-          </p>
-        </div>
+          </div>
+        </Panel>
       </div>
     </div>
   );

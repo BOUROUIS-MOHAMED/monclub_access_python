@@ -307,7 +307,7 @@ function aIsReentryDeny(reason: string): boolean {
 // ── Rule 5: a refusal always says what to do ────────────────────────────────
 // The engines emit SCREAMING_SNAKE codes (app/core/access_verification.py,
 // realtime_agent.py, ultra_engine.py). Each becomes a sentence plus an action.
-interface DenyCopy { title: string; action: string; short: string }
+export interface DenyCopy { title: string; action: string; short: string }
 const A_DENY_FALLBACK: DenyCopy = {
   title: "Cet accès n'a pas pu être validé",
   action: "Présentez-vous à l'accueil — nous réglons ça tout de suite.",
@@ -333,7 +333,10 @@ const A_DENY: Record<string, DenyCopy> = {
   DENY_HANDLE_SLOW: { title: "Le tourniquet n'a pas répondu à temps", action: "Représentez votre carte — si cela persiste, voyez l'accueil.", short: "Tourniquet sans réponse" },
   DOOR_CMD_FAILED: { title: "Le tourniquet n'a pas répondu", action: "Représentez votre carte — si cela persiste, voyez l'accueil.", short: "Tourniquet sans réponse" },
 };
-function aDenyCopy(raw: string): DenyCopy {
+// Exported for the Dashboard feed (v5): its refused rows show the same `short`
+// text. The table stays in this file — tests/test_qr_allowed_days.py and
+// tests/test_p3b1_setting_and_status.py read it here.
+export function aDenyCopy(raw: string): DenyCopy {
   const trimmed = String(raw || "").trim();
   if (!trimmed) return A_DENY_FALLBACK;
   const hit = A_DENY[trimmed.toUpperCase()];

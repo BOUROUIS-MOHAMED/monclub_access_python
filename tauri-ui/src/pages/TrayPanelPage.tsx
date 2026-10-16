@@ -1,47 +1,48 @@
-import { useDeferredValue, useEffect, useState } from "react";
+import { useDeferredValue, useEffect, useState, type ReactNode } from "react";
 
 import { post } from "@/api/client";
 import type { AgentDeviceSnap, DeviceDto, DoorPresetDto } from "@/api/types";
 import { useAgentStatus, useDevices } from "@/api/hooks";
-import StatusChip from "@/components/StatusChip2";
 import { useApp } from "@/context/AppContext";
 import { hasAgentDevices } from "@/lib/agentMode";
-import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { cn } from "@/lib/utils";
+import { ActionButton } from "@/components/ui/action-button";
+import { Chip } from "@/components/ui/chip";
+import { SOFT, type Tone } from "@/components/ui/tone";
 import { doorRequestedMessage } from "@/api/realtime";
 import {
-  Activity,
-  Bot,
-  Cable,
+  ChevronDown,
   CircleAlert,
-  DoorOpen,
+  CircleCheck,
+  CircleX,
   ExternalLink,
+  Info,
   LockOpen,
+  RadioTower,
   RefreshCw,
   Router,
   Search,
+  Send,
   ShieldCheck,
+  Star,
   Wifi,
   WifiOff,
   X,
+  type LucideIcon,
 } from "lucide-react";
 
-const statCardClassName = "rounded-[20px] border border-border bg-muted px-3 py-3";
-const detailCardClassName = "rounded-[18px] border border-border bg-muted p-3";
-const outlineBadgeClassName = "border-border bg-secondary text-secondary-foreground";
-const infoBadgeClassName = `${outlineBadgeClassName} text-[10px] tracking-wide`;
+// Access v5 tray panel (boards W01–W03): frameless always-on-top window, 428×608.
 
 type Notice = {
-  variant: "success" | "destructive" | "info";
+  tone: Tone;
+  icon: LucideIcon;
   title: string;
   message: string;
 };
 
 type AgentDeviceInfo = AgentDeviceSnap[string];
+
+type PanelPreset = DoorPresetDto & { favorite: boolean };
 
 type PanelDevice = {
   id: number;
@@ -51,14 +52,27 @@ type PanelDevice = {
   ipAddress: string;
   portNumber: string;
   platform: string;
+  model: string;
+  protocol: DeviceProtocol;
   active: boolean;
   accessDevice: boolean;
   doorIds: number[];
-  doorPresets: DoorPresetDto[];
-  statusVariant: string;
+  doorPresets: PanelPreset[];
+  statusTone: Tone;
   statusLabel: string;
   connected: boolean;
   lastError: string;
+};
+
+// Protocol family, read like DevicesPage.protocolOf (mirrors
+// app/sdk/device_driver.resolve_device_protocol): absent or unknown = PullSDK.
+const STANDALONE_ALIASES = new Set([
+  "ZK_STANDALONE", "STANDALONE", "ZKEMKEEPER", "ZKEM", "PUSH", "ADMS", "MB2000",
+]);
+type DeviceProtocol = "ZK_PULLSDK" | "ZK_STANDALONE";
+const PROTOCOL_LABEL: Record<DeviceProtocol, string> = {
+  ZK_PULLSDK: "PullSDK",
+  ZK_STANDALONE: "ZKTeco autonome",
 };
 
 function toNumber(value: unknown, fallback = 0): number {
@@ -90,18 +104,20 @@ function toNumberList(value: unknown): number[] {
     .filter((item) => Number.isFinite(item));
 }
 
-function normalizePreset(raw: unknown, deviceId: number): DoorPresetDto {
+function normalizePreset(raw: unknown, deviceId: number): PanelPreset {
   const source = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
   return {
     id: toNumber(source.id, 0),
     deviceId: toNumber(source.deviceId ?? deviceId, deviceId),
     doorNumber: toNumber(source.doorNumber, 1),
     pulseSeconds: toNumber(source.pulseSeconds, 3),
-    doorName: toStringValue(source.doorName, `Door ${toNumber(source.doorNumber, 1)}`),
+    doorName: toStringValue(source.doorName, `Porte ${toNumber(source.doorNumber, 1)}`),
+    // Star only when the synced preset really says so; absent = no star.
+    favorite: source.favoriteEnabled === true,
   };
 }
 
-function normalizeDevice(raw: unknown): Omit<PanelDevice, "statusVariant" | "statusLabel" | "connected" | "lastError"> {
+function normalizeDevice(raw: unknown): Omit<PanelDevice, "statusTone" | "statusLabel" | "connected" | "lastError"> {
   const source = raw && typeof raw === "object" ? raw as Partial<DeviceDto> & Record<string, unknown> : {};
   const id = toNumber(source.id ?? source.deviceId, 0);
   const presetsRaw = Array.isArray(source.doorPresets)
@@ -109,15 +125,21 @@ function normalizeDevice(raw: unknown): Omit<PanelDevice, "statusVariant" | "sta
     : Array.isArray(source.door_presets)
       ? source.door_presets
       : [];
+  const protocolRaw = toStringValue(source.deviceProtocol ?? source.device_protocol, "").trim().toUpperCase();
 
   return {
     id,
-    name: toStringValue(source.name ?? source.deviceName, `Device #${id || "?"}`),
+    name: toStringValue(source.name ?? source.deviceName, `Appareil #${id || "?"}`),
     description: toStringValue(source.description, ""),
     accessDataMode: toStringValue(source.accessDataMode ?? source.access_data_mode, "UNKNOWN").toUpperCase(),
-    ipAddress: toStringValue(source.ipAddress ?? source.ip_address ?? source.ip, "-"),
+    // Empty string = no address (shown as « Adresse absente »), never a placeholder.
+    ipAddress: [source.ipAddress, source.ip_address, source.ip]
+      .map((value) => toStringValue(value, "").trim())
+      .find(Boolean) ?? "",
     portNumber: toStringValue(source.portNumber ?? source.port_number ?? source.port, "4370"),
     platform: toStringValue(source.platform, ""),
+    model: toStringValue(source.model, ""),
+    protocol: STANDALONE_ALIASES.has(protocolRaw) ? "ZK_STANDALONE" : "ZK_PULLSDK",
     active: toBoolean(source.active, true),
     accessDevice: toBoolean(source.accessDevice ?? source.access_device, true),
     doorIds: toNumberList(source.doorIds ?? source.door_ids),
@@ -125,47 +147,52 @@ function normalizeDevice(raw: unknown): Omit<PanelDevice, "statusVariant" | "sta
   };
 }
 
+// Same four states as Appareils (DevicesPage.deviceStateOf) plus the AGENT-mode
+// ones. « Non connecté » is red only where this PC runs a worker for the device:
+// on a PC that drives nothing (a reader PC) every row would otherwise read as a fault.
 function resolveDeviceStatus(
   device: ReturnType<typeof normalizeDevice>,
   agentDevice: AgentDeviceInfo | undefined,
   pullsdkConnected: boolean,
   pullsdkDeviceId: number | null | undefined,
-  syncRunning: boolean,
-  ultraConnected: boolean,
-): Pick<PanelDevice, "statusVariant" | "statusLabel" | "connected" | "lastError"> {
+  ultraWorker: { connected?: boolean } | undefined,
+): Pick<PanelDevice, "statusTone" | "statusLabel" | "connected" | "lastError"> {
   const agentConnected = Boolean(agentDevice?.connected);
   const pullsdkLive = pullsdkConnected && pullsdkDeviceId === device.id;
   const lastError = toStringValue(agentDevice?.lastError, "");
 
   if (!device.active) {
-    return { statusVariant: "offline", statusLabel: "Inactive", connected: false, lastError };
+    return { statusTone: "grey", statusLabel: "Inactif", connected: false, lastError };
+  }
+  if (!device.ipAddress) {
+    return { statusTone: "warning", statusLabel: "Adresse absente", connected: false, lastError };
   }
   if (lastError) {
-    return { statusVariant: "error", statusLabel: "Agent error", connected: false, lastError };
+    return { statusTone: "error", statusLabel: "Erreur agent", connected: false, lastError };
   }
   // ULTRA workers own their own connection and never enter the manual PullSDK
-  // session pool, so a live standalone terminal used to fall through to "Ready"
-  // forever. This is the worker's real connected flag, not an assumption.
-  if (agentConnected || pullsdkLive || ultraConnected) {
-    return { statusVariant: "online", statusLabel: "Connected", connected: true, lastError: "" };
+  // session pool: this is the worker's real connected flag, not an assumption.
+  if (agentConnected || pullsdkLive || Boolean(ultraWorker?.connected)) {
+    return { statusTone: "success", statusLabel: "Connecté", connected: true, lastError: "" };
   }
   if (device.accessDataMode === "AGENT") {
     if (agentDevice?.enabled === false) {
-      return { statusVariant: "offline", statusLabel: "Agent off", connected: false, lastError: "" };
+      return { statusTone: "grey", statusLabel: "Agent arrêté", connected: false, lastError: "" };
     }
-    return { statusVariant: "idle", statusLabel: "Agent standby", connected: false, lastError: "" };
+    return { statusTone: "grey", statusLabel: "Agent en attente", connected: false, lastError: "" };
   }
-  if (syncRunning) {
-    return { statusVariant: "syncing", statusLabel: "Syncing", connected: false, lastError: "" };
-  }
-  return { statusVariant: "idle", statusLabel: "Ready", connected: false, lastError: "" };
+  return { statusTone: ultraWorker ? "error" : "grey", statusLabel: "Non connecté", connected: false, lastError: "" };
 }
 
 function formatClock(value: string | null | undefined): string {
-  if (!value) return "No sync yet";
+  if (!value) return "Aucune sync";
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return toStringValue(value, "No sync yet");
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (Number.isNaN(date.getTime())) return toStringValue(value, "Aucune sync");
+  return `Dernière sync ${date.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}`;
+}
+
+function plural(n: number, word: string): string {
+  return `${n} ${word}${n > 1 ? "s" : ""}`;
 }
 
 function PanelStat({
@@ -173,20 +200,36 @@ function PanelStat({
   label,
   value,
   hint,
+  valueClassName,
 }: {
-  icon: typeof Activity;
+  icon: LucideIcon;
   label: string;
   value: string;
   hint: string;
+  valueClassName?: string;
 }) {
   return (
-    <div className={statCardClassName}>
-      <div className="flex items-center justify-between">
-        <span className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">{label}</span>
-        <Icon className="h-4 w-4 text-primary" />
+    <div className="min-w-0 rounded-xl bg-muted px-2.5 py-[9px]">
+      <div className="flex items-center gap-[5px] text-[11px] font-bold uppercase tracking-[0.04em] text-muted-foreground">
+        <Icon className="h-[13px] w-[13px] shrink-0" />
+        {label}
       </div>
-      <div className="mt-2 text-xl font-semibold text-foreground">{value}</div>
-      <div className="mt-1 text-xs text-muted-foreground">{hint}</div>
+      <div className={cn("font-num text-[21px] font-bold leading-[1.25] text-foreground", valueClassName)}>{value}</div>
+      <div className="truncate text-[11.5px] text-muted-foreground">{hint}</div>
+    </div>
+  );
+}
+
+function NoticeBox({ notice, action }: { notice: Notice; action?: ReactNode }) {
+  const Icon = notice.icon;
+  return (
+    <div role="status" className={cn("flex gap-[9px] rounded-[10px] px-3 py-2.5 text-[12.5px] leading-[1.45]", SOFT[notice.tone])}>
+      <Icon className="mt-px h-[17px] w-[17px] shrink-0" />
+      <div className="min-w-0 flex-1">
+        <div className="font-bold">{notice.title}</div>
+        <div className="break-words">{notice.message}</div>
+        {action}
+      </div>
     </div>
   );
 }
@@ -199,6 +242,7 @@ export default function TrayPanelPage() {
   const [query, setQuery] = useState("");
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
+  const [openIds, setOpenIds] = useState<Set<number>>(() => new Set());
   const deferredQuery = useDeferredValue(query.trim().toLowerCase());
 
   useEffect(() => {
@@ -218,10 +262,12 @@ export default function TrayPanelPage() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
+  const ultraDevices = status?.ultra?.devices ?? {};
   const rawDevices = Array.isArray(data?.devices) ? data.devices : [];
-  const devices = rawDevices.map((rawDevice) => {
+  const devices: (PanelDevice & { canOpenDoor: boolean })[] = rawDevices.map((rawDevice) => {
     const normalized = normalizeDevice(rawDevice);
     const agentDevice = agentDevices[String(normalized.id)];
+    const ultraWorker = ultraDevices[String(normalized.id)];
     return {
       ...normalized,
       ...resolveDeviceStatus(
@@ -229,14 +275,12 @@ export default function TrayPanelPage() {
         agentDevice,
         Boolean(status?.pullsdk?.connected),
         status?.pullsdk?.deviceId,
-        Boolean(status?.sync?.running),
-        Boolean((status as any)?.ultra?.devices?.[String(normalized.id)]?.connected),
+        ultraWorker,
       ),
       // Door availability comes from the DRIVER, never the protocol: a standalone
       // terminal ships with the door command gated off but it can be enabled per
       // machine once the relay is verified. undefined = unknown -> keep it live.
-      canOpenDoor:
-        (status as any)?.ultra?.devices?.[String(normalized.id)]?.supports_open_door !== false,
+      canOpenDoor: ultraWorker?.supports_open_door !== false,
     };
   });
 
@@ -247,16 +291,43 @@ export default function TrayPanelPage() {
       device.ipAddress,
       device.accessDataMode,
       device.platform,
-      device.connected ? "connected" : "offline",
+      device.model,
+      PROTOCOL_LABEL[device.protocol],
+      device.statusLabel,
     ]
       .join(" ")
       .toLowerCase();
     return searchable.includes(deferredQuery);
   });
 
+  // ── Stats ──
+  const modeCounts = devices.reduce<Record<string, number>>((acc, device) => {
+    acc[device.accessDataMode] = (acc[device.accessDataMode] ?? 0) + 1;
+    return acc;
+  }, {});
+  const modeEntries = Object.entries(modeCounts);
+  const modeHint = devices.length === 0
+    ? "aucun appareil"
+    : modeEntries.length === 1
+      ? `tous en mode ${modeEntries[0][0]}`
+      : modeEntries.map(([mode, count]) => `${count} ${mode}`).join(" · ");
+
   const connectedCount = devices.filter((device) => device.connected).length;
-  const agentCount = devices.filter((device) => device.accessDataMode === "AGENT").length;
-  const deviceModeCount = devices.filter((device) => device.accessDataMode === "DEVICE").length;
+  // « x / y » counts only the ULTRA workers this PC runs (same as the header pill of
+  // the main window): a reader PC or a DEVICE-mode gym holds no permanent link, and
+  // counting every roster row there would show a false « hors ligne ».
+  const drivesTurnstiles = status?.ultra?.drivesTurnstiles;
+  const ultraWorkers = Object.values(ultraDevices);
+  const workerConnected = ultraWorkers.filter((worker) => worker?.connected).length;
+  const showWorkerRatio = drivesTurnstiles !== false && ultraWorkers.length > 0;
+  const allWorkersUp = workerConnected === ultraWorkers.length;
+
+  // Role: `drivesTurnstiles` is false on a READER PC, but also on a PC of a gym with
+  // no ULTRA device at all, so « Lecteur » needs ULTRA devices in the roster too.
+  const ultraInRoster = (modeCounts.ULTRA ?? 0) > 0;
+  const isReader = drivesTurnstiles === false && ultraInRoster;
+  const isDriver = drivesTurnstiles === true && ultraInRoster;
+  const showRole = isReader || isDriver;
 
   async function hideCurrentPanel() {
     try {
@@ -299,9 +370,10 @@ export default function TrayPanelPage() {
     try {
       await syncNow();
       setNotice({
-        variant: "info",
-        title: "Sync started",
-        message: "The local backend is refreshing device data.",
+        tone: "info",
+        icon: RefreshCw,
+        title: "Synchronisation lancée",
+        message: "Le service local met à jour les appareils.",
       });
       window.setTimeout(() => {
         void refreshStatus();
@@ -309,8 +381,9 @@ export default function TrayPanelPage() {
       }, 1800);
     } catch (syncError) {
       setNotice({
-        variant: "destructive",
-        title: "Sync failed",
+        tone: "error",
+        icon: CircleX,
+        title: "Échec de la synchronisation",
         message: String(syncError),
       });
     } finally {
@@ -327,14 +400,27 @@ export default function TrayPanelPage() {
         pulseSeconds: preset.pulseSeconds,
       });
       // P3b-2: another PC drives this turnstile -- filed for it, not opened here.
+      // A filed request is information (its result is not visible here); one the
+      // driver will never pick up is a warning. Neither is an error.
       setNotice(res?.requested
-        ? { variant: res.targetConnected ? "info" : "destructive", title: "Demande au PC pilote",
-            message: `${device.name} - ${preset.doorName}: ${doorRequestedMessage(res)}` }
-        : { variant: "success", title: "Door command sent", message: `${device.name} - ${preset.doorName}` });
+        ? {
+            tone: res.targetConnected ? "info" : "warning",
+            icon: res.targetConnected ? Send : CircleAlert,
+            title: "Demande au PC pilote",
+            message: `${device.name} · ${preset.doorName} : ${doorRequestedMessage(res)}`,
+          }
+        : {
+            tone: "success",
+            icon: CircleCheck,
+            // A 2xx means the controller accepted the command, not that the door was seen opening.
+            title: "Commande d’ouverture acceptée",
+            message: `${device.name} · ${preset.doorName} (${preset.pulseSeconds} s)`,
+          });
     } catch (openError) {
       setNotice({
-        variant: "destructive",
-        title: "Door open failed",
+        tone: "error",
+        icon: CircleX,
+        title: "Échec de l'ouverture",
         message: String(openError),
       });
     } finally {
@@ -342,319 +428,309 @@ export default function TrayPanelPage() {
     }
   }
 
-  const sessionEmail = status?.session?.email ?? "Local runtime";
+  function toggleDevice(id: number) {
+    setOpenIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
   const panelBusy = (loading && !status) || (devicesLoading && rawDevices.length === 0);
   const showLoginState = !panelBusy && !(status?.session?.loggedIn ?? false);
   const showRestrictedState = !showLoginState && Boolean(status?.session?.restricted);
+  const sessionEmail = showLoginState ? "Non connecté" : (status?.session?.email ?? "Service local");
+  const dataError = devicesError || error;
+  const showList = !panelBusy && !showLoginState && !showRestrictedState && !dataError;
+  const syncSpinning = busyKey === "sync" || Boolean(status?.sync?.running);
 
   return (
     <div className="h-screen w-screen overflow-hidden bg-transparent">
-      <div
-        className="h-full w-full origin-top-left text-foreground"
-        style={{ transform: "scale(0.9)", width: "111.1112%", height: "111.1112%" }}
-      >
-        <div className="flex h-full flex-col overflow-hidden rounded-[24px] border border-border bg-background shadow-[0_18px_50px_rgba(0,0,0,0.16)] dark:shadow-[0_28px_70px_rgba(0,0,0,0.5)]">
-        <div className="border-b border-border px-4 pb-4 pt-4">
-          <div className="flex items-start justify-between gap-3">
-            <div data-tauri-drag-region className="flex min-w-0 items-start gap-3">
-              <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-primary/25 bg-primary/10 text-primary">
-                <ShieldCheck className="h-5 w-5" />
-              </div>
-              <div className="min-w-0">
-                <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">Tray panel</div>
-                <h1 className="mt-1 truncate text-lg font-semibold text-foreground">MonClub Access</h1>
-                <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                  <span className="truncate">{sessionEmail}</span>
-                  {hasAgentDevices(status) && (
-                    <Badge variant="outline" className={outlineBadgeClassName}>
-                      {status?.agent?.running ? "Agent on" : "Agent off"}
-                    </Badge>
-                  )}
-                  <Badge variant="outline" className={outlineBadgeClassName}>
-                    Last sync {formatClock(status?.sync?.lastSyncAt)}
-                  </Badge>
-                </div>
+      <div className="flex h-full w-full flex-col overflow-hidden rounded-[20px] border border-border bg-card text-foreground">
+        {/* ── Header ── */}
+        <div data-tauri-drag-region className="shrink-0 border-b border-dashed border-border px-3.5 pb-3 pt-3.5">
+          <div data-tauri-drag-region className="flex items-start gap-2.5">
+            <span className="grid h-[38px] w-[38px] shrink-0 place-items-center rounded-[11px] bg-primary text-primary-foreground">
+              <ShieldCheck className="h-5 w-5" />
+            </span>
+            <div data-tauri-drag-region className="min-w-0 flex-1">
+              <h1 className="m-0 text-[16px] font-bold leading-[1.2]">MonClub Access</h1>
+              <div className="mt-[3px] flex min-w-0 items-center gap-1.5 text-[12px] text-muted-foreground">
+                <span className="truncate">{sessionEmail}</span>
+                {!showLoginState && (
+                  <Chip size="sm" tone="grey" className="bg-muted text-foreground">
+                    {formatClock(status?.sync?.lastSyncAt)}
+                  </Chip>
+                )}
+                {!showLoginState && hasAgentDevices(status) && (
+                  <Chip size="sm" tone={status?.agent?.running ? "success" : "grey"}>
+                    {status?.agent?.running ? "Agent actif" : "Agent arrêté"}
+                  </Chip>
+                )}
               </div>
             </div>
-
-            <div className="flex items-center gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-9 rounded-xl"
-                onClick={openMainApp}
-              >
-                <ExternalLink className="h-3.5 w-3.5" />
-                Open app
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-8 w-8 rounded-full text-muted-foreground hover:text-foreground"
-                onClick={() => void hideCurrentPanel()}
-              >
-                <X className="h-4 w-4" />
-              </Button>
-            </div>
-          </div>
-
-          <div className="mt-4 grid grid-cols-3 gap-2">
-            <PanelStat icon={Router} label="Devices" value={String(devices.length)} hint={`${deviceModeCount} device mode`} />
-            <PanelStat icon={Wifi} label="Connected" value={String(connectedCount)} hint={`${agentCount} agent mode`} />
-            <PanelStat
-              icon={status?.sync?.running ? RefreshCw : Activity}
-              label="Runtime"
-              value={status?.sync?.running ? "Syncing" : "Ready"}
-              hint={connectedCount > 0
-                ? `${connectedCount} live link${connectedCount > 1 ? "s" : ""}`
-                : "Waiting for command"}
-            />
-          </div>
-
-          <div className="mt-4 flex items-center gap-2">
-            <div className="relative flex-1">
-              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-                placeholder="Search by name, IP, mode..."
-                className="h-10 rounded-xl border-input bg-card pl-9 placeholder:text-muted-foreground"
-              />
-            </div>
-            <Button
-              variant="default"
-              size="sm"
-              className="h-10 rounded-xl px-3"
-              onClick={() => void handleSyncNow()}
-              disabled={busyKey === "sync"}
+            <ActionButton kind="outline" size="md" icon={ExternalLink} className="text-[12.5px]" onClick={() => void openMainApp()}>
+              Ouvrir l’app
+            </ActionButton>
+            <button
+              type="button"
+              aria-label="Fermer le panneau (Échap)"
+              title="Fermer (Échap)"
+              onClick={() => void hideCurrentPanel()}
+              className="grid h-8 w-8 shrink-0 place-items-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
             >
-              <RefreshCw className={`h-4 w-4 ${busyKey === "sync" ? "animate-spin" : ""}`} />
-              Sync
-            </Button>
+              <X className="h-4 w-4" />
+            </button>
           </div>
+
+          {!showLoginState && !panelBusy && (
+            <>
+              <div className={cn("mt-3 grid gap-2", showRole ? "grid-cols-3" : "grid-cols-2")}>
+                <PanelStat icon={Router} label="Appareils" value={String(devices.length)} hint={modeHint} />
+                {showWorkerRatio ? (
+                  <PanelStat
+                    icon={Wifi}
+                    label="Connectés"
+                    value={`${workerConnected} / ${ultraWorkers.length}`}
+                    hint={allWorkersUp ? "tous les lecteurs" : `${ultraWorkers.length - workerConnected} hors ligne`}
+                    valueClassName={allWorkersUp ? "text-success-ink" : "text-error-ink"}
+                  />
+                ) : (
+                  <PanelStat
+                    icon={Wifi}
+                    label="Connectés"
+                    value={String(connectedCount)}
+                    hint={isReader ? "ce PC ne pilote aucun tourniquet" : `${connectedCount} liaison${connectedCount > 1 ? "s" : ""} active${connectedCount > 1 ? "s" : ""}`}
+                  />
+                )}
+                {showRole && (
+                  <PanelStat
+                    icon={RadioTower}
+                    label="Rôle"
+                    value={isReader ? "Lecteur" : "Pilote"}
+                    hint={isReader ? "demande au PC pilote" : "ouvre ses tourniquets"}
+                  />
+                )}
+              </div>
+
+              <div className="mt-2.5 flex gap-2">
+                <div className="relative min-w-0 flex-1">
+                  <Search className="pointer-events-none absolute left-2.5 top-1/2 h-[15px] w-[15px] -translate-y-1/2 text-muted-foreground" />
+                  <input
+                    value={query}
+                    onChange={(event) => setQuery(event.target.value)}
+                    placeholder="Nom, adresse IP…"
+                    aria-label="Rechercher un appareil"
+                    className="h-9 w-full rounded-lg border border-grey/32 bg-card pl-[30px] pr-2.5 text-[13px] text-foreground outline-none placeholder:text-muted-foreground focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary/20"
+                  />
+                </div>
+                <ActionButton
+                  kind="primary"
+                  size="lg"
+                  icon={RefreshCw}
+                  spin={syncSpinning}
+                  className="text-[13px]"
+                  onClick={() => void handleSyncNow()}
+                  disabled={busyKey === "sync"}
+                >
+                  Synchroniser
+                </ActionButton>
+              </div>
+            </>
+          )}
         </div>
 
-        {notice && (
-          <div className="px-4 pt-3">
-            <Alert variant={notice.variant}>
-              <CircleAlert className="h-4 w-4" />
-              <AlertTitle>{notice.title}</AlertTitle>
-              <AlertDescription>{notice.message}</AlertDescription>
-            </Alert>
-          </div>
-        )}
+        {/* ── Body ── */}
+        <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-3 pb-3 pt-2.5">
+          {notice && <NoticeBox notice={notice} />}
 
-          <ScrollArea className="flex-1 px-4 pb-4 pt-4">
-          {panelBusy && (
-            <div className="space-y-3">
-              {Array.from({ length: 3 }).map((_, index) => (
-                <div key={index} className="rounded-[20px] border border-border bg-muted p-4">
-                  <div className="h-4 w-28 animate-pulse rounded-full bg-secondary" />
-                  <div className="mt-3 h-10 animate-pulse rounded-xl bg-secondary" />
-                  <div className="mt-2 h-10 animate-pulse rounded-xl bg-secondary" />
-                </div>
-              ))}
+          {panelBusy && Array.from({ length: 3 }).map((_, index) => (
+            <div key={index} className="flex items-center gap-2.5 rounded-[14px] border border-border px-3 py-2.5">
+              <div className="h-[34px] w-[34px] animate-pulse rounded-[10px] bg-muted" />
+              <div className="flex-1 space-y-1.5">
+                <div className="h-3 w-32 animate-pulse rounded-full bg-muted" />
+                <div className="h-2.5 w-44 animate-pulse rounded-full bg-muted" />
+              </div>
             </div>
-          )}
+          ))}
 
           {showLoginState && (
-            <Alert variant="warning" className="border border-border bg-card">
-              <CircleAlert className="h-4 w-4" />
-              <AlertTitle>Login required</AlertTitle>
-              <AlertDescription>
-                Open the main application, sign in, then reopen this panel from the tray.
-              </AlertDescription>
-            </Alert>
+            <NoticeBox
+              notice={{
+                tone: "warning",
+                icon: CircleAlert,
+                title: "Connexion requise",
+                message: "Ouvrez l’application, connectez-vous, puis rouvrez ce panneau depuis la barre des tâches.",
+              }}
+              action={
+                <ActionButton kind="dark" size="sm" className="mt-2" onClick={() => void openMainApp()}>
+                  Ouvrir l’app
+                </ActionButton>
+              }
+            />
           )}
 
           {showRestrictedState && (
-            <Alert variant="warning" className="border border-border bg-card">
-              <CircleAlert className="h-4 w-4" />
-              <AlertTitle>Access restricted</AlertTitle>
-              <AlertDescription>
-                {(status?.session?.reasons ?? []).join(" | ") || "The local runtime is currently restricted."}
-              </AlertDescription>
-            </Alert>
+            <NoticeBox
+              notice={{
+                tone: "warning",
+                icon: CircleAlert,
+                title: "Accès restreint",
+                message: (status?.session?.reasons ?? []).join(" · ") || "Le service local est actuellement restreint.",
+              }}
+            />
           )}
 
-          {!panelBusy && !showLoginState && !showRestrictedState && (error || devicesError) && (
-            <Alert variant="destructive">
-              <CircleAlert className="h-4 w-4" />
-              <AlertTitle>Panel data unavailable</AlertTitle>
-              <AlertDescription>{devicesError || error || "Unknown error"}</AlertDescription>
-            </Alert>
+          {!panelBusy && !showLoginState && !showRestrictedState && dataError && (
+            <NoticeBox
+              notice={{
+                tone: "error",
+                icon: CircleX,
+                title: "Données du panneau indisponibles",
+                message: String(dataError || "Erreur inconnue"),
+              }}
+            />
           )}
 
-          {!panelBusy && !showLoginState && !showRestrictedState && !error && !devicesError && filteredDevices.length === 0 && (
-            <div className="rounded-[22px] border border-dashed border-border bg-muted px-5 py-10 text-center">
-              <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl border border-border bg-card text-primary">
-                <Router className="h-6 w-6" />
+          {showList && filteredDevices.length === 0 && (
+            <div className="rounded-[14px] border border-dashed border-grey/50 px-4 py-8 text-center text-[12.5px] leading-normal text-muted-foreground">
+              <div className="font-bold text-foreground">
+                {deferredQuery ? "Aucun appareil ne correspond" : "Aucun appareil synchronisé"}
               </div>
-              <div className="mt-4 text-sm font-medium text-foreground">No matching devices</div>
-              <div className="mt-1 text-xs text-muted-foreground">
-                Try another search term or run a sync to refresh the local cache.
-              </div>
+              {deferredQuery ? "Essayez une autre recherche." : "Lancez une synchronisation pour rafraîchir la liste."}
             </div>
           )}
 
-          {!panelBusy && !showLoginState && !showRestrictedState && !error && !devicesError && filteredDevices.length > 0 && (
-            <Accordion type="multiple" className="space-y-3">
-              {filteredDevices.map((device) => (
-                <AccordionItem
-                  key={device.id}
-                  value={`device-${device.id}`}
-                  className="overflow-hidden rounded-[22px] border border-border bg-card px-0"
+          {showList && filteredDevices.map((device) => {
+            const open = openIds.has(device.id);
+            const ok = device.statusTone === "success";
+            const faulty = device.statusTone === "error" || device.statusTone === "warning";
+            const address = device.ipAddress ? `${device.ipAddress}:${device.portNumber}` : "";
+            const hardware = [PROTOCOL_LABEL[device.protocol], device.model || device.platform].filter(Boolean).join(" · ");
+            const readerNote = isReader && device.accessDataMode === "ULTRA";
+            const note = !device.canOpenDoor
+              ? "Commande d’ouverture non activée pour cet appareil (à activer dans Appareils › Contrôle une fois le relais vérifié)."
+              : device.doorPresets.length === 0
+                ? "Aucun preset de porte pour cet appareil."
+                : readerNote
+                  ? "Ce PC est lecteur : « Ouvrir » envoie une demande au PC pilote."
+                  : "";
+            return (
+              <div
+                key={device.id}
+                className={cn(
+                  "shrink-0 overflow-hidden rounded-[14px] border bg-card",
+                  open ? "border-primary/40" : "border-border",
+                )}
+              >
+                <button
+                  type="button"
+                  aria-expanded={open}
+                  onClick={() => toggleDevice(device.id)}
+                  className="flex w-full items-center gap-2.5 px-3 py-2.5 text-left text-foreground"
                 >
-                  <AccordionTrigger className="px-4 py-4 hover:no-underline">
-                    <div className="flex min-w-0 flex-1 items-center gap-3 text-left">
-                      <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-border bg-muted text-primary">
-                        <Router className="h-5 w-5" />
-                      </div>
+                  <span
+                    className={cn(
+                      "grid h-[34px] w-[34px] shrink-0 place-items-center rounded-[10px]",
+                      ok ? "bg-primary/10 text-primary" : SOFT[device.statusTone],
+                    )}
+                  >
+                    {faulty ? <WifiOff className="h-[17px] w-[17px]" /> : <Router className="h-[17px] w-[17px]" />}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-[13.5px] font-bold">{device.name}</span>
+                    <span className="block truncate text-[11.5px] text-muted-foreground">
+                      {[address || "adresse absente", PROTOCOL_LABEL[device.protocol], plural(device.doorPresets.length, "preset")].join(" · ")}
+                    </span>
+                  </span>
+                  <Chip size="sm" tone={device.statusTone} className="h-[22px] px-[7px] text-[11.5px]">
+                    {device.statusLabel}
+                  </Chip>
+                  <ChevronDown
+                    className={cn("h-[15px] w-[15px] shrink-0 text-muted-foreground transition-transform", open && "rotate-180")}
+                  />
+                </button>
 
-                      <div className="min-w-0 flex-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="truncate text-sm font-semibold text-foreground">{device.name}</span>
-                          <Badge variant="outline" className="border-primary/25 bg-primary/10 text-[10px] tracking-wide text-primary">
-                            {device.accessDataMode}
-                          </Badge>
-                          <Badge variant="outline" className={infoBadgeClassName}>
-                            {device.accessDevice ? "ACCESS" : "GENERIC"}
-                          </Badge>
-                          {device.platform && (
-                            <Badge variant="outline" className={infoBadgeClassName}>
-                              {device.platform}
-                            </Badge>
-                          )}
-                        </div>
-                        <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                          <span>{device.ipAddress}:{device.portNumber}</span>
-                          <span className="text-border">/</span>
-                          <span>{device.doorPresets.length} presets</span>
-                        </div>
-                      </div>
-
-                      <div className="shrink-0">
-                        <StatusChip variant={device.statusVariant} label={device.statusLabel} />
-                      </div>
-                    </div>
-                  </AccordionTrigger>
-
-                  <AccordionContent className="px-4 pb-4">
-                    <div className="grid grid-cols-2 gap-2">
-                      <div className={detailCardClassName}>
-                        <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
-                          <Cable className="h-3.5 w-3.5" />
-                          Status
-                        </div>
-                        <div className="mt-2 text-sm font-medium text-foreground">{device.statusLabel}</div>
-                        <div className="mt-1 text-xs text-muted-foreground">
-                          {device.connected ? "Live communication active" : "Using cached runtime info"}
-                        </div>
-                      </div>
-
-                      <div className={detailCardClassName}>
-                        <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
-                          <Bot className="h-3.5 w-3.5" />
-                          Type
-                        </div>
-                        <div className="mt-2 text-sm font-medium text-foreground">{device.accessDataMode}</div>
-                        <div className="mt-1 text-xs text-muted-foreground">
-                          {device.accessDevice ? "Access controller enabled" : "Listed but not used for access"}
-                        </div>
-                      </div>
-
-                      <div className={detailCardClassName}>
-                        <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
-                          <DoorOpen className="h-3.5 w-3.5" />
-                          Doors
-                        </div>
-                        <div className="mt-2 text-sm font-medium text-foreground">
-                          {device.doorIds.length > 0 ? device.doorIds.join(", ") : "Default backend rule"}
-                        </div>
-                        <div className="mt-1 text-xs text-muted-foreground">
-                          Authorized doors configured for this controller
-                        </div>
-                      </div>
-
-                      <div className={detailCardClassName}>
-                        <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
-                          {device.connected ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5" />}
-                          Endpoint
-                        </div>
-                        <div className="mt-2 text-sm font-medium text-foreground">{device.ipAddress}:{device.portNumber}</div>
-                        <div className="mt-1 text-xs text-muted-foreground">
-                          {device.platform || "Standard controller link"}
-                        </div>
-                      </div>
+                {open && (
+                  <div className="px-3 pb-3">
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <Fact label="Adresse" value={address || "—"} mono />
+                      <Fact label="Matériel" value={hardware || "—"} />
+                      <Fact label="Mode" value={device.accessDataMode} />
+                      <Fact
+                        label="Portes autorisées"
+                        value={device.doorIds.length > 0 ? device.doorIds.join(", ") : "Règle par défaut"}
+                      />
                     </div>
 
                     {device.lastError && (
-                      <Alert variant="destructive" className="mt-3">
-                        <CircleAlert className="h-4 w-4" />
-                        <AlertTitle>Last device error</AlertTitle>
-                        <AlertDescription>{device.lastError}</AlertDescription>
-                      </Alert>
+                      <div className="mt-2 rounded-[9px] bg-error/12 px-2.5 py-2 text-[12px] leading-[1.45] text-error-ink">
+                        <strong>Dernière erreur :</strong> <span className="break-all font-mono">{device.lastError}</span>
+                      </div>
                     )}
 
-                    <div className="mt-3 rounded-[20px] border border-border bg-muted p-3">
-                      <div className="flex items-center justify-between gap-3">
-                        <div>
-                          <div className="text-sm font-medium text-foreground">Door presets</div>
-                          <div className="text-xs text-muted-foreground">Quick actions synced from the dashboard</div>
-                        </div>
-                        <Badge variant="outline" className={outlineBadgeClassName}>
-                          {device.doorPresets.length}
-                        </Badge>
-                      </div>
-
-                      {device.doorPresets.length > 0 ? (
-                        <div className="mt-3 space-y-2">
-                          {device.doorPresets.map((preset) => {
-                            const actionKey = `preset:${device.id}:${preset.doorNumber}:${preset.pulseSeconds}`;
-                            const presetLabel = preset.doorName || `Door ${preset.doorNumber}`;
-                            return (
-                              <div
-                                key={`${device.id}-${preset.id}-${preset.doorNumber}-${preset.pulseSeconds}`}
-                                className="flex items-center justify-between rounded-[18px] border border-border bg-background px-3 py-2.5"
-                              >
-                                <div className="min-w-0">
-                                  <div className="truncate text-sm font-medium text-foreground">{presetLabel}</div>
-                                  <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
-                                    <span>Door #{preset.doorNumber}</span>
-                                    <span className="text-border">/</span>
-                                    <span>{preset.pulseSeconds}s pulse</span>
-                                  </div>
-                                </div>
-                                <Button
-                                  size="sm"
-                                  className="rounded-xl"
-                                  onClick={() => void handleOpenPreset(device, preset)}
-                                  disabled={busyKey === actionKey || (device as any).canOpenDoor === false}
-                                  title={(device as any).canOpenDoor === false
-                                    ? "Door command disabled for this device family (not validated on this hardware)"
-                                    : undefined}
-                                >
-                                  <LockOpen className={`h-4 w-4 ${busyKey === actionKey ? "animate-pulse" : ""}`} />
-                                  Open
-                                </Button>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      ) : (
-                        <div className="mt-3 rounded-[18px] border border-dashed border-border bg-background px-3 py-5 text-center text-xs text-muted-foreground">
-                          No presets are available for this device yet.
-                        </div>
-                      )}
+                    <div className="mt-2.5 text-[11px] font-bold uppercase tracking-[0.05em] text-muted-foreground">
+                      Portes · presets du tableau de bord
                     </div>
-                  </AccordionContent>
-                </AccordionItem>
-              ))}
-            </Accordion>
-          )}
-          </ScrollArea>
+                    {device.doorPresets.map((preset) => {
+                      const actionKey = `preset:${device.id}:${preset.doorNumber}:${preset.pulseSeconds}`;
+                      const presetLabel = preset.doorName || `Porte ${preset.doorNumber}`;
+                      const busy = busyKey === actionKey;
+                      return (
+                        <div
+                          key={`${device.id}-${preset.id}-${preset.doorNumber}-${preset.pulseSeconds}`}
+                          className="mt-1.5 flex items-center gap-2 rounded-[10px] border border-border py-[7px] pl-2.5 pr-2"
+                        >
+                          <span className="min-w-0 flex-1">
+                            <span className="flex items-center gap-1.5 text-[13px] font-semibold">
+                              <span className="truncate">{presetLabel}</span>
+                              {preset.favorite && (
+                                <Star className="h-3 w-3 shrink-0 fill-current text-warning-ink" aria-label="Favori" role="img" />
+                              )}
+                            </span>
+                            <span className="block text-[11.5px] text-muted-foreground">
+                              Porte {preset.doorNumber} · impulsion {preset.pulseSeconds} s
+                            </span>
+                          </span>
+                          <ActionButton
+                            kind={device.canOpenDoor ? "primary" : "ghost"}
+                            size="sm"
+                            icon={LockOpen}
+                            className={cn(!device.canOpenDoor && "bg-muted text-muted-foreground", busy && "[&_svg]:animate-pulse")}
+                            onClick={() => void handleOpenPreset(device, preset)}
+                            disabled={busy || !device.canOpenDoor}
+                            title={!device.canOpenDoor
+                              ? "Commande d’ouverture non activée pour cet appareil"
+                              : readerNote ? "Envoie une demande au PC pilote" : "Ouvrir maintenant"}
+                          >
+                            Ouvrir
+                          </ActionButton>
+                        </div>
+                      );
+                    })}
+                    {note && (
+                      <div className="mt-2 flex items-start gap-1.5 text-[11.5px] leading-[1.45] text-muted-foreground">
+                        <Info className="mt-px h-3.5 w-3.5 shrink-0" />
+                        <span>{note}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
+    </div>
+  );
+}
+
+function Fact({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="min-w-0 rounded-[9px] bg-muted px-[9px] py-[7px]">
+      <div className="text-[10.5px] font-bold uppercase tracking-[0.05em] text-muted-foreground">{label}</div>
+      <div className={cn("truncate text-[12.5px] font-semibold", mono && "font-mono")} title={value}>{value}</div>
     </div>
   );
 }

@@ -2,20 +2,30 @@
 // reader — the door history of the drivers it reads, from the server (a reader never
 // connects to a turnstile).
 import { useCallback, useEffect, useState } from "react";
-import { Loader2, RefreshCw, Radio } from "lucide-react";
+import { Activity, Clock, Loader2, RadioTower, RefreshCw, Router } from "lucide-react";
 
 import { realtime, ROLE_LABEL_FR, type ReaderDoorEvent, type RealtimeStatus } from "@/api/realtime";
-import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { usePageChrome } from "@/context/PageChromeContext";
+import { ActionButton } from "@/components/ui/action-button";
+import { Chip } from "@/components/ui/chip";
+import { CellText, FlexCell, FlexRow, FlexTable, IconCell } from "@/components/ui/flex-table";
+import { KpiCard, KpiRow } from "@/components/ui/kpi-card";
+import { Note, Panel, PanelHeader } from "@/components/ui/panel";
+import { aDenyCopy } from "@/pages/PopupWindow";
 
 const AVAILABILITY_FR: Record<string, string> = {
   ON: "Serveur v2 actif",
   OFF: "Serveur sans v2 (fonctionnement habituel)",
   UNKNOWN: "Serveur injoignable pour l'instant (rôles du cache local)",
   NOT_STARTED: "Pas encore démarré",
+};
+
+// Server door-history credential types; anything else is shown as sent.
+const TYPE_FR: Record<string, string> = {
+  CARD: "Carte",
+  FINGER_PRINT: "Empreinte",
+  FACE_ID: "Visage",
+  QR_CODE: "QR Code",
 };
 
 function formatDate(value: string | null | undefined): string {
@@ -50,95 +60,136 @@ export default function RealtimePage() {
   const isReader = status?.role === "READER";
   useEffect(() => { if (isReader || (status?.readerOf?.length ?? 0) > 0) loadHistory(null); }, [isReader, status?.readerOf?.length, loadHistory]);
 
+  usePageChrome(() => ({
+    subtitle: isReader ? "Ce PC lit l'historique, il n'écrit dans aucun tourniquet" : "Qui écrit dans quel tourniquet",
+    actions: <ActionButton kind="outline" icon={RefreshCw} onClick={load}>Actualiser</ActionButton>,
+  }), [isReader, load]);
+
   if (!status) {
     return error
-      ? <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert>
-      : <div className="flex items-center gap-2 p-6 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />Chargement…</div>;
+      ? <Note tone="error">{error}</Note>
+      : <div className="flex items-center gap-2 p-6 text-[13.5px] text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" />Chargement…</div>;
   }
 
-  return (
-    <div className="flex flex-col gap-4 p-4">
-      <div className="flex items-center justify-end">
-        <Button variant="outline" size="sm" onClick={load}><RefreshCw className="mr-1 h-4 w-4" />Actualiser</Button>
-      </div>
+  const connected = !!status.socket?.connected;
+  const roleLabel = ROLE_LABEL_FR[status.role] ?? status.role;
 
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-        <Card><CardHeader className="pb-1"><CardTitle className="text-sm text-muted-foreground">Rôle de ce PC</CardTitle></CardHeader>
-          <CardContent className="text-base font-semibold">{ROLE_LABEL_FR[status.role] ?? status.role}
-            <div className="text-xs font-normal text-muted-foreground">{AVAILABILITY_FR[status.availability] ?? status.availability}</div>
-          </CardContent></Card>
-        <Card><CardHeader className="pb-1"><CardTitle className="text-sm text-muted-foreground">Connexion temps réel</CardTitle></CardHeader>
-          <CardContent className="flex items-center gap-2 text-sm">
-            <Radio className={status.socket?.connected ? "h-4 w-4 text-green-600" : "h-4 w-4 text-muted-foreground"} />
-            {status.socket?.connected ? "Connecté" : `Non connecté — vérification toutes les ${status.socket?.pollIntervalSec ?? 120} s`}
-          </CardContent></Card>
-        <Card><CardHeader className="pb-1"><CardTitle className="text-sm text-muted-foreground">Horloge (écart avec le serveur)</CardTitle></CardHeader>
-          <CardContent className="text-sm">{status.clock ? `${status.clock.offsetSec >= 0 ? "+" : ""}${status.clock.offsetSec.toFixed(1)} s` : "pas encore mesuré"}</CardContent></Card>
-      </div>
+  return (
+    <div className="flex flex-col gap-[18px]">
+      <KpiRow cols={3}>
+        <KpiCard
+          label="Rôle de ce PC"
+          value={<span title={roleLabel}>{roleLabel}</span>}
+          sub={AVAILABILITY_FR[status.availability] ?? status.availability}
+          icon={RadioTower}
+          tone="primary"
+        />
+        <KpiCard
+          label="Connexion temps réel"
+          value={connected ? "Connecté" : "Non connecté"}
+          sub={connected ? undefined : `Vérification toutes les ${status.socket?.pollIntervalSec ?? 120} s`}
+          subTone={connected ? undefined : "warning"}
+          icon={Activity}
+          tone={connected ? "success" : "grey"}
+        />
+        <KpiCard
+          label="Horloge (écart avec le serveur)"
+          value={status.clock ? `${status.clock.offsetSec >= 0 ? "+" : ""}${status.clock.offsetSec.toFixed(1).replace(".", ",")} s` : "pas encore mesuré"}
+          icon={Clock}
+          tone="info"
+        />
+      </KpiRow>
 
       {status.mode === "LEASED" && (
-        <Card>
-          <CardHeader className="pb-2"><CardTitle className="text-sm">Tourniquets pilotés par ce PC</CardTitle></CardHeader>
-          <CardContent>
-            {status.drive.length === 0 && status.release.length === 0
-              ? <div className="text-sm text-muted-foreground">Aucun : ce PC ne se connecte à aucun tourniquet.</div>
-              : (
-                <Table>
-                  <TableHeader><TableRow><TableHead>Tourniquet</TableHead><TableHead>État</TableHead><TableHead>Retraits</TableHead></TableRow></TableHeader>
-                  <TableBody>
-                    {status.drive.map((d) => (
-                      <TableRow key={d.gymDeviceId}>
-                        <TableCell>{d.name || d.gymDeviceId}</TableCell>
-                        <TableCell>{d.state === "DRIVE" ? <Badge variant="success">Piloté</Badge> : <Badge variant="outline">En attente de la passation</Badge>}</TableCell>
-                        <TableCell>{d.addOnly ? <Badge variant="warning">Ajouts seulement (relecture en attente)</Badge> : "Normaux"}</TableCell>
-                      </TableRow>
-                    ))}
-                    {status.release.map((r) => (
-                      <TableRow key={`r${r.gymDeviceId}`}>
-                        <TableCell>{r.name || r.gymDeviceId}</TableCell>
-                        <TableCell><Badge variant="warning">Passation en cours</Badge></TableCell>
-                        <TableCell>Aucune écriture jusqu'à la fin de la passation</TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              )}
-            {status.readerOf.length > 0 && (
-              <div className="mt-2 text-xs text-muted-foreground">Lit l'historique de : {status.readerOf.map((r) => r.name).join(", ")}</div>
-            )}
-          </CardContent>
-        </Card>
+        <Panel>
+          <PanelHeader title="Tourniquets pilotés par ce PC" sub="Un seul PC écrit dans chaque tourniquet" />
+          <FlexTable
+            label="Tourniquets pilotés par ce PC"
+            columns={[
+              { label: "Tourniquet", flex: 1.6 },
+              { label: "État", flex: 1.2 },
+              { label: "Retraits", flex: 2 },
+            ]}
+            empty="Aucun : ce PC ne se connecte à aucun tourniquet."
+            footer={status.readerOf.length > 0
+              ? <span>Lit l'historique de : {status.readerOf.map((r) => r.name).join(", ")}</span>
+              : undefined}
+          >
+            {status.drive.map((d) => (
+              <FlexRow key={d.gymDeviceId}>
+                <FlexCell flex={1.6}><IconCell icon={Router} tone="primary" title={d.name || d.gymDeviceId} /></FlexCell>
+                <FlexCell flex={1.2}>
+                  {d.state === "DRIVE"
+                    ? <Chip tone="success">Piloté</Chip>
+                    : <Chip tone="warning">En attente de la passation</Chip>}
+                </FlexCell>
+                <FlexCell flex={2}>
+                  {d.addOnly
+                    ? <Chip tone="warning">Ajouts seulement (relecture en attente)</Chip>
+                    : <Chip tone="grey">Normaux</Chip>}
+                </FlexCell>
+              </FlexRow>
+            ))}
+            {status.release.map((r) => (
+              <FlexRow key={`r${r.gymDeviceId}`}>
+                <FlexCell flex={1.6}><IconCell icon={Router} tone="primary" title={r.name || r.gymDeviceId} /></FlexCell>
+                <FlexCell flex={1.2}><Chip tone="info">Passation en cours</Chip></FlexCell>
+                <FlexCell flex={2}><Chip tone="grey">Aucune écriture jusqu'à la fin de la passation</Chip></FlexCell>
+              </FlexRow>
+            ))}
+          </FlexTable>
+        </Panel>
       )}
 
       {(isReader || status.readerOf.length > 0) && (
-        <Card>
-          <CardHeader className="pb-2"><CardTitle className="text-sm">Historique des portes (depuis le serveur)</CardTitle></CardHeader>
-          <CardContent>
-            <Table>
-              <TableHeader><TableRow><TableHead>Date</TableHead><TableHead>Tourniquet</TableHead><TableHead>Membre</TableHead><TableHead>Type</TableHead><TableHead>Résultat</TableHead></TableRow></TableHeader>
-              <TableBody>
-                {history.map((e) => (
-                  <TableRow key={e.id}>
-                    <TableCell>{formatDate(e.date)}</TableCell>
-                    <TableCell>{e.deviceName}</TableCell>
-                    <TableCell>{e.userName || "—"}</TableCell>
-                    <TableCell>{e.type}</TableCell>
-                    <TableCell>{e.allowed ? <Badge variant="success">Autorisé</Badge> : <Badge variant="destructive">{e.reason || "Refusé"}</Badge>}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-            {nextBefore && (
-              <Button className="mt-2" variant="outline" size="sm" disabled={loadingHistory} onClick={() => loadHistory(nextBefore)}>
-                {loadingHistory ? <Loader2 className="mr-1 h-4 w-4 animate-spin" /> : null}Plus
-              </Button>
-            )}
-          </CardContent>
-        </Card>
+        <Panel>
+          <PanelHeader title="Historique des portes" sub="Depuis le serveur · tourniquets des PC pilotes suivis" />
+          <FlexTable
+            label="Historique des portes"
+            columns={[
+              { label: "Date", flex: 1.1 },
+              { label: "Tourniquet", flex: 1.4 },
+              { label: "Membre", flex: 1.6 },
+              { label: "Type", flex: 0.9 },
+              { label: "Résultat", flex: 1.1, align: "right" },
+            ]}
+            empty={loadingHistory
+              ? <Loader2 className="mx-auto h-5 w-5 animate-spin text-primary" />
+              : "Aucun passage à afficher."}
+            footer={
+              <>
+                {nextBefore && (
+                  <ActionButton size="sm" icon={loadingHistory ? Loader2 : undefined} spin disabled={loadingHistory} onClick={() => loadHistory(nextBefore)}>
+                    Plus
+                  </ActionButton>
+                )}
+                <span>50 par page</span>
+              </>
+            }
+          >
+            {history.map((e) => {
+              // Refusals in the entry screen's French short copy; the raw code stays in the tooltip.
+              const deny = e.allowed ? null : aDenyCopy(e.reason || "");
+              return (
+                <FlexRow key={e.id} minHeight={50}>
+                  <FlexCell flex={1.1}><span className="truncate font-mono text-[12.5px] text-muted-foreground">{formatDate(e.date)}</span></FlexCell>
+                  <FlexCell flex={1.4}><CellText title={e.deviceName} /></FlexCell>
+                  <FlexCell flex={1.6}><CellText title={e.userName || "—"} strong /></FlexCell>
+                  <FlexCell flex={0.9}><CellText title={TYPE_FR[e.type] ?? e.type} /></FlexCell>
+                  <FlexCell flex={1.1} align="right">
+                    {deny
+                      ? <Chip tone="error" title={e.reason || undefined}>{deny.short}</Chip>
+                      : <Chip tone="success">Autorisé</Chip>}
+                  </FlexCell>
+                </FlexRow>
+              );
+            })}
+          </FlexTable>
+        </Panel>
       )}
 
       {(status.lastError || error) && (
-        <Alert variant="warning"><AlertDescription>{status.lastError || error}</AlertDescription></Alert>
+        <Note tone="warning">{status.lastError || error}</Note>
       )}
     </div>
   );

@@ -410,14 +410,14 @@ fn rebuild_tray_menu(
     devices: &[DeviceInfo],
 ) -> Result<(), Box<dyn std::error::Error>> {
     // ── Show ──
-    let show_item = MenuItemBuilder::with_id("tray_show", "Afficher").build(app)?;
+    let show_item = MenuItemBuilder::with_id("tray_show", "Afficher MonClub Access").build(app)?;
     // ── Sync Now ──
     let sync_item = MenuItemBuilder::with_id("tray_sync", "Synchroniser").build(app)?;
     // ── Scan Card ──
-    let scan_item = MenuItemBuilder::with_id("tray_scan", "Scanner carte").build(app)?;
+    let scan_item = MenuItemBuilder::with_id("tray_scan", "Scanner une carte").build(app)?;
 
     // ── Open submenu (devices → presets) ──
-    let mut open_sub = SubmenuBuilder::with_id(app, "tray_open", "Ouvrir porte");
+    let mut open_sub = SubmenuBuilder::with_id(app, "tray_open", "Ouvrir une porte");
 
     if devices.is_empty() {
         let no_dev = MenuItemBuilder::with_id("tray_no_devices", "Aucun appareil")
@@ -473,9 +473,9 @@ fn rebuild_tray_menu(
 
     // ── Separator + Quit ──
     let quit_item = MenuItemBuilder::with_id("tray_quit", "Quitter").build(app)?;
-    let panel_item = MenuItemBuilder::with_id("tray_panel", "Show panel").build(app)?;
-    let favorites_item = MenuItemBuilder::with_id("tray_favorites", "Favoris").build(app)?;
-    let popup_item = MenuItemBuilder::with_id("tray_popup", "Écran Notification").build(app)?;
+    let panel_item = MenuItemBuilder::with_id("tray_panel", "Panneau rapide").build(app)?;
+    let favorites_item = MenuItemBuilder::with_id("tray_favorites", "Accès rapide (favoris)").build(app)?;
+    let popup_item = MenuItemBuilder::with_id("tray_popup", "Écran d’entrée").build(app)?;
 
     let menu = MenuBuilder::new(app)
         .item(&show_item)
@@ -1468,13 +1468,13 @@ fn unregister_favorite_shortcuts(app: AppHandle) -> Result<(), String> {
 fn setup_access_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::error::Error>> {
     let icon = desktop_window_icon("access")?;
 
-    let show_item = MenuItemBuilder::with_id("tray_show", "Afficher").build(app)?;
-    let panel_item = MenuItemBuilder::with_id("tray_panel", "Show panel").build(app)?;
-    let favorites_item = MenuItemBuilder::with_id("tray_favorites", "Favoris").build(app)?;
-    let popup_item = MenuItemBuilder::with_id("tray_popup", "Écran Notification").build(app)?;
+    let show_item = MenuItemBuilder::with_id("tray_show", "Afficher MonClub Access").build(app)?;
+    let panel_item = MenuItemBuilder::with_id("tray_panel", "Panneau rapide").build(app)?;
+    let favorites_item = MenuItemBuilder::with_id("tray_favorites", "Accès rapide (favoris)").build(app)?;
+    let popup_item = MenuItemBuilder::with_id("tray_popup", "Écran d’entrée").build(app)?;
     let sync_item = MenuItemBuilder::with_id("tray_sync", "Synchroniser").build(app)?;
-    let scan_item = MenuItemBuilder::with_id("tray_scan", "Scanner carte").build(app)?;
-    let open_sub = SubmenuBuilder::with_id(app, "tray_open", "Ouvrir porte")
+    let scan_item = MenuItemBuilder::with_id("tray_scan", "Scanner une carte").build(app)?;
+    let open_sub = SubmenuBuilder::with_id(app, "tray_open", "Ouvrir une porte")
         .item(
             &MenuItemBuilder::with_id("tray_no_devices", "Chargement…")
                 .enabled(false)

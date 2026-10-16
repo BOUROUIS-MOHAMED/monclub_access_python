@@ -38,6 +38,18 @@ import { get, post } from "@/api/client";
 import { useFavoritePresets } from "@/api/hooks";
 import type { FavoriteDoorPresetDto } from "@/api/types";
 import { doorRequestedMessage } from "@/api/realtime";
+import { INK, SOFT, type Tone } from "@/components/ui/tone";
+import {
+  Check,
+  CircleAlert,
+  CircleCheck,
+  CircleX,
+  LockOpen,
+  RefreshCw,
+  Send,
+  X,
+  type LucideIcon,
+} from "lucide-react";
 
 // ── Anchor ────────────────────────────────────────────────────────────────────
 type Anchor =
@@ -91,7 +103,36 @@ function clamp(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
 }
 
-type FlashState = { key: string; ok: boolean; msg: string } | null;
+// Flash tones: success = the controller accepted the open command; info = filed for the
+// PC pilote (its result is not visible here); warning = filed but the PC pilote is
+// offline, so it will expire; error = refused or failed.
+type FlashTone = Extract<Tone, "success" | "info" | "warning" | "error">;
+type FlashState = { key: string; tone: FlashTone; msg: string } | null;
+
+const FLASH_ICON: Record<FlashTone, LucideIcon> = {
+  success: CircleCheck, info: Send, warning: CircleAlert, error: CircleX,
+};
+const FLASH_END_ICON: Record<FlashTone, LucideIcon> = {
+  success: Check, info: Send, warning: CircleAlert, error: X,
+};
+const ITEM_HIT: Record<FlashTone, string> = {
+  success: "border-success/45 bg-success/8",
+  info: "border-info/45 bg-info/8",
+  warning: "border-warning/45 bg-warning/8",
+  error: "border-error/45 bg-error/8",
+};
+const KBD = "rounded border border-grey/40 bg-muted px-1 font-mono";
+
+// The Rust shortcut handler (src-tauri/src/lib.rs, `favorite-shortcut-triggered`)
+// reports a door request filed for the PC pilote as ok=false with one of these two
+// texts. They are not failures: map them to info / warning here. If the Rust text
+// changes, these fall back to the red error flash.
+const RUST_REQUEST_SENT = "demandé au PC pilote (résultat non visible ici)";
+const RUST_REQUEST_DRIVER_OFFLINE = "PC pilote non connecté : la demande expirera sans ouvrir";
+
+function lowerFirst(text: string): string {
+  return text ? text.charAt(0).toLowerCase() + text.slice(1) : text;
+}
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 function StarIcon({ className, size = 15 }: { className?: string; size?: number }) {
@@ -329,11 +370,17 @@ export default function FavoritesOverlayPage() {
         }>("favorite-shortcut-triggered", (event) => {
           const p = event.payload;
           const label = p.doorName?.trim() || p.deviceName || `Favori ${p.favoriteId}`;
-          setFlash({
-            key: `sc-${p.favoriteId}-${Date.now()}`,
-            ok: p.ok,
-            msg: p.ok ? `⌨ ${p.shortcut} → ${label}` : `${label}: ${p.error ?? "erreur"}`,
-          });
+          // Keyed on the favourite so its row lights up like a click would.
+          const key = String(p.favoriteId);
+          if (p.ok) {
+            setFlash({ key, tone: "success", msg: `${p.shortcut} → ${label} : ouverture acceptée` });
+          } else if (p.error === RUST_REQUEST_SENT) {
+            setFlash({ key, tone: "info", msg: `${p.shortcut} → ${label} : demande envoyée au PC pilote. Son résultat n'est pas visible ici.` });
+          } else if (p.error === RUST_REQUEST_DRIVER_OFFLINE) {
+            setFlash({ key, tone: "warning", msg: `${p.shortcut} → ${label} : demande enregistrée, mais le PC pilote n'est pas connecté : elle expirera sans ouvrir.` });
+          } else {
+            setFlash({ key, tone: "error", msg: `${p.shortcut} → ${label} : ${p.error ?? "erreur"}` });
+          }
           // Briefly expand so the toast is visible when the user triggered
           // the shortcut from another app.
           doOpenRef.current();
@@ -371,8 +418,8 @@ export default function FavoritesOverlayPage() {
           const p = event.payload;
           setFlash({
             key: `scan-${Date.now()}`,
-            ok: p.ok,
-            msg: p.ok ? `🪪 ${p.card}` : `Scan: ${p.error ?? "erreur"}`,
+            tone: p.ok ? "success" : "error",
+            msg: p.ok ? `Carte scannée : ${p.card}` : `Scan : ${p.error ?? "erreur"}`,
           });
           doOpenRef.current();
           if (autoCollapseTimer) clearTimeout(autoCollapseTimer);
@@ -455,10 +502,17 @@ export default function FavoritesOverlayPage() {
         pulseSeconds: fav.pulseSeconds,
       });
       // P3b-2: another PC drives this turnstile -- filed for it, not opened here.
-      if (res?.requested) setFlash({ key, ok: false, msg: `${favoriteTitle(fav, index)}: ${doorRequestedMessage(res)}` });
-      else setFlash({ key, ok: true, msg: favoriteTitle(fav, index) });
+      // That is information (blue), or a warning when the PC pilote is offline —
+      // never the red error it used to be.
+      const title = favoriteTitle(fav, index);
+      if (res?.requested) {
+        setFlash({ key, tone: res.targetConnected ? "info" : "warning", msg: `${title} : ${lowerFirst(doorRequestedMessage(res))}` });
+      } else {
+        // A 2xx means the controller accepted the command, not that the door was seen opening.
+        setFlash({ key, tone: "success", msg: `${title} : ouverture acceptée` });
+      }
     } catch (err) {
-      setFlash({ key, ok: false, msg: String(err) });
+      setFlash({ key, tone: "error", msg: `${favoriteTitle(fav, index)} : ${String(err)}` });
     } finally {
       setBusyKey(null);
     }
@@ -577,14 +631,10 @@ export default function FavoritesOverlayPage() {
     : /* bottom */      "0 -4px 24px 5px hsl(var(--primary) / 0.5)";
 
   // Base gradient direction (from edge face outward)
-  const pillGradient =
-    edge === "right"
-      ? "linear-gradient(168deg, hsl(var(--primary)) 0%, hsl(var(--primary)) 45%, hsl(var(--primary) / 0.82) 100%)"
-      : edge === "left"
-        ? "linear-gradient(-168deg, hsl(var(--primary)) 0%, hsl(var(--primary)) 45%, hsl(var(--primary) / 0.82) 100%)"
-      : edge === "top"
-        ? "linear-gradient(258deg, hsl(var(--primary)) 0%, hsl(var(--primary)) 45%, hsl(var(--primary) / 0.82) 100%)"
-        : "linear-gradient(78deg, hsl(var(--primary)) 0%, hsl(var(--primary)) 45%, hsl(var(--primary) / 0.82) 100%)";
+  // Design ramp (light blue → primary → dark blue), from the docked edge outward.
+  // White text on saturated blue: the same in light and dark mode.
+  const pillAngle = isVertical ? "180deg" : "90deg";
+  const pillGradient = `linear-gradient(${pillAngle}, #2D8CFF 0%, hsl(var(--primary)) 55%, #0C44AE 100%)`;
 
   // Panel border-radius — rounded on the side facing away from the edge.
   const panelRadius =
@@ -596,10 +646,10 @@ export default function FavoritesOverlayPage() {
   // Accent stripe position on the panel (along the docked edge inside)
   const accentStripeStyle: React.CSSProperties = isVertical
     ? { height: 3, width: "100%", background:
-        "linear-gradient(90deg, hsl(var(--primary)) 0%, hsl(var(--primary)/0.45) 75%, transparent 100%)",
+        "linear-gradient(90deg, hsl(var(--primary)) 0%, hsl(var(--info)) 100%)",
         borderRadius: edge === "right" ? "20px 0 0 0" : "0 20px 0 0" }
     : { width: 3, height: "100%", background:
-        "linear-gradient(180deg, hsl(var(--primary)) 0%, hsl(var(--primary)/0.45) 75%, transparent 100%)",
+        "linear-gradient(180deg, hsl(var(--primary)) 0%, hsl(var(--info)) 100%)",
         borderRadius: edge === "top" ? "0 0 0 20px" : "0 20px 0 0" };
 
   // ────────────────────────────────────────────────────────────────────────────
@@ -629,9 +679,9 @@ export default function FavoritesOverlayPage() {
 
         {/* ── Collapsed handle ──────────────────────────────────────────────
             `z-0` establishes a stacking context so the `z-10` used on
-            chevrons/dots inside the pill stays CONTAINED to the handle.
+            chevrons/label inside the pill stays CONTAINED to the handle.
             Without it those inner elements would bleed above the expanded
-            panel — you'd see the orange edge and the arrow tip poking
+            panel — you'd see the edge and the arrow tip poking
             through while the panel is open. */}
         <div
           className="absolute cursor-pointer select-none z-0"
@@ -654,7 +704,7 @@ export default function FavoritesOverlayPage() {
 
           {/* Main pill */}
           <div
-            className={`relative flex ${handleFlexDir} items-center justify-between ${handleRadius} ${isVertical ? "h-full w-full px-1 py-2.5" : "h-full w-full px-2.5 py-1"}`}
+            className={`relative flex ${handleFlexDir} items-center justify-between text-white ${handleRadius} ${isVertical ? "h-full w-full px-1 py-3" : "h-full w-full px-3 py-1"}`}
             style={{
               transform: showHoverEffect ? `${handleHoverShift} scale(1.04)` : "translate3d(0,0,0) scale(1)",
               transition: "transform 200ms cubic-bezier(0.22, 0.9, 0.28, 1)",
@@ -692,14 +742,18 @@ export default function FavoritesOverlayPage() {
                 willChange: "transform",
               }}
             >
-              <ChevronIcon direction={chevronDir} className="text-primary-foreground/90" />
+              <ChevronIcon direction={chevronDir} className="text-white/90" />
             </div>
 
-            {/* Middle grab-bar dots */}
-            <div className={`relative z-10 flex ${isVertical ? "flex-col" : "flex-row"} gap-1`}>
-              <div className="h-[3px] w-[3px] rounded-full bg-primary-foreground/45" />
-              <div className="h-[3px] w-[3px] rounded-full bg-primary-foreground/45" />
-              <div className="h-[3px] w-[3px] rounded-full bg-primary-foreground/45" />
+            {/* Star + « FAVORIS » label (vertical on a side edge) */}
+            <div className={`relative z-10 flex ${isVertical ? "flex-col" : "flex-row"} items-center gap-2`}>
+              <StarIcon size={15} />
+              <span
+                className="text-[11px] font-extrabold tracking-[0.18em]"
+                style={isVertical ? { writingMode: "vertical-rl", transform: "rotate(180deg)" } : undefined}
+              >
+                FAVORIS
+              </span>
             </div>
 
             {/* Second chevron */}
@@ -711,7 +765,7 @@ export default function FavoritesOverlayPage() {
                 willChange: "transform",
               }}
             >
-              <ChevronIcon direction={chevronDir} className="text-primary-foreground/90" />
+              <ChevronIcon direction={chevronDir} className="text-white/90" />
             </div>
           </div>
         </div>
@@ -720,15 +774,15 @@ export default function FavoritesOverlayPage() {
         {panelMounted && (
           <div className="absolute inset-0 z-10" style={panelTransitionStyle}>
             <div
-              className="flex h-full w-full flex-col overflow-hidden"
+              className="flex h-full w-full flex-col overflow-hidden text-foreground"
               style={{
                 borderRadius: panelRadius,
-                background: "hsl(var(--background) / 0.86)",
+                background: "hsl(var(--card) / 0.93)",
                 backdropFilter: "blur(16px) saturate(1.3)",
                 WebkitBackdropFilter: "blur(16px) saturate(1.3)",
-                border: "1px solid hsl(var(--border) / 0.5)",
+                border: "1px solid hsl(var(--grey) / 0.32)",
                 boxShadow:
-                  "-14px 0 48px rgba(0,0,0,0.32), " +
+                  "-14px 0 48px rgba(0,0,0,0.28), " +
                   "-3px 0 10px rgba(0,0,0,0.12), " +
                   "inset 1px 0 0 hsl(var(--foreground) / 0.04)",
               }}
@@ -737,98 +791,77 @@ export default function FavoritesOverlayPage() {
               <div className="shrink-0" style={accentStripeStyle} />
 
               {/* Header */}
-              <div className="flex shrink-0 items-center justify-between border-b border-border/40 px-4 py-2.5">
-                <div className="flex items-center gap-2">
-                  <div
-                    className="flex h-5 w-5 items-center justify-center rounded-md"
-                    style={{ background: "hsl(var(--primary) / 0.14)" }}
-                  >
-                    <StarIcon className="text-primary" size={11} />
-                  </div>
-                  <span className="text-[11px] font-bold uppercase tracking-[0.2em] text-primary">
-                    Accès rapide
-                  </span>
-                </div>
-                <div className="flex items-center gap-1">
-                  {/* Manual sync — refetches from the remote server so new
-                      dashboard favorites appear without waiting for auto-sync. */}
-                  <button
-                    type="button"
-                    disabled={syncing}
-                    className="flex h-6 w-6 items-center justify-center rounded-full text-muted-foreground/60
-                               transition-all duration-150 hover:bg-muted hover:text-foreground
-                               focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50
-                               disabled:opacity-50"
-                    onClick={async () => {
-                      if (syncing) return;
-                      setSyncing(true);
-                      try {
-                        // `forceDeviceRefresh` strips the devicesVersion token
-                        // on the client so the server must re-send full device
-                        // state (including preset favoriteEnabled changes —
-                        // those don't bump the backend's devicesVersion).
-                        await post("/sync/now", {
-                          entityType: "FAVORITE",
-                          forceDeviceRefresh: true,
-                          reason: "user_manual_favorites_refresh",
-                        });
-                        // Give the backend a moment to populate, then reload.
-                        window.setTimeout(() => { reload(); setSyncing(false); }, 2000);
-                      } catch (e) {
-                        setFlash({ key: "sync", ok: false, msg: String(e) });
-                        setSyncing(false);
-                      }
-                    }}
-                    aria-label="Synchroniser les favoris"
-                    title="Synchroniser les favoris depuis le serveur"
-                  >
-                    <svg
-                      width="11" height="11" viewBox="0 0 12 12" fill="none"
-                      className={syncing ? "animate-spin" : ""}
-                    >
-                      <path d="M10.5 6a4.5 4.5 0 1 1-1.32-3.18M10.5 1.5V4.5H7.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                  </button>
-                  <button
-                    type="button"
-                    className="flex h-6 w-6 items-center justify-center rounded-full text-muted-foreground/60
-                               transition-all duration-150 hover:rotate-90 hover:bg-muted hover:text-foreground
-                               focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
-                    onClick={doClose}
-                    aria-label="Réduire le panneau favoris"
-                  >
-                    <svg width="9" height="9" viewBox="0 0 10 10" fill="none">
-                      <path d="M2 2L8 8M8 2L2 8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-                    </svg>
-                  </button>
-                </div>
+              <div className="flex shrink-0 items-center gap-2 border-b border-dashed border-grey/32 py-2.5 pl-3.5 pr-3">
+                <span className="grid h-[22px] w-[22px] place-items-center rounded-[7px] bg-primary/14 text-primary">
+                  <StarIcon size={12} />
+                </span>
+                <h1 className="m-0 flex-1 text-[12px] font-extrabold tracking-[0.16em] text-primary-ink">
+                  ACCÈS RAPIDE
+                </h1>
+                {/* Manual sync — refetches from the remote server so new
+                    dashboard favorites appear without waiting for auto-sync. */}
+                <button
+                  type="button"
+                  disabled={syncing}
+                  className="grid h-7 w-7 place-items-center rounded-full text-muted-foreground
+                             transition-colors duration-150 hover:bg-muted hover:text-foreground
+                             focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50
+                             disabled:opacity-50"
+                  onClick={async () => {
+                    if (syncing) return;
+                    setSyncing(true);
+                    try {
+                      // `forceDeviceRefresh` strips the devicesVersion token
+                      // on the client so the server must re-send full device
+                      // state (including preset favoriteEnabled changes —
+                      // those don't bump the backend's devicesVersion).
+                      await post("/sync/now", {
+                        entityType: "FAVORITE",
+                        forceDeviceRefresh: true,
+                        reason: "user_manual_favorites_refresh",
+                      });
+                      // Give the backend a moment to populate, then reload.
+                      window.setTimeout(() => { reload(); setSyncing(false); }, 2000);
+                    } catch (e) {
+                      setFlash({ key: "sync", tone: "error", msg: `Synchronisation : ${String(e)}` });
+                      setSyncing(false);
+                    }
+                  }}
+                  aria-label="Synchroniser les favoris depuis le serveur"
+                  title="Synchroniser les favoris depuis le serveur"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${syncing ? "animate-spin" : ""}`} />
+                </button>
+                <button
+                  type="button"
+                  className="grid h-7 w-7 place-items-center rounded-full text-muted-foreground
+                             transition-colors duration-150 hover:bg-muted hover:text-foreground
+                             focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+                  onClick={doClose}
+                  aria-label="Réduire le panneau favoris"
+                  title="Réduire (Échap)"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
               </div>
 
               {/* Flash banner */}
-              {flash && (
-                <div
-                  className={[
-                    "mx-3 mt-2.5 shrink-0 flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-medium",
-                    "animate-in fade-in slide-in-from-top-1 duration-200",
-                    flash.ok
-                      ? "bg-emerald-500/15 text-emerald-400 ring-1 ring-emerald-500/25"
-                      : "bg-destructive/15 text-destructive ring-1 ring-destructive/25",
-                  ].join(" ")}
-                >
-                  {flash.ok ? (
-                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="shrink-0">
-                      <circle cx="6" cy="6" r="5.5" stroke="currentColor" strokeOpacity="0.5" />
-                      <path d="M3.5 6L5.2 7.7L8.5 4.3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                  ) : (
-                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="shrink-0">
-                      <circle cx="6" cy="6" r="5.5" stroke="currentColor" strokeOpacity="0.5" />
-                      <path d="M4 4L8 8M8 4L4 8" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-                    </svg>
-                  )}
-                  <span className="truncate">{flash.msg}</span>
-                </div>
-              )}
+              {flash && (() => {
+                const FlashIcon = FLASH_ICON[flash.tone];
+                return (
+                  <div
+                    role="status"
+                    className={[
+                      "mx-2.5 mt-2.5 flex shrink-0 items-start gap-2 rounded-[10px] px-2.5 py-2 text-[12px] font-semibold leading-[1.4]",
+                      "animate-in fade-in slide-in-from-top-1 duration-200",
+                      SOFT[flash.tone],
+                    ].join(" ")}
+                  >
+                    <FlashIcon className="mt-px h-[15px] w-[15px] shrink-0" />
+                    <span className="min-w-0 break-words">{flash.msg}</span>
+                  </div>
+                );
+              })()}
 
               {/* List — single column for vertical panel (right/left anchor);
                   two-column grid for horizontal panel (top/bottom anchor)
@@ -836,17 +869,17 @@ export default function FavoritesOverlayPage() {
                   empty bands next to each row. */}
               <div
                 className={[
-                  "flex-1 overflow-y-auto overflow-x-hidden px-2.5 pb-3 pt-2.5",
-                  isVertical ? "space-y-1" : "grid grid-cols-2 gap-1.5 content-start",
+                  "flex-1 overflow-y-auto overflow-x-hidden p-2.5",
+                  isVertical ? "space-y-1.5" : "grid grid-cols-2 gap-1.5 content-start",
                 ].join(" ")}
               >
 
                 {loading && favorites.length === 0 && (
-                  <div className={isVertical ? "space-y-1.5 px-0.5" : "contents"}>
+                  <div className={isVertical ? "space-y-1.5" : "contents"}>
                     {Array.from({ length: 4 }).map((_, i) => (
                       <div
                         key={i}
-                        className="h-[52px] animate-pulse rounded-2xl bg-muted/40"
+                        className="h-[52px] animate-pulse rounded-[14px] bg-muted"
                         style={{ opacity: 1 - i * 0.2, animationDelay: `${i * 80}ms` }}
                       />
                     ))}
@@ -856,7 +889,7 @@ export default function FavoritesOverlayPage() {
                 {!loading && favorites.length === 0 && (
                   <div
                     className={[
-                      "flex flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-border bg-muted/20 py-8 px-4 text-center",
+                      "mx-2 mt-[30px] rounded-[14px] border border-dashed border-grey/50 px-4 py-[26px] text-center text-[12.5px] leading-normal text-muted-foreground",
                       !isVertical && "col-span-2",
                     ].filter(Boolean).join(" ")}
                     style={{
@@ -865,26 +898,18 @@ export default function FavoritesOverlayPage() {
                       transition: "opacity 280ms ease-out 80ms, transform 280ms cubic-bezier(0.22,0.9,0.28,1) 80ms",
                     }}
                   >
-                    <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-muted/50">
-                      <StarIcon className="text-muted-foreground/50" />
-                    </div>
-                    <p className="text-xs text-muted-foreground leading-relaxed">
-                      Aucun favori synchronisé.
-                      <br />
-                      <span className="text-muted-foreground/60">
-                        Marquez des presets depuis le dashboard.
-                      </span>
-                    </p>
+                    <div className="font-bold text-foreground">Aucun favori synchronisé</div>
+                    Marquez des presets de portes comme favoris dans le tableau de bord MonClub, puis synchronisez.
                   </div>
                 )}
 
                 {favorites.map((fav, i) => {
                   const key    = String(fav.id);
                   const busy   = busyKey === key;
-                  const didFlash = flash?.key === key;
-                  const isOk   = didFlash && flash?.ok;
-                  const isErr  = didFlash && !flash?.ok;
+                  const hitTone: Tone | null = flash?.key === key ? flash.tone : null;
                   const isKb   = kbIndex === i;
+                  const shortcut = typeof fav.favoriteShortcut === "string" ? fav.favoriteShortcut.trim() : "";
+                  const EndIcon = hitTone ? FLASH_END_ICON[hitTone] : LockOpen;
 
                   const delay = panelOpen ? Math.min(i * 22, 200) : 0;
 
@@ -896,16 +921,14 @@ export default function FavoritesOverlayPage() {
                       onClick={() => void handleOpen(fav, i)}
                       onMouseEnter={() => setKbIndex(i)}
                       className={[
-                        "group relative flex w-full items-center gap-3 rounded-2xl border px-3 py-2.5",
-                        "text-left transition-[background,border-color,transform,box-shadow] duration-150",
-                        "disabled:opacity-50 focus:outline-none",
-                        isOk
-                          ? "border-emerald-500/35 bg-emerald-500/10"
-                          : isErr
-                            ? "border-destructive/35 bg-destructive/10"
-                            : isKb
-                              ? "border-primary/45 bg-primary/8 shadow-[0_0_0_1px_hsl(var(--primary)/0.2)]"
-                              : "border-border/50 bg-card/60 hover:border-primary/30 hover:bg-primary/5",
+                        "group relative flex w-full items-center gap-2.5 rounded-[14px] border px-2.5 py-2",
+                        "text-left text-foreground transition-[background,border-color,transform,box-shadow] duration-150",
+                        "disabled:opacity-60 focus:outline-none",
+                        hitTone
+                          ? ITEM_HIT[hitTone]
+                          : isKb
+                            ? "border-primary/45 bg-primary/6"
+                            : "border-grey/28 bg-card/70 hover:border-primary/30 hover:bg-primary/5",
                         "active:scale-[0.98]",
                       ].join(" ")}
                       style={{
@@ -923,61 +946,49 @@ export default function FavoritesOverlayPage() {
                     >
                       <span
                         className={[
-                          "flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-[11px] font-bold",
-                          "transition-all duration-200",
-                          isOk
-                            ? "bg-emerald-500/22 text-emerald-400 scale-110"
-                            : isErr
-                              ? "bg-destructive/22 text-destructive scale-105"
-                              : "bg-primary/12 text-primary group-hover:bg-primary/20 group-hover:scale-105",
+                          "grid h-[34px] w-[34px] shrink-0 place-items-center rounded-[10px] font-num text-[15px] font-extrabold",
+                          "transition-colors duration-200",
+                          hitTone === "success" ? "bg-success/18 text-success-ink" : "bg-primary/12 text-primary-ink",
                         ].join(" ")}
                       >
                         {slotBadge(fav.favoriteOrder ?? i)}
                       </span>
 
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate text-[13px] font-semibold leading-tight text-foreground">
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-[13.5px] font-bold leading-tight">
                           {favoriteTitle(fav, i)}
-                        </div>
-                        <div className="mt-0.5 flex items-center gap-1 text-[10px] text-muted-foreground">
-                          <span className="truncate">{fav.deviceName || "Appareil"}</span>
-                          <span className="opacity-40">·</span>
-                          <span className="shrink-0">{fav.pulseSeconds}s</span>
-                        </div>
-                      </div>
+                        </span>
+                        <span className="mt-0.5 block truncate text-[11.5px] text-muted-foreground">
+                          {fav.deviceName || "Appareil"} · {fav.pulseSeconds} s
+                        </span>
+                      </span>
+
+                      {shortcut && (
+                        <span
+                          className="inline-flex h-5 shrink-0 items-center whitespace-nowrap rounded-[5px] border border-grey/40 bg-muted px-[5px] font-mono text-[10.5px] text-muted-foreground"
+                          title={`Raccourci clavier : ${shortcut}`}
+                        >
+                          {shortcut}
+                        </span>
+                      )}
 
                       <span className="flex h-4 w-4 shrink-0 items-center justify-center">
-                        {busy && (
+                        {busy ? (
                           <svg className="h-4 w-4 animate-spin text-primary" viewBox="0 0 24 24" fill="none">
                             <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" opacity="0.2" />
                             <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
                           </svg>
-                        )}
-                        {!busy && isOk && (
-                          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" className="text-emerald-400">
-                            <path d="M3 7L5.8 9.8L11 4.2" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-                          </svg>
-                        )}
-                        {!busy && isErr && (
-                          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" className="text-destructive">
-                            <path d="M4 4L10 10M10 4L4 10" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-                          </svg>
-                        )}
-                        {!busy && !didFlash && (
-                          <svg
-                            width="12"
-                            height="12"
-                            viewBox="0 0 12 12"
-                            fill="none"
+                        ) : (
+                          <EndIcon
                             className={[
-                              "transition-all duration-200",
-                              isKb
-                                ? "text-primary translate-x-0.5"
-                                : "text-transparent group-hover:text-primary/55 group-hover:translate-x-0.5",
+                              "h-[15px] w-[15px] transition-colors duration-200",
+                              hitTone
+                                ? INK[hitTone]
+                                : isKb
+                                  ? "text-primary"
+                                  : "text-grey group-hover:text-primary",
                             ].join(" ")}
-                          >
-                            <path d="M2 6H10M7 3L10 6L7 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                          </svg>
+                          />
                         )}
                       </span>
                     </button>
@@ -987,16 +998,13 @@ export default function FavoritesOverlayPage() {
 
               {/* Footer */}
               {!loading && favorites.length > 0 && (
-                <div className="shrink-0 border-t border-border/30 px-4 py-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[9px] font-medium uppercase tracking-[0.15em] text-muted-foreground/45">
-                      {favorites.length} favori{favorites.length > 1 ? "s" : ""}
-                    </span>
-                    <span className="text-[9px] text-muted-foreground/35">
-                      <kbd className="rounded border border-border/40 bg-muted/30 px-1 font-mono">Esc</kbd>
-                      <span className="ml-1">fermer</span>
-                    </span>
-                  </div>
+                <div className="flex shrink-0 items-center justify-between gap-2 border-t border-dashed border-grey/32 px-3.5 py-2 text-[11px] text-muted-foreground">
+                  <span className="font-bold uppercase tracking-[0.08em]">
+                    {favorites.length} favori{favorites.length > 1 ? "s" : ""}
+                  </span>
+                  <span className="whitespace-nowrap">
+                    <kbd className={KBD}>↑↓</kbd> choisir · <kbd className={KBD}>Entrée</kbd> ouvrir · <kbd className={KBD}>Échap</kbd> fermer
+                  </span>
                 </div>
               )}
             </div>
