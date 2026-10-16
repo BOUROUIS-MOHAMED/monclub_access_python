@@ -14,8 +14,9 @@
 // the Agent nav item (only when AGENT devices exist), the logout and tray-quit
 // dialogs, and the PC identity banner under the header.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Outlet, NavLink, useLocation, useNavigate } from "react-router-dom";
+import { get } from "@/api/client";
 import { useApp } from "@/context/AppContext";
 import { useTrayIntegration } from "@/hooks/useTrayIntegration";
 import { usePageChromeValue } from "@/context/PageChromeContext";
@@ -203,6 +204,28 @@ export default function MainLayout() {
   const showHealth = status?.ultra?.drivesTurnstiles !== false && ultraWorkers.length > 0;
   const healthConnected = ultraWorkers.filter((d) => d?.connected).length;
   const healthTone: Tone = healthConnected === ultraWorkers.length ? "success" : "error";
+
+  // Beside it: how many ACTIVE declared devices have an IP address (Appareils' « Adresse
+  // absente » rule; inactive devices are not counted). Read from the synced roster once,
+  // then again after each sync -- no polling of its own. The roster payload also carries
+  // each device's password, so it is reduced to two numbers right here and never kept.
+  const lastSyncAt = status?.sync?.lastSyncAt ?? null;
+  const [addressCount, setAddressCount] = useState<{ withAddress: number; active: number } | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await get<{ devices?: any[] }>("/sync/cache/devices", { includeDoorPresets: "0" });
+        const active = (res.devices ?? []).filter((d) => d && d.active !== false);
+        const withAddress = active.filter((d) => String(d.ip ?? d.ipAddress ?? "").trim() !== "").length;
+        if (!cancelled) setAddressCount({ withAddress, active: active.length });
+      } catch {
+        if (!cancelled) setAddressCount(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [lastSyncAt]);
+  const addressTone: Tone = addressCount && addressCount.withAddress < addressCount.active ? "warning" : "grey";
 
   // The account row shows the e-mail's local part — SessionBlock carries no
   // person name or role.
@@ -442,6 +465,24 @@ export default function MainLayout() {
                 </span>
               </TooltipTrigger>
               <TooltipContent side="bottom">Appareils ULTRA connectés à ce poste</TooltipContent>
+            </Tooltip>
+          )}
+          {showHealth && addressCount && addressCount.active > 0 && (
+            <Tooltip delayDuration={0}>
+              <TooltipTrigger asChild>
+                <span
+                  className={cn(
+                    "inline-flex h-8 shrink-0 items-center whitespace-nowrap rounded-lg px-[11px] text-[13px] font-bold",
+                    SOFT[addressTone],
+                  )}
+                >
+                  {addressCount.withAddress} / {addressCount.active} avec adresse
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="max-w-[300px]">
+                Appareils actifs déclarés dans MonClub qui ont une adresse IP (les appareils inactifs ne sont pas comptés).
+                {addressCount.withAddress < addressCount.active && " Ajoutez l'adresse manquante dans le tableau de bord, puis synchronisez."}
+              </TooltipContent>
             </Tooltip>
           )}
         </header>
