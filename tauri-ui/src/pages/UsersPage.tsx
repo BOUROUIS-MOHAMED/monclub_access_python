@@ -1573,6 +1573,7 @@ export default function UsersPage() {
                 ["Actifs", rosterCounts.active ?? 0, CircleCheck, "success"],
                 ["Expirés", rosterCounts.expired ?? 0, CircleX, "error"],
                 ["En attente (créés hors ligne)", rosterCounts.pending ?? 0, CloudUpload, "info"],
+                ["dont hors des tourniquets (gel, fin, début à venir)", rosterCounts.held ?? 0, Snowflake, "grey"],
               ] as const).map(([l, v, icon, tone]) => (
                 <ListRow
                   key={l}

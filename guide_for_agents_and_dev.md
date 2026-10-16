@@ -4825,13 +4825,16 @@ the membership in `sync_users` nor `sync_users_held`. `[CODE]`
   the `ix_access_history_user_door_day` prefix, no new index. A row resolved to another plan of the
   same person carries its own `activeMembershipId` and the card marks it « autre abonnement ». Rows
   are shaped like the dashboard feed (`_handle_dashboard_overview`): time = `event_time`, else
-  `created_at`; device name from the synced devices; door number; `method` from
+  `created_at` (the list is ORDERED by `created_at`, so a late-arriving device record can sit above a
+  later-timed one); device name from the synced devices; door number; `method` from
   `_credential_type_from_raw`; the raw refusal code, worded in the UI by `aDenyCopy(reason).short`.
   Limits, said in the card's footnote: only events THIS PC stored (a READER PC under driver leases,
   or a gym whose turnstiles another PC drives, may have few or none); `user_id` is filled at insert
   by the AGENT and ULTRA writers only, so DEVICE-mode attendance and unresolved events are not
   listed; rows are pruned after the backend `history_retention_days` (`retentionDays` in the
-  answer, from `settings_reader.get_backend_global_settings`) once uploaded (§3.5). `[TEST:
+  answer, from `settings_reader.get_backend_global_settings`) once uploaded (§3.5). The ULTRA writer
+  stores `user_id` = the resolved roster row's `userId` (`ultra_engine.py`, `_resolved_user_id`), the
+  same id space as `sync_users.user_id`. `[TEST:
   tests/test_member_card_details.py::TestMemberHistory]`
 - **Freeze (« Gel ») and held members.** From the protocol-2 data of §3.8, never `datetime.now()`:
   `_member_freeze_facts` returns None (the card says « non connu ») without an `access_v2_state`
@@ -4844,8 +4847,11 @@ the membership in `sync_users` nor `sync_users_held`. `[CODE]`
   `_list_held_users_for_roster`, template-free like the roster read): a member frozen today used to
   vanish from Utilisateurs. Each carries `heldReason` / `heldForDate` / `heldToday` and gets a flag
   (« gelé aujourd'hui », « gelé », « pas encore commencé », « hors des tourniquets »); an id on both
-  tables is listed once (the `sync_users` row). Counts (« abonnements sur ce poste ») include them,
-  like `db.list_local_member_ids` (a held member is still in the server's list). Nothing on the door
+  tables is listed once (the `sync_users` row); `heldToday` also needs trusted windows. Counts
+  (« abonnements sur ce poste ») include them, like `db.list_local_member_ids` (a held member is
+  still in the server's list); their status stays the `validTo` one (a member frozen today counts in
+  « Actifs »), so `counts.held` is returned too and L'effectif shows « dont hors des tourniquets ».
+  A failed held read is logged and the roster falls back to `sync_users` only. Nothing on the door
   path reads the roster. `[TEST: tests/test_member_card_details.py::TestFreeze,
   ::TestHeldMembersOnTheRoster]`
 - **Names on « Modifications d'abonnement ».** `GET /api/v2/mutations` (`_handle_mutations_list`)

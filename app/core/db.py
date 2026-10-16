@@ -8110,7 +8110,8 @@ def list_members_roster(
     today = datetime.now().date()
 
     enriched: List[Dict[str, Any]] = []
-    counts = {"all": 0, "active": 0, "expired": 0, "pending": 0}
+    # "held" is not a status: those rows are also counted in active/expired by validTo.
+    counts = {"all": 0, "active": 0, "expired": 0, "pending": 0, "held": 0}
     for u in users:
         row = dict(u)
         pending = bool(u.get("offlinePending"))
@@ -8136,6 +8137,8 @@ def list_members_roster(
         enriched.append(row)
         counts["all"] += 1
         counts[st] = counts.get(st, 0) + 1
+        if u.get("heldReason"):
+            counts["held"] += 1
 
     s = (status or "all").strip().lower()
     if s in ("active", "expired", "pending"):
@@ -8183,7 +8186,8 @@ def list_members_roster(
 def _list_held_users_for_roster(skip_ids: set) -> List[Dict[str, Any]]:
     """sync_users_held rows as roster payloads, template-free (fingerprints_json is not
     selected), each with ``heldReason`` / ``heldForDate`` and ``heldToday`` (held for the gym
-    date last applied by a flip). An id already on sync_users is skipped."""
+    date last applied by a flip, windows trusted). An id already on sync_users is skipped.
+    A read failure is logged and gives [] (the roster then shows sync_users only, as before)."""
     try:
         with get_conn() as conn:
             cols = [r[1] for r in conn.execute("PRAGMA table_info(sync_users_held)").fetchall()]
@@ -8193,10 +8197,11 @@ def _list_held_users_for_roster(skip_ids: set) -> List[Dict[str, Any]]:
             rows = [dict(r) for r in conn.execute(
                 "SELECT " + ", ".join(f'"{c}"' for c in keep) + " FROM sync_users_held"
             ).fetchall()]
-            st = conn.execute("SELECT applied_date FROM access_v2_state WHERE id = 1").fetchone()
+            st = conn.execute("SELECT applied_date, trusted FROM access_v2_state WHERE id = 1").fetchone()
     except Exception:
+        logging.getLogger(__name__).warning("members roster: held rows unreadable", exc_info=True)
         return []
-    applied = str(st[0]) if st is not None and st[0] else None
+    applied = str(st[0]) if st is not None and st[0] and st[1] else None
     out: List[Dict[str, Any]] = []
     for r in rows:
         amid = _to_int_or_none(r.get("active_membership_id"))

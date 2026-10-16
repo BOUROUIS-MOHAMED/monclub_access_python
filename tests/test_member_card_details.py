@@ -382,7 +382,7 @@ class TestHeldMembersOnTheRoster:
 
         rows, total, counts = db.list_members_roster()
 
-        assert total == 2 and counts["all"] == 2
+        assert total == 2 and counts["all"] == 2 and counts["held"] == 1
         held = {r["activeMembershipId"]: r for r in rows}[7]
         assert held["heldReason"] == "frozen" and held["heldToday"] is True
         assert held["fingerprints"] == []
@@ -396,6 +396,14 @@ class TestHeldMembersOnTheRoster:
 
         rows, total, _ = db.list_members_roster(q="member 700")
         assert total == 1 and rows[0]["heldReason"] == "expired" and rows[0]["heldToday"] is False
+
+    def test_held_today_needs_trusted_windows(self, db):
+        db.upsert_delta_users([_user(7, 700, card="1007")])
+        _v2_state(db, trusted=0, applied="2026-10-16")
+        _hold(db, 7, reason="frozen", for_date="2026-10-16")
+
+        rows, _, _ = db.list_members_roster()
+        assert rows[0]["heldReason"] == "frozen" and rows[0]["heldToday"] is False
 
     def test_an_id_on_both_tables_is_listed_once(self, db):
         db.upsert_delta_users([_user(7, 700, card="1007")])
