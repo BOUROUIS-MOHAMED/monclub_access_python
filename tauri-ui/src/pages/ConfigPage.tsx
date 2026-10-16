@@ -178,6 +178,12 @@ import { usePageChrome } from "@/context/PageChromeContext";
 import { ArrowRightLeft } from "lucide-react";
 import { hasAgentDevices } from "@/lib/agentMode";
 import { cn } from "@/lib/utils";
+import { ActionButton } from "@/components/ui/action-button";
+import { Chip } from "@/components/ui/chip";
+import { DialogFrame, DialogRow, DialogSection } from "@/components/ui/dialog-frame";
+import { LineTabs } from "@/components/ui/line-tabs";
+import { ListRow, Note, PageGrid, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
+import { Power, ScanLine, Volume2, Router, CircleAlert, LockOpen } from "lucide-react";
 
 export default function ConfigPage() {
   const { status } = useApp();
@@ -215,6 +221,10 @@ export default function ConfigPage() {
     antiFraudDuration: false,
     antiFraudDailyLimit: false,
   });
+
+  // Unsaved edits (key → value), refreshed on every render below. The
+  // immediate-save controls read it so a save or a reload never erases them.
+  const pendingEditsRef = useRef<Record<string, any>>({});
 
   const broadcastFeedbackConfig = useCallback((nextCfg: Record<string, any>) => {
     if (typeof window === "undefined") return;
@@ -255,6 +265,15 @@ export default function ConfigPage() {
 
   useEffect(() => { loadConfig(); }, [loadConfig]);
 
+  // Same GET as loadConfig (it IS loadConfig), then the unsaved edits are put
+  // back on screen — except `savedKeys`, which must show the server's value.
+  const reloadKeepingEdits = useCallback(async (savedKeys: string[] = []) => {
+    const keep = { ...pendingEditsRef.current };
+    for (const k of savedKeys) delete keep[k];
+    await loadConfig();
+    if (Object.keys(keep).length) setCfg((p) => ({ ...p, ...keep }));
+  }, [loadConfig]);
+
   const handleSave = async () => {
     setSaving(true); setError(null); setSuccess(false);
     try {
@@ -290,13 +309,18 @@ export default function ConfigPage() {
     try {
       const res = await patch<any>("/config", changes);
       const nextCfg = res.config || optimistic;
-      setCfg(nextCfg);
+      // The answer is the WHOLE saved config: taking all of it erased every
+      // unsaved edit on the page. Take only the keys just saved, and count
+      // them as saved (baseline) so they never show as « non enregistré ».
+      const saved = Object.fromEntries(Object.keys(changes).map((k) => [k, nextCfg[k]]));
+      setCfg((p) => ({ ...p, ...saved }));
+      setBaseline((b) => ({ ...b, ...saved }));
       broadcastFeedbackConfig(nextCfg);
     } catch (e) {
       setError(String(e));
-      await loadConfig();
+      await reloadKeepingEdits(Object.keys(changes));
     }
-  }, [broadcastFeedbackConfig, cfg, loadConfig]);
+  }, [broadcastFeedbackConfig, cfg, reloadKeepingEdits]);
 
   const handleFeedbackSoundUpload = useCallback(async (kind: FeedbackSoundKind, file: File | null) => {
     if (!file) return;
@@ -310,7 +334,7 @@ export default function ConfigPage() {
     }));
     try {
       await uploadFeedbackSound(kind, file);
-      await loadConfig();
+      await reloadKeepingEdits();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -326,7 +350,7 @@ export default function ConfigPage() {
       if (kind === "anti-fraud-duration" && antiFraudDurationSoundInputRef.current) antiFraudDurationSoundInputRef.current.value = "";
       if (kind === "anti-fraud-daily-limit" && antiFraudDailyLimitSoundInputRef.current) antiFraudDailyLimitSoundInputRef.current.value = "";
     }
-  }, [loadConfig]);
+  }, [reloadKeepingEdits]);
 
   const handleFeedbackSoundReset = useCallback(async (kind: FeedbackSoundKind) => {
     setError(null);
@@ -339,7 +363,7 @@ export default function ConfigPage() {
     }));
     try {
       await resetFeedbackSound(kind);
-      await loadConfig();
+      await reloadKeepingEdits();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -351,7 +375,7 @@ export default function ConfigPage() {
         antiFraudDailyLimit: kind === "anti-fraud-daily-limit" ? false : prev.antiFraudDailyLimit,
       }));
     }
-  }, [loadConfig]);
+  }, [reloadKeepingEdits]);
 
   const handleStartupToggle = async (enabled: boolean) => {
     const previous = Boolean(cfg.start_on_system_startup ?? false);
@@ -360,6 +384,7 @@ export default function ConfigPage() {
     setError(null);
     try {
       await patch("/config", { start_on_system_startup: enabled });
+      setBaseline((b) => ({ ...b, start_on_system_startup: enabled }));
     } catch (e) {
       setCfg((p) => ({ ...p, start_on_system_startup: previous }));
       setError(String(e));
@@ -393,6 +418,7 @@ export default function ConfigPage() {
   const changes = Object.keys({ ...baseline, ...cfg })
     .filter((k) => JSON.stringify(baseline[k]) !== JSON.stringify(cfg[k]))
     .map((k) => ({ key: k, from: baseline[k], to: cfg[k] }));
+  pendingEditsRef.current = Object.fromEntries(changes.map((c) => [c.key, c.to]));
 
   const fmtVal = (v: any): string => {
     if (v === true) return "activé";
@@ -402,31 +428,34 @@ export default function ConfigPage() {
     return String(v).slice(0, 40);
   };
 
+  // ── Access v5 (boards S22 / S23): sections become tabs ────────────────
+  type ConfigTab = "updates" | "startup" | "dock" | "scanner" | "feedback" | "advanced";
+  const [section, setSection] = useState<ConfigTab>("updates");
+
   usePageChrome(() => ({
-    fill: true,
     subtitle: changes.length > 0 ? (
-      <span className="inline-flex h-[22px] items-center rounded-lg bg-amber-500/[0.14] px-2 text-[11px] font-bold text-amber-700 dark:text-amber-400">
+      <Chip tone="warning">
         {changes.length} modification{changes.length > 1 ? "s" : ""} non enregistrée{changes.length > 1 ? "s" : ""}
-      </span>
-    ) : undefined,
+      </Chip>
+    ) : "Réglages de ce poste",
     actions: (
       <>
-        <Button
-          variant="outline"
-          className="h-[30px] gap-1.5 rounded-[14px] px-[13px] text-[12px] font-semibold"
+        <ActionButton
+          kind="outline"
           onClick={() => { setCfg(baseline); setDirty(false); }}
           disabled={changes.length === 0 || saving}
         >
           Annuler
-        </Button>
-        <Button
-          className="h-[34px] gap-[7px] rounded-full px-[18px] text-[12.5px] font-bold shadow-[0_8px_20px_rgba(226,32,63,0.22)]"
+        </ActionButton>
+        <ActionButton
+          kind={dirty ? "primary" : "outline"}
+          icon={saving ? Loader2 : Save}
+          spin={saving}
           onClick={handleSave}
           disabled={!dirty || saving}
         >
-          {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
           Enregistrer
-        </Button>
+        </ActionButton>
       </>
     ),
     // Primitives only — see PageChromeContext: an unstable dep loops the effect.
@@ -436,840 +465,537 @@ export default function ConfigPage() {
     return <div className="flex items-center justify-center py-20"><Loader2 className="h-8 w-8 animate-spin text-primary" /></div>;
   }
 
+  // « Enregistré automatiquement »: these controls PATCH the moment they change
+  // (startup switch, every Sons et animations control). They never count as
+  // unsaved and Annuler does not touch them.
+  const AUTO = (
+    <Chip tone="info" size="sm" className="ml-2 align-[1px]">Enregistré automatiquement</Chip>
+  );
+  const SEPARATE_SAVE = (
+    <Chip tone="grey" size="sm" className="ml-2 align-[1px]">Avec « Enregistrer »</Chip>
+  );
+
+  // Readers: a standalone terminal is held by its ULTRA worker and never shows in
+  // the PullSDK session (`status.pullsdk`), so that flag alone said « non connecté »
+  // on MB2000 gyms. Same rule as ProfilePage.
+  const ultraWorkers = Object.values(status?.ultra?.devices ?? {});
+  const ultraConnected = ultraWorkers.filter((d: any) => d?.connected).length;
+  const readerValue = ultraWorkers.length > 0
+    ? `${ultraConnected} / ${ultraWorkers.length} connecté${ultraWorkers.length > 1 ? "s" : ""}`
+    : status?.pullsdk?.connected
+      ? `PullSDK · ${status.pullsdk.ip || "connecté"}`
+      : "aucun connecté";
+  const readerTone = ultraWorkers.length > 0
+    ? (ultraConnected === ultraWorkers.length ? "success" : ultraConnected > 0 ? "warning" : "error")
+    : status?.pullsdk?.connected ? "success" : "grey";
+
+  const soundFileRow = (opts: {
+    uploading: boolean; fileName: string | null | undefined;
+    inputRef: React.MutableRefObject<HTMLInputElement | null>; kind: FeedbackSoundKind;
+  }) => (
+    <DialogRow
+      label={<>Fichier du son{AUTO}</>}
+      hint={opts.fileName ? `Actuel : ${opts.fileName}` : "Aucun son personnalisé sélectionné."}
+    >
+      <input
+        ref={opts.inputRef}
+        type="file"
+        accept=".mp3,.wav,.ogg,.m4a,audio/*"
+        className="hidden"
+        onChange={(event) => { void handleFeedbackSoundUpload(opts.kind, event.target.files?.[0] ?? null); }}
+      />
+      <ActionButton
+        kind="outline"
+        size="md"
+        icon={opts.uploading ? Loader2 : Upload}
+        spin={opts.uploading}
+        disabled={opts.uploading}
+        onClick={() => opts.inputRef.current?.click()}
+      >
+        {opts.fileName ? "Remplacer le son" : "Choisir un son"}
+      </ActionButton>
+      <ActionButton
+        kind="ghost"
+        size="md"
+        icon={RotateCcw}
+        disabled={opts.uploading || !opts.fileName}
+        onClick={() => { void handleFeedbackSoundReset(opts.kind); }}
+      >
+        Réinitialiser
+      </ActionButton>
+    </DialogRow>
+  );
+
+  const sourceSelect = (key: string) => (
+    <Select
+      value={String(cfg[key] || "default")}
+      onValueChange={(value) => { void patchFeedbackConfig({ [key]: value }); }}
+    >
+      <SelectTrigger className="h-9 w-[220px] rounded-lg border-grey/32 bg-card shadow-none"><SelectValue /></SelectTrigger>
+      <SelectContent>
+        <SelectItem value="default">Son par défaut</SelectItem>
+        <SelectItem value="custom">Son personnalisé</SelectItem>
+      </SelectContent>
+    </Select>
+  );
+
+  const fbSwitch = (id: string, key: string, def: boolean) => (
+    <Switch
+      id={id}
+      checked={Boolean(cfg[key] ?? def)}
+      onCheckedChange={(checked: boolean) => { void patchFeedbackConfig({ [key]: checked }); }}
+    />
+  );
+
+  const SECTIONS: { value: ConfigTab; label: string; icon: typeof Download }[] = [
+    { value: "updates", label: "Mises à jour", icon: Download },
+    { value: "startup", label: "Démarrage Windows", icon: Power },
+    { value: "dock", label: "Dock des favoris", icon: Star },
+    { value: "scanner", label: "Lecteur de cartes", icon: ScanLine },
+    { value: "feedback", label: "Sons et animations", icon: Volume2 },
+    { value: "advanced", label: "Paramètres avancés", icon: advancedUnlocked ? Unlock : Lock },
+  ];
+  const sectionTitle = SECTIONS.find((s) => s.value === section)?.label ?? "";
+
   return (
-    <div className="flex h-full min-h-0 gap-4">
-      {/* ── Le sujet : les réglages ─────────────────────────────────────── */}
-      <div className="flex min-w-0 flex-1 flex-col gap-[11px] overflow-y-auto pr-1">
-        <div className="flex flex-none items-center gap-[9px]">
-          <Settings className="h-[17px] w-[17px] text-primary" />
-          <span className="font-display text-[13px] font-extrabold tracking-[-0.01em] text-foreground">
-            Réglages du poste
-          </span>
-        </div>
+    <div className="flex flex-col gap-[18px]">
+      <LineTabs<ConfigTab> className="-mt-1" value={section} onChange={setSection} items={SECTIONS} />
 
-      {error && <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert>}
-      {success && <Alert variant="success"><CheckCircle className="h-4 w-4" /><AlertDescription>Configuration enregistrée !</AlertDescription></Alert>}
+      {error && <Note tone="error">{error}</Note>}
+      {success && <Note tone="success" className="flex items-center gap-2"><CheckCircle className="h-4 w-4" />Configuration enregistrée !</Note>}
 
-      {/* Updates section — always visible */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm flex items-center gap-2"><Download className="h-4 w-4" /> Mises à jour</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="flex items-center justify-between">
-            <div className="space-y-1">
-              <p className="text-sm">Composant: <code className="bg-muted px-1.5 py-0.5 rounded text-xs">{updates?.componentDisplayName || "MonClub Access"}</code></p>
-              <p className="text-sm">Version actuelle: <code className="bg-muted px-1.5 py-0.5 rounded text-xs">{currentVersionDisplay}</code></p>
-              <p className="text-xs text-muted-foreground">Canal {updates?.channel || "stable"} · Plateforme {updates?.platform || "WINDOWS"}</p>
-              {updates?.updateAvailable ? (
-                <Badge variant="warning" className="text-xs">Mise à jour disponible</Badge>
-              ) : (
-                <p className="text-sm text-muted-foreground">Aucune mise à jour disponible.</p>
-              )}
-            </div>
-            {updates?.updateAvailable && (
-              <Button size="sm" variant="outline" onClick={() => setUpdateDialog(true)}>
-                <Info className="h-3.5 w-3.5" /> Détails
-              </Button>
+      <PageGrid>
+        <Panel className="col-span-8">
+          <PanelHeader
+            title={sectionTitle}
+            sub={section === "feedback"
+              ? "Chaque réglage de cet onglet est enregistré dès que vous le changez."
+              : section === "dock" || section === "scanner" || (section === "advanced" && advancedUnlocked)
+                ? "Les changements de cet onglet s'appliquent avec « Enregistrer » en haut de la page."
+                : undefined}
+          />
+          <div className="px-[18px] pb-4 pt-1">
+
+            {/* ── Mises à jour ─────────────────────────────────────────── */}
+            {section === "updates" && (
+              <>
+                <DialogRow
+                  label={updates?.componentDisplayName || "MonClub Access"}
+                  hint={`Canal ${updates?.channel || "stable"} · plateforme ${updates?.platform || "WINDOWS"}`}
+                >
+                  <span className="inline-flex h-9 items-center rounded-lg bg-muted px-3 font-mono text-[13px]">{currentVersionDisplay}</span>
+                </DialogRow>
+                {updates?.updateAvailable ? (
+                  <DialogRow
+                    label={`Version ${updates.latestVersion ?? ""} disponible`}
+                    hint={updates.downloaded ? "Téléchargée — à installer à la fermeture du club." : "À installer à la fermeture du club."}
+                  >
+                    <ActionButton kind="outline" size="md" icon={Info} onClick={() => setUpdateDialog(true)}>Voir les détails</ActionButton>
+                  </DialogRow>
+                ) : (
+                  <DialogRow label="Aucune mise à jour disponible." className="border-b-0" />
+                )}
+              </>
             )}
-          </div>
-        </CardContent>
-      </Card>
 
-      {/* Advanced settings — locked by default */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm flex items-center gap-2"><Settings className="h-4 w-4" /> Demarrage Windows</CardTitle>
-        </CardHeader>
-        <CardContent className="flex items-start justify-between gap-4">
-          <div className="space-y-1">
-            <Label htmlFor="start-on-windows-switch">Ouvrir MonClub Access avec Windows</Label>
-            <p className="text-sm text-muted-foreground">
-              Quand cette option est activee, MonClub Access est ajoute au demarrage de Windows et son interface s&apos;ouvre automatiquement a l&apos;ouverture de session.
-            </p>
-            <p className="text-xs text-muted-foreground">
-              En mode developpement, la preference est enregistree, mais l&apos;inscription au demarrage Windows ne s&apos;applique que sur les builds installes.
-            </p>
-          </div>
-          <div className="flex items-center gap-3">
-            {startupSaving && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
-            <Switch
-              id="start-on-windows-switch"
-              checked={Boolean(cfg.start_on_system_startup ?? false)}
-              onCheckedChange={(checked: boolean) => { void handleStartupToggle(checked); }}
-            />
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Watchdog (design section 12) — self-contained card */}
-      <WatchdogCard />
-
-      {/* Favorites overlay position — always visible */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm flex items-center gap-2">
-            <Star className="h-4 w-4" /> Overlay favoris — Position
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
-            <div className="space-y-1 max-w-md">
-              <Label>Emplacement du dock flottant</Label>
-              <p className="text-sm text-muted-foreground">
-                Choisissez l&apos;un des 12 points d&apos;ancrage pour le panneau d&apos;accès rapide.
-                Le panneau s&apos;ouvrira dans la direction opposée au bord sélectionné.
-              </p>
-              <p className="text-xs text-muted-foreground">
-                La nouvelle position s&apos;applique après avoir cliqué sur <strong>Enregistrer</strong>.
-              </p>
-            </div>
-            <OverlayAnchorPicker
-              value={
-                isOverlayAnchor(cfg.favorites_overlay_anchor)
-                  ? cfg.favorites_overlay_anchor
-                  : "right-center"
-              }
-              onChange={(next) => update("favorites_overlay_anchor", next)}
-            />
-          </div>
-
-          <Separator />
-
-          <div className="flex items-start justify-between gap-4">
-            <div className="space-y-1 max-w-md">
-              <Label htmlFor="fav-show-all-switch">Afficher tous les presets de portes</Label>
-              <p className="text-sm text-muted-foreground">
-                Quand activé, le panneau liste <strong>tous</strong> les presets synchronisés,
-                pas seulement ceux marqués comme favoris sur le tableau de bord.
-                Les favoris apparaissent en premier.
-              </p>
-            </div>
-            <Switch
-              id="fav-show-all-switch"
-              checked={Boolean(cfg.favorites_overlay_show_all_presets ?? false)}
-              onCheckedChange={(checked: boolean) =>
-                update("favorites_overlay_show_all_presets", checked)
-              }
-            />
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Card scanner settings — always visible */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm flex items-center gap-2">
-            <CreditCard className="h-4 w-4" /> Lecteur de cartes
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          {/* Mode toggle */}
-          <div className="flex items-center justify-between">
-            <div className="space-y-1">
-              <Label>Mode de connexion</Label>
-              <p className="text-sm text-muted-foreground">
-                SCR100 via le réseau (TCP/IP port 4370)
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              <Select
-                value={cfg.scanner_mode || "zkemkeeper"}
-                onValueChange={(value) => {
-                  update("scanner_mode", value);
-                }}
-              >
-                <SelectTrigger className="w-[240px]">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="zkemkeeper"><Wifi className="h-3.5 w-3.5" /> SCR100 ZKEMKeeper</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-
-          {/* Network mode settings */}
-          {(cfg.scanner_mode === "zkemkeeper" || !cfg.scanner_mode) && (
-            <div className="space-y-3 pt-2 border-t border-border/40">
-              <div className="flex items-end gap-2">
-                <div className="flex-1 space-y-1">
-                  <Label htmlFor="scanner-ip">Adresse IP du SCR100</Label>
-                  <Input
-                    id="scanner-ip"
-                    placeholder="192.168.1.201"
-                    value={cfg.scanner_network_ip || ""}
-                    onChange={(e) => update("scanner_network_ip", e.target.value)}
-                  />
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => startDiscover()}
-                  disabled={discovering}
-                  title="Scanner le réseau pour trouver les appareils ZKTeco (port 4370)"
-                >
-                  {discovering ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Search className="h-4 w-4" />
-                  )}
-                  {discovering ? "Scan..." : "Détecter"}
-                </Button>
-              </div>
-
-              {/* Discovered devices list */}
-              {discoveredDevices.length > 0 && (
-                <div className="space-y-1">
-                  <p className="text-xs text-muted-foreground">
-                    {discoveredDevices.length} appareil(s) trouvé(s) :
-                  </p>
-                  {discoveredDevices.map((dev: DiscoveredDevice) => (
-                    <button
-                      key={dev.ip}
-                      className="w-full flex items-center justify-between px-3 py-2 rounded-md border border-border hover:bg-accent text-left text-sm transition-colors"
-                      onClick={() => {
-                        update("scanner_network_ip", dev.ip);
-                      }}
-                    >
-                      <span className="flex items-center gap-2">
-                        <Radio className="h-3.5 w-3.5 text-emerald-500" />
-                        <code className="text-xs font-mono">{dev.ip}</code>
-                        {dev.serialNumber && (
-                          <span className="text-xs text-muted-foreground">
-                            — {dev.serialNumber}
-                          </span>
-                        )}
+            {/* ── Démarrage Windows ────────────────────────────────────── */}
+            {section === "startup" && (
+              <>
+                <DialogRow
+                  label={<label htmlFor="start-on-windows-switch">Ouvrir MonClub Access avec Windows{AUTO}</label>}
+                  hint={(
+                    <>
+                      Quand cette option est activée, MonClub Access est ajouté au démarrage de Windows et son
+                      interface s&apos;ouvre automatiquement à l&apos;ouverture de session.
+                      <span className="mt-1 block text-[12px]">
+                        En mode développement, la préférence est enregistrée, mais l&apos;inscription au démarrage
+                        Windows ne s&apos;applique que sur les builds installés.
                       </span>
-                      <span className="text-xs text-muted-foreground">{dev.model}</span>
-                    </button>
-                  ))}
+                    </>
+                  )}
+                >
+                  {startupSaving && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
+                  <Switch
+                    id="start-on-windows-switch"
+                    checked={Boolean(cfg.start_on_system_startup ?? false)}
+                    onCheckedChange={(checked: boolean) => { void handleStartupToggle(checked); }}
+                  />
+                </DialogRow>
+                {/* Watchdog — self-contained card (its own switch and confirm). */}
+                <div className="mt-4">
+                  <WatchdogCard />
                 </div>
-              )}
+              </>
+            )}
 
-              {!discovering && discoveredDevices.length === 0 && cfg.scanner_network_ip && (
-                <p className="text-xs text-muted-foreground">
-                  IP configurée : <code className="bg-muted px-1 rounded">{cfg.scanner_network_ip}</code>
-                </p>
-              )}
-            </div>
-          )}
+            {/* ── Dock des favoris ─────────────────────────────────────── */}
+            {section === "dock" && (
+              <>
+                <DialogRow
+                  label={<>Emplacement du dock flottant{SEPARATE_SAVE}</>}
+                  hint={(
+                    <>
+                      Choisissez l&apos;un des 6 points d&apos;ancrage pour le panneau d&apos;accès rapide.
+                      Le panneau s&apos;ouvrira dans la direction opposée au bord sélectionné.
+                    </>
+                  )}
+                >
+                  <OverlayAnchorPicker
+                    value={
+                      isOverlayAnchor(cfg.favorites_overlay_anchor)
+                        ? cfg.favorites_overlay_anchor
+                        : "right-center"
+                    }
+                    onChange={(next) => update("favorites_overlay_anchor", next)}
+                  />
+                </DialogRow>
+                <DialogRow
+                  label={<label htmlFor="fav-show-all-switch">Afficher tous les presets de portes{SEPARATE_SAVE}</label>}
+                  hint="Quand activé, le panneau liste tous les presets synchronisés, pas seulement ceux marqués comme favoris sur le tableau de bord. Les favoris apparaissent en premier."
+                  className="border-b-0"
+                >
+                  <Switch
+                    id="fav-show-all-switch"
+                    checked={Boolean(cfg.favorites_overlay_show_all_presets ?? false)}
+                    onCheckedChange={(checked: boolean) =>
+                      update("favorites_overlay_show_all_presets", checked)
+                    }
+                  />
+                </DialogRow>
+              </>
+            )}
 
-        </CardContent>
-      </Card>
+            {/* ── Lecteur de cartes ────────────────────────────────────── */}
+            {section === "scanner" && (
+              <>
+                <DialogRow label="Mode de connexion" hint="SCR100 via le réseau (TCP/IP port 4370)">
+                  <Select
+                    value={cfg.scanner_mode || "zkemkeeper"}
+                    onValueChange={(value) => {
+                      update("scanner_mode", value);
+                    }}
+                  >
+                    <SelectTrigger className="h-9 w-[240px] rounded-lg border-grey/32 bg-card shadow-none">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="zkemkeeper"><Wifi className="h-3.5 w-3.5" /> SCR100 ZKEMKeeper</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </DialogRow>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm flex items-center gap-2">
-            <Music4 className="h-4 w-4" /> Feedback
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-5">
-          <div className="space-y-3">
-            <div className="flex items-start justify-between gap-4">
-              <div className="space-y-1">
-                <Label>Push appareil réussi</Label>
-                <p className="text-sm text-muted-foreground">
+                {/* Network mode settings */}
+                {(cfg.scanner_mode === "zkemkeeper" || !cfg.scanner_mode) && (
+                  <>
+                    <DialogRow
+                      label={<label htmlFor="scanner-ip">Adresse IP du SCR100</label>}
+                      hint={!discovering && discoveredDevices.length === 0 && cfg.scanner_network_ip
+                        ? <>IP configurée : <span className="font-mono">{cfg.scanner_network_ip}</span></>
+                        : undefined}
+                    >
+                      <Input
+                        id="scanner-ip"
+                        placeholder="192.168.1.201"
+                        value={cfg.scanner_network_ip || ""}
+                        onChange={(e) => update("scanner_network_ip", e.target.value)}
+                        className="h-9 w-[180px] rounded-lg border-grey/32 font-mono"
+                      />
+                    </DialogRow>
+                    <DialogRow
+                      label="Détecter sur le réseau"
+                      hint="Cherche les appareils ZKTeco qui répondent sur le port 4370"
+                      className={discoveredDevices.length > 0 ? undefined : "border-b-0"}
+                    >
+                      <ActionButton
+                        kind="outline"
+                        size="md"
+                        icon={discovering ? Loader2 : Search}
+                        spin={discovering}
+                        onClick={() => startDiscover()}
+                        disabled={discovering}
+                        title="Scanner le réseau pour trouver les appareils ZKTeco (port 4370)"
+                      >
+                        {discovering ? "Scan…" : "Détecter"}
+                      </ActionButton>
+                    </DialogRow>
+
+                    {/* Discovered devices list */}
+                    {discoveredDevices.length > 0 && (
+                      <div className="space-y-1.5 pt-3">
+                        <Note tone="success">
+                          {discoveredDevices.length} appareil{discoveredDevices.length > 1 ? "s" : ""} trouvé{discoveredDevices.length > 1 ? "s" : ""} — cliquez pour utiliser son adresse :
+                        </Note>
+                        {discoveredDevices.map((dev: DiscoveredDevice) => (
+                          <button
+                            key={dev.ip}
+                            type="button"
+                            className="flex w-full cursor-pointer items-center justify-between rounded-lg border border-grey/32 px-3 py-2 text-left text-[13.5px] transition-colors hover:bg-muted"
+                            onClick={() => {
+                              update("scanner_network_ip", dev.ip);
+                            }}
+                          >
+                            <span className="flex items-center gap-2">
+                              <Radio className="h-3.5 w-3.5 text-success-ink" />
+                              <span className="font-mono text-[13px]">{dev.ip}</span>
+                              {dev.serialNumber && (
+                                <span className="text-[12.5px] text-muted-foreground">— {dev.serialNumber}</span>
+                              )}
+                            </span>
+                            <span className="text-[12.5px] text-muted-foreground">{dev.model}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+              </>
+            )}
+
+            {/* ── Sons et animations (all saved immediately) ───────────── */}
+            {section === "feedback" && (
+              <>
+                <DialogSection>Envoi réussi vers un appareil</DialogSection>
+                <p className="text-[12.5px] text-muted-foreground">
                   Son et animation quand les données sont poussées avec succès vers un appareil ZKTeco.
+                  Son par défaut : <span className="font-mono">{DEFAULT_FEEDBACK_SOUNDS.device_push_success}</span> ·
+                  animation : <span className="font-mono">{DEFAULT_FEEDBACK_ANIMATIONS.device_push_success}</span>
                 </p>
-                <p className="text-xs text-muted-foreground">
-                  Son par défaut : <code className="bg-muted px-1 rounded">{DEFAULT_FEEDBACK_SOUNDS.device_push_success}</code>
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  Animation : <code className="bg-muted px-1 rounded">{DEFAULT_FEEDBACK_ANIMATIONS.device_push_success}</code>
-                </p>
-              </div>
-              <div className="grid min-w-[180px] gap-3">
-                <div className="flex items-center justify-between gap-3">
-                  <Label htmlFor="push-success-sound-switch" className="text-xs">Son</Label>
-                  <Switch
-                    id="push-success-sound-switch"
-                    checked={Boolean(cfg.push_success_sound_enabled ?? true)}
-                    onCheckedChange={(checked: boolean) => { void patchFeedbackConfig({ push_success_sound_enabled: checked }); }}
-                  />
-                </div>
-                <div className="flex items-center justify-between gap-3">
-                  <Label htmlFor="push-success-animation-switch" className="text-xs">Animation</Label>
-                  <Switch
-                    id="push-success-animation-switch"
-                    checked={Boolean(cfg.push_success_animation_enabled ?? true)}
-                    onCheckedChange={(checked: boolean) => { void patchFeedbackConfig({ push_success_animation_enabled: checked }); }}
-                  />
-                </div>
-              </div>
-            </div>
+                <DialogRow label={<label htmlFor="push-success-sound-switch">Son{AUTO}</label>}>
+                  {fbSwitch("push-success-sound-switch", "push_success_sound_enabled", true)}
+                </DialogRow>
+                <DialogRow label={<label htmlFor="push-success-animation-switch">Animation{AUTO}</label>}>
+                  {fbSwitch("push-success-animation-switch", "push_success_animation_enabled", true)}
+                </DialogRow>
+                <DialogRow label={<>Répétition{AUTO}</>}>
+                  <Select
+                    value={String(cfg.push_success_repeat_mode || "per_device")}
+                    onValueChange={(value) => { void patchFeedbackConfig({ push_success_repeat_mode: value }); }}
+                  >
+                    <SelectTrigger className="h-9 w-[260px] rounded-lg border-grey/32 bg-card shadow-none"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="per_device">Pour chaque appareil réussi</SelectItem>
+                      <SelectItem value="per_run">Une seule fois par synchronisation</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </DialogRow>
+                <DialogRow label={<>Source du son{AUTO}</>}>{sourceSelect("push_success_sound_source")}</DialogRow>
+                {soundFileRow({ uploading: devicePushUploading, fileName: devicePushCustomFileName, inputRef: devicePushSoundInputRef, kind: "device-push" })}
 
-            <div className="grid gap-3 md:grid-cols-2">
-              <div className="space-y-1.5">
-                <Label>Répétition</Label>
-                <Select
-                  value={String(cfg.push_success_repeat_mode || "per_device")}
-                  onValueChange={(value) => { void patchFeedbackConfig({ push_success_repeat_mode: value }); }}
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="per_device">Pour chaque appareil réussi</SelectItem>
-                    <SelectItem value="per_run">Une seule fois par synchronisation</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-
-              <div className="space-y-1.5">
-                <Label>Source du son</Label>
-                <Select
-                  value={String(cfg.push_success_sound_source || "default")}
-                  onValueChange={(value) => { void patchFeedbackConfig({ push_success_sound_source: value }); }}
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="default">Son par défaut</SelectItem>
-                    <SelectItem value="custom">Son personnalisé</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              <input
-                ref={devicePushSoundInputRef}
-                type="file"
-                accept=".mp3,.wav,.ogg,.m4a,audio/*"
-                className="hidden"
-                onChange={(event) => { void handleFeedbackSoundUpload("device-push", event.target.files?.[0] ?? null); }}
-              />
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={devicePushUploading}
-                onClick={() => devicePushSoundInputRef.current?.click()}
-              >
-                {devicePushUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
-                {devicePushCustomFileName ? "Remplacer le son" : "Choisir un son"}
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                disabled={devicePushUploading || !devicePushCustomFileName}
-                onClick={() => { void handleFeedbackSoundReset("device-push"); }}
-              >
-                <RotateCcw className="h-4 w-4" /> Réinitialiser
-              </Button>
-              <span className="text-xs text-muted-foreground">
-                {devicePushCustomFileName ? `Actuel : ${devicePushCustomFileName}` : "Aucun son personnalisé sélectionné."}
-              </span>
-            </div>
-          </div>
-
-          <Separator />
-
-          <div className="space-y-3">
-            <div className="flex items-start justify-between gap-4">
-              <div className="space-y-1">
-                <Label>Synchronisation terminée</Label>
-                <p className="text-sm text-muted-foreground">
+                <DialogSection className="pt-5">Synchronisation terminée</DialogSection>
+                <p className="text-[12.5px] text-muted-foreground">
                   Son et animation quand une synchronisation complète se termine avec succès.
+                  Son par défaut : <span className="font-mono">{DEFAULT_FEEDBACK_SOUNDS.sync_completed_success}</span> ·
+                  animation : <span className="font-mono">{DEFAULT_FEEDBACK_ANIMATIONS.sync_completed_success}</span>
                 </p>
-                <p className="text-xs text-muted-foreground">
-                  Son par défaut : <code className="bg-muted px-1 rounded">{DEFAULT_FEEDBACK_SOUNDS.sync_completed_success}</code>
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  Animation : <code className="bg-muted px-1 rounded">{DEFAULT_FEEDBACK_ANIMATIONS.sync_completed_success}</code>
-                </p>
-              </div>
-              <div className="grid min-w-[180px] gap-3">
-                <div className="flex items-center justify-between gap-3">
-                  <Label htmlFor="sync-success-sound-switch" className="text-xs">Son</Label>
-                  <Switch
-                    id="sync-success-sound-switch"
-                    checked={Boolean(cfg.sync_success_sound_enabled ?? true)}
-                    onCheckedChange={(checked: boolean) => { void patchFeedbackConfig({ sync_success_sound_enabled: checked }); }}
-                  />
-                </div>
-                <div className="flex items-center justify-between gap-3">
-                  <Label htmlFor="sync-success-animation-switch" className="text-xs">Animation</Label>
-                  <Switch
-                    id="sync-success-animation-switch"
-                    checked={Boolean(cfg.sync_success_animation_enabled ?? true)}
-                    onCheckedChange={(checked: boolean) => { void patchFeedbackConfig({ sync_success_animation_enabled: checked }); }}
-                  />
-                </div>
-              </div>
-            </div>
+                <DialogRow label={<label htmlFor="sync-success-sound-switch">Son{AUTO}</label>}>
+                  {fbSwitch("sync-success-sound-switch", "sync_success_sound_enabled", true)}
+                </DialogRow>
+                <DialogRow label={<label htmlFor="sync-success-animation-switch">Animation{AUTO}</label>} hint="Style : confetti et célébration">
+                  <Sparkles className="h-4 w-4 text-warning-ink" />
+                  {fbSwitch("sync-success-animation-switch", "sync_success_animation_enabled", true)}
+                </DialogRow>
+                <DialogRow label={<>Source du son{AUTO}</>}>{sourceSelect("sync_success_sound_source")}</DialogRow>
+                {soundFileRow({ uploading: syncCompleteUploading, fileName: syncCompleteCustomFileName, inputRef: syncCompleteSoundInputRef, kind: "sync-complete" })}
 
-            <div className="grid gap-3 md:grid-cols-2">
-              <div className="space-y-1.5">
-                <Label>Source du son</Label>
-                <Select
-                  value={String(cfg.sync_success_sound_source || "default")}
-                  onValueChange={(value) => { void patchFeedbackConfig({ sync_success_sound_source: value }); }}
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="default">Son par défaut</SelectItem>
-                    <SelectItem value="custom">Son personnalisé</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-
-              <div className="space-y-1.5">
-                <Label>Style</Label>
-                <div className="flex h-9 items-center gap-2 rounded-md border border-input px-3 text-sm text-muted-foreground">
-                  <Sparkles className="h-4 w-4 text-amber-400" />
-                  Confetti et célébration
-                </div>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              <input
-                ref={syncCompleteSoundInputRef}
-                type="file"
-                accept=".mp3,.wav,.ogg,.m4a,audio/*"
-                className="hidden"
-                onChange={(event) => { void handleFeedbackSoundUpload("sync-complete", event.target.files?.[0] ?? null); }}
-              />
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={syncCompleteUploading}
-                onClick={() => syncCompleteSoundInputRef.current?.click()}
-              >
-                {syncCompleteUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
-                {syncCompleteCustomFileName ? "Remplacer le son" : "Choisir un son"}
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                disabled={syncCompleteUploading || !syncCompleteCustomFileName}
-                onClick={() => { void handleFeedbackSoundReset("sync-complete"); }}
-              >
-                <RotateCcw className="h-4 w-4" /> Réinitialiser
-              </Button>
-              <span className="text-xs text-muted-foreground">
-                {syncCompleteCustomFileName ? `Actuel : ${syncCompleteCustomFileName}` : "Aucun son personnalisé sélectionné."}
-              </span>
-            </div>
-          </div>
-
-          <Separator />
-
-          {/* ── Anti-fraude durée ── */}
-          <div className="space-y-3">
-            <div className="flex items-start justify-between gap-4">
-              <div className="space-y-1">
-                <Label>Anti-fraude durée</Label>
-                <p className="text-sm text-muted-foreground">
+                <DialogSection className="pt-5">Anti-fraude (durée)</DialogSection>
+                <p className="text-[12.5px] text-muted-foreground">
                   Son joué quand un utilisateur est refusé pour tentative de passage trop rapide (anti-fraude durée).
+                  Son par défaut : <span className="font-mono">{DEFAULT_FEEDBACK_SOUNDS.anti_fraud_duration}</span>
                 </p>
-                <p className="text-xs text-muted-foreground">
-                  Son par défaut : <code className="bg-muted px-1 rounded">{DEFAULT_FEEDBACK_SOUNDS.anti_fraud_duration}</code>
-                </p>
-              </div>
-              <div className="grid min-w-[180px] gap-3">
-                <div className="flex items-center justify-between gap-3">
-                  <Label htmlFor="anti-fraud-duration-sound-switch" className="text-xs">Son</Label>
-                  <Switch
-                    id="anti-fraud-duration-sound-switch"
-                    checked={Boolean(cfg.anti_fraud_duration_sound_enabled ?? true)}
-                    onCheckedChange={(checked: boolean) => { void patchFeedbackConfig({ anti_fraud_duration_sound_enabled: checked }); }}
-                  />
-                </div>
-              </div>
-            </div>
+                <DialogRow label={<label htmlFor="anti-fraud-duration-sound-switch">Son{AUTO}</label>}>
+                  {fbSwitch("anti-fraud-duration-sound-switch", "anti_fraud_duration_sound_enabled", true)}
+                </DialogRow>
+                <DialogRow label={<>Source du son{AUTO}</>}>{sourceSelect("anti_fraud_duration_sound_source")}</DialogRow>
+                {soundFileRow({ uploading: antiFraudDurationUploading, fileName: antiFraudDurationCustomFileName, inputRef: antiFraudDurationSoundInputRef, kind: "anti-fraud-duration" })}
 
-            <div className="grid gap-3 md:grid-cols-2">
-              <div className="space-y-1.5">
-                <Label>Source du son</Label>
-                <Select
-                  value={String(cfg.anti_fraud_duration_sound_source || "default")}
-                  onValueChange={(value) => { void patchFeedbackConfig({ anti_fraud_duration_sound_source: value }); }}
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="default">Son par défaut</SelectItem>
-                    <SelectItem value="custom">Son personnalisé</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              <input
-                ref={antiFraudDurationSoundInputRef}
-                type="file"
-                accept=".mp3,.wav,.ogg,.m4a,audio/*"
-                className="hidden"
-                onChange={(event) => { void handleFeedbackSoundUpload("anti-fraud-duration", event.target.files?.[0] ?? null); }}
-              />
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={antiFraudDurationUploading}
-                onClick={() => antiFraudDurationSoundInputRef.current?.click()}
-              >
-                {antiFraudDurationUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
-                {antiFraudDurationCustomFileName ? "Remplacer le son" : "Choisir un son"}
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                disabled={antiFraudDurationUploading || !antiFraudDurationCustomFileName}
-                onClick={() => { void handleFeedbackSoundReset("anti-fraud-duration"); }}
-              >
-                <RotateCcw className="h-4 w-4" /> Réinitialiser
-              </Button>
-              <span className="text-xs text-muted-foreground">
-                {antiFraudDurationCustomFileName ? `Actuel : ${antiFraudDurationCustomFileName}` : "Aucun son personnalisé sélectionné."}
-              </span>
-            </div>
-          </div>
-
-          <Separator />
-
-          {/* ── Limite journalière ── */}
-          <div className="space-y-3">
-            <div className="flex items-start justify-between gap-4">
-              <div className="space-y-1">
-                <Label>Limite de passages journalière</Label>
-                <p className="text-sm text-muted-foreground">
+                <DialogSection className="pt-5">Limite de passages journalière</DialogSection>
+                <p className="text-[12.5px] text-muted-foreground">
                   Son joué quand un utilisateur dépasse sa limite de passages journalière (alerte seulement — l&apos;accès est accordé).
+                  Son par défaut : <span className="font-mono">{DEFAULT_FEEDBACK_SOUNDS.anti_fraud_daily_limit}</span>
                 </p>
-                <p className="text-xs text-muted-foreground">
-                  Son par défaut : <code className="bg-muted px-1 rounded">{DEFAULT_FEEDBACK_SOUNDS.anti_fraud_daily_limit}</code>
-                </p>
-              </div>
-              <div className="grid min-w-[180px] gap-3">
-                <div className="flex items-center justify-between gap-3">
-                  <Label htmlFor="anti-fraud-daily-limit-sound-switch" className="text-xs">Son</Label>
-                  <Switch
-                    id="anti-fraud-daily-limit-sound-switch"
-                    checked={Boolean(cfg.anti_fraud_daily_limit_sound_enabled ?? true)}
-                    onCheckedChange={(checked: boolean) => { void patchFeedbackConfig({ anti_fraud_daily_limit_sound_enabled: checked }); }}
-                  />
-                </div>
-              </div>
-            </div>
+                <DialogRow label={<label htmlFor="anti-fraud-daily-limit-sound-switch">Son{AUTO}</label>}>
+                  {fbSwitch("anti-fraud-daily-limit-sound-switch", "anti_fraud_daily_limit_sound_enabled", true)}
+                </DialogRow>
+                <DialogRow label={<>Source du son{AUTO}</>}>{sourceSelect("anti_fraud_daily_limit_sound_source")}</DialogRow>
+                {soundFileRow({ uploading: antiFraudDailyLimitUploading, fileName: antiFraudDailyLimitCustomFileName, inputRef: antiFraudDailyLimitSoundInputRef, kind: "anti-fraud-daily-limit" })}
+              </>
+            )}
 
-            <div className="grid gap-3 md:grid-cols-2">
-              <div className="space-y-1.5">
-                <Label>Source du son</Label>
-                <Select
-                  value={String(cfg.anti_fraud_daily_limit_sound_source || "default")}
-                  onValueChange={(value) => { void patchFeedbackConfig({ anti_fraud_daily_limit_sound_source: value }); }}
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="default">Son par défaut</SelectItem>
-                    <SelectItem value="custom">Son personnalisé</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
+            {/* ── Paramètres avancés (password) ────────────────────────── */}
+            {section === "advanced" && (!advancedUnlocked ? (
+              <DialogRow
+                label="Paramètres avancés"
+                hint="Session, synchronisation, barre des tâches, debug. Protégés par le mot de passe administrateur."
+                className="border-b-0"
+              >
+                <ActionButton kind="dark" size="md" icon={LockOpen} onClick={() => setPwdDialogOpen(true)}>
+                  Afficher
+                </ActionButton>
+              </DialogRow>
+            ) : (
+              <>
+                <DialogSection>Général</DialogSection>
+                <DialogRow label="Email de connexion">
+                  <Input value={cfg.login_email || ""} onChange={(e) => update("login_email", e.target.value)} className="h-9 w-[240px] rounded-lg border-grey/32" />
+                </DialogRow>
+                <DialogRow label="Intervalle de sync (sec)" hint="En secondes">
+                  <Input type="number" value={cfg.sync_interval_sec ?? 60} onChange={(e) => update("sync_interval_sec", parseInt(e.target.value) || 60)} className="h-9 w-[110px] rounded-lg border-grey/32 font-mono" />
+                </DialogRow>
+                <DialogRow label="Durée max session (min)" hint="43200 = 30 jours">
+                  <Input type="number" value={cfg.max_login_age_minutes ?? 43200} onChange={(e) => update("max_login_age_minutes", parseInt(e.target.value) || 43200)} className="h-9 w-[110px] rounded-lg border-grey/32 font-mono" />
+                </DialogRow>
+                <DialogRow label="Délai de grâce hors ligne (jours)" hint="0 = les abonnements expirent à l'heure même sans internet">
+                  <Input type="number" min={0} max={36500} value={cfg.offline_revoke_grace_days ?? 0} onChange={(e) => update("offline_revoke_grace_days", Math.min(36500, Math.max(0, parseInt(e.target.value) || 0)))} className="h-9 w-[110px] rounded-lg border-grey/32 font-mono" />
+                </DialogRow>
+                <DialogRow label="Sync appareils (DEVICE mode)">
+                  <Switch checked={cfg.device_sync_enabled ?? true} onCheckedChange={(v: boolean) => update("device_sync_enabled", v)} />
+                </DialogRow>
 
-            <div className="flex flex-wrap items-center gap-2">
-              <input
-                ref={antiFraudDailyLimitSoundInputRef}
-                type="file"
-                accept=".mp3,.wav,.ogg,.m4a,audio/*"
-                className="hidden"
-                onChange={(event) => { void handleFeedbackSoundUpload("anti-fraud-daily-limit", event.target.files?.[0] ?? null); }}
-              />
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={antiFraudDailyLimitUploading}
-                onClick={() => antiFraudDailyLimitSoundInputRef.current?.click()}
-              >
-                {antiFraudDailyLimitUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
-                {antiFraudDailyLimitCustomFileName ? "Remplacer le son" : "Choisir un son"}
-              </Button>
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                disabled={antiFraudDailyLimitUploading || !antiFraudDailyLimitCustomFileName}
-                onClick={() => { void handleFeedbackSoundReset("anti-fraud-daily-limit"); }}
-              >
-                <RotateCcw className="h-4 w-4" /> Réinitialiser
-              </Button>
-              <span className="text-xs text-muted-foreground">
-                {antiFraudDailyLimitCustomFileName ? `Actuel : ${antiFraudDailyLimitCustomFileName}` : "Aucun son personnalisé sélectionné."}
-              </span>
-            </div>
+                <DialogSection className="pt-5">Barre des tâches</DialogSection>
+                <DialogRow label="Activer l'icône de la barre des tâches">
+                  <Switch checked={cfg.tray_enabled ?? true} onCheckedChange={(v: boolean) => update("tray_enabled", v)} />
+                </DialogRow>
+                <DialogRow label="Réduire dans la barre des tâches au lieu de fermer">
+                  <Switch checked={cfg.minimize_to_tray_on_close ?? true} onCheckedChange={(v: boolean) => update("minimize_to_tray_on_close", v)} />
+                </DialogRow>
+
+                <DialogSection className="pt-5">Avancé</DialogSection>
+                <DialogRow label="Mode debug">
+                  <Switch checked={cfg.debug_mode ?? false} onCheckedChange={(v: boolean) => update("debug_mode", v)} />
+                </DialogRow>
+                <DialogRow label="Encodage empreinte">
+                  <Input value={cfg.fingerprint_encoding || "BASE64"} onChange={(e) => update("fingerprint_encoding", e.target.value)} className="h-9 w-[140px] rounded-lg border-grey/32 font-mono" />
+                </DialogRow>
+
+                <DialogSection className="pt-5">Paramètres serveur (lecture seule)</DialogSection>
+                {Object.keys(serverSettings).length > 0 ? (
+                  Object.entries(serverSettings).map(([k, v]) => (
+                    <DialogRow key={k} label={k} mono>
+                      <span className="font-mono text-[13px]">{String(v)}</span>
+                    </DialogRow>
+                  ))
+                ) : (
+                  <p className="py-2 text-[13px] text-muted-foreground">Aucun paramètre serveur chargé.</p>
+                )}
+              </>
+            ))}
           </div>
-        </CardContent>
-      </Card>
+        </Panel>
 
-      {!advancedUnlocked ? (
-        <div className="flex justify-center py-8">
-          <Button variant="outline" onClick={() => setPwdDialogOpen(true)}>
-            <Lock className="h-4 w-4" /> Afficher les paramètres avancés
-          </Button>
-        </div>
-      ) : (
-        <Accordion type="multiple" defaultValue={["general"]}>
-          <AccordionItem value="general">
-            <AccordionTrigger>Général</AccordionTrigger>
-            <AccordionContent className="space-y-4">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="space-y-1.5">
-                  <Label>Email de connexion</Label>
-                  <Input value={cfg.login_email || ""} onChange={(e) => update("login_email", e.target.value)} />
-                </div>
-                <div className="space-y-1.5">
-                  <Label>Intervalle de sync (sec)</Label>
-                  <Input type="number" value={cfg.sync_interval_sec ?? 60} onChange={(e) => update("sync_interval_sec", parseInt(e.target.value) || 60)} />
-                </div>
-                <div className="space-y-1.5">
-                  <Label>Durée max session (min)</Label>
-                  <Input type="number" value={cfg.max_login_age_minutes ?? 43200} onChange={(e) => update("max_login_age_minutes", parseInt(e.target.value) || 43200)} />
-                  <p className="text-xs text-muted-foreground">43200 = 30 jours</p>
-                </div>
-                <div className="space-y-1.5">
-                  <Label>Délai de grâce hors ligne (jours)</Label>
-                  <Input type="number" min={0} max={36500} value={cfg.offline_revoke_grace_days ?? 0} onChange={(e) => update("offline_revoke_grace_days", Math.min(36500, Math.max(0, parseInt(e.target.value) || 0)))} />
-                  <p className="text-xs text-muted-foreground">0 = les abonnements expirent à l'heure même sans internet</p>
-                </div>
-              </div>
-              <div className="flex items-center gap-3">
-                <Switch checked={cfg.device_sync_enabled ?? true} onCheckedChange={(v: boolean) => update("device_sync_enabled", v)} />
-                <Label>Sync appareils (DEVICE mode)</Label>
-              </div>
-            </AccordionContent>
-          </AccordionItem>
-
-          <AccordionItem value="tray">
-            <AccordionTrigger>Tray</AccordionTrigger>
-            <AccordionContent className="space-y-3">
-              <div className="flex items-center gap-3">
-                <Switch checked={cfg.tray_enabled ?? true} onCheckedChange={(v: boolean) => update("tray_enabled", v)} />
-                <Label>Activer le tray</Label>
-              </div>
-              <div className="flex items-center gap-3">
-                <Switch checked={cfg.minimize_to_tray_on_close ?? true} onCheckedChange={(v: boolean) => update("minimize_to_tray_on_close", v)} />
-                <Label>Minimiser dans le tray</Label>
-              </div>
-            </AccordionContent>
-          </AccordionItem>
-
-          <AccordionItem value="server-settings">
-            <AccordionTrigger>Paramètres serveur (lecture seule)</AccordionTrigger>
-            <AccordionContent>
-              {Object.keys(serverSettings).length > 0 ? (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                  {Object.entries(serverSettings).map(([k, v]) => (
-                    <div key={k} className="flex justify-between items-center py-1.5 px-2 rounded hover:bg-muted/50">
-                      <span className="text-sm text-muted-foreground">{k}</span>
-                      <span className="text-sm font-mono">{String(v)}</span>
-                    </div>
+        {/* ── Le rail ─────────────────────────────────────────────────── */}
+        <div className="col-span-4 flex flex-col gap-[18px]">
+          <Panel>
+            <PanelHeader
+              title={changes.length > 0 ? "Non enregistré" : "Tout est enregistré"}
+              sub={changes.length > 0 ? "Annuler ou Enregistrer en haut de la page" : "Aucune modification en attente."}
+            />
+            {changes.length > 0 ? (
+              <>
+                {/* Raw setting keys on purpose — there is no French label catalogue
+                    in the codebase, and inventing one risks mislabelling a field. */}
+                <PanelList className="max-h-[260px] overflow-y-auto">
+                  {changes.map((c) => (
+                    <ListRow
+                      key={c.key}
+                      icon={ArrowRightLeft}
+                      tone="warning"
+                      mono
+                      title={c.key}
+                      sub={`${fmtVal(c.from)} → ${fmtVal(c.to)}`}
+                    />
                   ))}
+                </PanelList>
+                <div className="flex gap-2 border-t border-dashed border-grey/20 px-[18px] py-3.5">
+                  <ActionButton kind="outline" className="flex-1" onClick={() => { setCfg(baseline); setDirty(false); }} disabled={saving}>
+                    Annuler
+                  </ActionButton>
+                  <ActionButton kind="primary" className="flex-[1.3]" icon={saving ? Loader2 : Save} spin={saving} onClick={handleSave} disabled={saving}>
+                    Enregistrer
+                  </ActionButton>
                 </div>
-              ) : (
-                <p className="text-sm text-muted-foreground">Aucun paramètre serveur chargé.</p>
-              )}
-            </AccordionContent>
-          </AccordionItem>
+              </>
+            ) : (
+              <PanelList>
+                <ListRow icon={CheckCircle} tone="success" title="Rien à enregistrer" sub="Les réglages « Enregistré automatiquement » sont déjà sauvegardés." wrap />
+              </PanelList>
+            )}
+          </Panel>
 
-          <AccordionItem value="advanced">
-            <AccordionTrigger>Avancé</AccordionTrigger>
-            <AccordionContent className="space-y-3">
-              <div className="flex items-center gap-3">
-                <Switch checked={cfg.debug_mode ?? false} onCheckedChange={(v: boolean) => update("debug_mode", v)} />
-                <Label>Mode debug</Label>
-              </div>
-              <div className="space-y-1.5">
-                <Label>Encodage empreinte</Label>
-                <Input value={cfg.fingerprint_encoding || "BASE64"} onChange={(e) => update("fingerprint_encoding", e.target.value)} />
-              </div>
-            </AccordionContent>
-          </AccordionItem>
-        </Accordion>
-      )}
+          <Panel>
+            <PanelHeader title="Ce poste" />
+            <PanelList>
+              <ListRow icon={Info} tone="grey" title="Version installée" value={currentVersionDisplay} valueMono />
+              <ListRow icon={Download} tone="grey" title="Canal" value={`${updates?.channel || "stable"} · ${updates?.platform || "WINDOWS"}`} />
+              {hasAgentDevices(status) && (
+                <ListRow
+                  icon={Router}
+                  tone={status?.agent?.running ? "success" : "grey"}
+                  title="Agent temps réel"
+                  value={status?.agent?.running ? "actif" : "arrêté"}
+                />
+              )}
+              <ListRow icon={Router} tone={readerTone} title="Lecteurs" value={readerValue} />
+              {updates?.updateAvailable && (
+                <ListRow
+                  icon={CircleAlert}
+                  tone="primary"
+                  wrap
+                  title={`Version ${updates.latestVersion ?? ""} disponible`}
+                  sub={updates.downloaded ? "Téléchargée — à installer à la fermeture du club." : "À installer à la fermeture du club."}
+                  actions={<ActionButton kind="outline" size="sm" icon={Info} onClick={() => setUpdateDialog(true)}>Voir les détails</ActionButton>}
+                />
+              )}
+            </PanelList>
+          </Panel>
+        </div>
+      </PageGrid>
 
       {/* Password dialog */}
-      <Dialog open={pwdDialogOpen} onOpenChange={setPwdDialogOpen}>
-        <DialogContent className="rounded-3xlmax-w-xs">
-          <DialogHeader>
-            <DialogTitle>Paramètres avancés</DialogTitle>
-            <DialogDescription>Entrez le mot de passe administrateur.</DialogDescription>
-          </DialogHeader>
-          <div className="space-y-2">
-            <Input type="password" placeholder="Mot de passe" value={pwdInput} onChange={(e) => { setPwdInput(e.target.value); setPwdError(false); }}
-              onKeyDown={(e) => { if (e.key === "Enter") handleUnlockAdvanced(); }} autoFocus />
-            {pwdError && <p className="text-sm text-destructive">Mot de passe incorrect.</p>}
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => { setPwdDialogOpen(false); setPwdInput(""); }}>Annuler</Button>
-            <Button onClick={handleUnlockAdvanced}><Unlock className="h-4 w-4" /> Déverrouiller</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <DialogFrame
+        open={pwdDialogOpen}
+        onOpenChange={setPwdDialogOpen}
+        width={440}
+        title="Paramètres avancés"
+        sub="Entrez le mot de passe administrateur."
+        footer={(
+          <>
+            <ActionButton kind="outline" className="px-4" onClick={() => { setPwdDialogOpen(false); setPwdInput(""); }}>Annuler</ActionButton>
+            <ActionButton kind="dark" className="px-4" icon={Unlock} onClick={handleUnlockAdvanced}>Déverrouiller</ActionButton>
+          </>
+        )}
+      >
+        <Input
+          type="password"
+          placeholder="Mot de passe"
+          aria-label="Mot de passe"
+          value={pwdInput}
+          onChange={(e) => { setPwdInput(e.target.value); setPwdError(false); }}
+          onKeyDown={(e) => { if (e.key === "Enter") handleUnlockAdvanced(); }}
+          autoFocus
+          className={cn("h-11 rounded-lg", pwdError ? "border-error" : "border-grey/32")}
+        />
+        {pwdError && <p className="mt-2 text-[13px] font-semibold text-error-ink">Mot de passe incorrect.</p>}
+      </DialogFrame>
 
       {/* Update details dialog */}
-      <Dialog open={updateDialog} onOpenChange={setUpdateDialog}>
-        <DialogContent className="rounded-3xlmax-w-sm">
-          <DialogHeader>
-            <DialogTitle>Mise à jour disponible</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-2 text-sm">
-            <p>Composant: <code className="bg-muted px-1 rounded">{updates?.componentDisplayName || "MonClub Access"}</code></p>
-            <p>Version actuelle: <code className="bg-muted px-1 rounded">{updates?.currentVersion || updates?.currentReleaseId || "dev"}</code></p>
-            <p>ExÃ©cutable: <code className="bg-muted px-1 rounded">{updates?.mainExecutable || "MonClubAccess.exe"}</code></p>
-            <p>Package d&apos;installation: <code className="bg-muted px-1 rounded">{updates?.latestVersion ? `monclub_access_${updates?.latestVersion}.exe` : "monclub_access_<version>.exe"}</code></p>
-            <p>Flux: <code className="bg-muted px-1 rounded">Le .exe telecharge installe ou met a jour automatiquement</code></p>
-            {updates?.installRoot && <p>Install root: <code className="bg-muted px-1 rounded">{updates.installRoot}</code></p>}
-            {updates?.lastCheckAt && <p>Dernière vérification: {updates.lastCheckAt}</p>}
-            <Separator />
-            <p className="text-muted-foreground">Contactez l'équipe MonClub pour obtenir la dernière version.</p>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setUpdateDialog(false)}>Fermer</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-      </div>
-
-      {/* ── Le rail ─────────────────────────────────────────────────────── */}
-      <div className="flex w-[330px] flex-none flex-col gap-[11px]">
-        <div className="flex flex-none items-center gap-[9px]">
-          <span className={cn(
-            "inline-flex h-[22px] items-center gap-1.5 rounded-lg px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em]",
-            changes.length > 0 ? "bg-primary/[0.08] text-primary" : "bg-muted text-muted-foreground",
-          )}>
-            {changes.length > 0 && <span className="relative inline-block h-1.5 w-1.5"><span className="absolute inset-0 animate-ping rounded-full bg-primary opacity-60" /><span className="absolute inset-0 rounded-full bg-primary" /></span>}
-            {changes.length > 0 ? "Non enregistré" : "À jour"}
-          </span>
-        </div>
-
-        {changes.length > 0 ? (
-          <div className="flex max-h-[45%] flex-none flex-col rounded-3xl border-[1.5px] border-primary/30 bg-card px-5 py-[18px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
-            <div className="mb-3 text-[14px] font-bold text-foreground">
-              {changes.length} modification{changes.length > 1 ? "s" : ""}
-            </div>
-            {/* Raw setting keys on purpose — there is no French label catalogue
-                in the codebase, and inventing one risks mislabelling a field. */}
-            <div className="mb-[15px] flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto">
-              {changes.map((c) => (
-                <div key={c.key} className="flex items-start gap-[9px]">
-                  <ArrowRightLeft className="mt-0.5 h-[15px] w-[15px] shrink-0 text-muted-foreground" />
-                  <div className="min-w-0">
-                    <div className="truncate font-mono text-[11.5px] font-semibold text-foreground">{c.key}</div>
-                    <div className="truncate text-[10.5px] text-muted-foreground">
-                      {fmtVal(c.from)} → {fmtVal(c.to)}
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-            <div className="flex flex-none gap-2">
-              <Button
-                variant="outline"
-                className="h-[34px] flex-1 justify-center rounded-[14px] text-[12px] font-semibold"
-                onClick={() => { setCfg(baseline); setDirty(false); }}
-                disabled={saving}
-              >
-                Annuler
-              </Button>
-              <Button
-                className="h-[34px] flex-[1.3] justify-center gap-1.5 rounded-full text-[12px] font-bold"
-                onClick={handleSave}
-                disabled={saving}
-              >
-                {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-                Enregistrer
-              </Button>
-            </div>
-          </div>
-        ) : (
-          <div className="flex-none rounded-3xl bg-card px-5 py-[18px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
-            <div className="flex items-center gap-3">
-              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[18px] bg-emerald-500/[0.055] text-emerald-700 dark:text-emerald-400">
-                <CheckCircle className="h-[19px] w-[19px]" />
-              </span>
-              <div className="min-w-0 flex-1">
-                <div className="text-[13.5px] font-bold text-foreground">Tout est enregistré</div>
-                <div className="mt-0.5 text-[11px] text-muted-foreground">Aucune modification en attente.</div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        <div className="mt-[3px] flex flex-none items-center gap-[9px]">
-          <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-muted px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em] text-muted-foreground">
-            <Info className="h-3 w-3" />Ce poste
-          </span>
-        </div>
-        <div className="flex min-h-0 flex-1 flex-col gap-[11px] overflow-y-auto rounded-[18px] bg-card px-5 py-4 shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
-          <div className="flex items-center justify-between gap-2.5">
-            <span className="text-[12px] text-muted-foreground">Version installée</span>
-            <span className="font-mono text-[12px] text-foreground">{currentVersionDisplay}</span>
-          </div>
-          <div className="flex items-center justify-between gap-2.5">
-            <span className="text-[12px] text-muted-foreground">Canal</span>
-            <span className="text-[12px] font-semibold text-foreground">{updates?.channel || "stable"}</span>
-          </div>
-          <div className="flex items-center justify-between gap-2.5">
-            <span className="text-[12px] text-muted-foreground">Plateforme</span>
-            <span className="text-[12px] font-semibold text-foreground">{updates?.platform || "WINDOWS"}</span>
-          </div>
-          <div className="h-px bg-border" />
-          {hasAgentDevices(status) && (
-            <div className="flex items-center justify-between gap-2.5">
-              <span className="text-[12px] text-muted-foreground">Agent temps réel</span>
-              <span className={cn("text-[12px] font-semibold", status?.agent?.running ? "text-emerald-700 dark:text-emerald-400" : "text-muted-foreground")}>
-                {status?.agent?.running ? "actif" : "arrêté"}
-              </span>
-            </div>
-          )}
-          <div className="flex items-center justify-between gap-2.5">
-            <span className="text-[12px] text-muted-foreground">Lecteur PullSDK</span>
-            <span className={cn("text-[12px] font-semibold", status?.pullsdk?.connected ? "text-emerald-700 dark:text-emerald-400" : "text-muted-foreground")}>
-              {status?.pullsdk?.connected ? (status.pullsdk.ip || "connecté") : "non connecté"}
-            </span>
-          </div>
-
-          {updates?.updateAvailable && (
-            <>
-              <div className="h-px bg-border" />
-              <div className="flex items-start gap-2.5 rounded-xl bg-primary/[0.05] px-3 py-[11px]">
-                <Download className="mt-px h-[17px] w-[17px] shrink-0 text-primary" />
-                <div className="min-w-0">
-                  <div className="text-[12px] font-bold text-foreground">
-                    Version {updates.latestVersion ?? ""} disponible
-                  </div>
-                  <div className="mt-[3px] text-[10.5px] leading-[1.5] text-muted-foreground">
-                    {updates.downloaded ? "Téléchargée — à installer à la fermeture du club." : "À installer à la fermeture du club."}
-                  </div>
-                </div>
-              </div>
-              <Button
-                variant="outline"
-                className="h-8 w-full justify-center gap-1.5 rounded-[14px] text-[12px] font-semibold"
-                onClick={() => setUpdateDialog(true)}
-              >
-                <Info className="h-[15px] w-[15px]" />Voir les détails
-              </Button>
-            </>
-          )}
-        </div>
-      </div>
+      <DialogFrame
+        open={updateDialog}
+        onOpenChange={setUpdateDialog}
+        width={480}
+        title="Mise à jour disponible"
+        footer={<ActionButton kind="dark" className="px-4" onClick={() => setUpdateDialog(false)}>Fermer</ActionButton>}
+      >
+        <DialogRow label="Composant"><span className="font-mono text-[13px]">{updates?.componentDisplayName || "MonClub Access"}</span></DialogRow>
+        <DialogRow label="Version actuelle"><span className="font-mono text-[13px]">{updates?.currentVersion || updates?.currentReleaseId || "dev"}</span></DialogRow>
+        <DialogRow label="Exécutable"><span className="font-mono text-[13px]">{updates?.mainExecutable || "MonClubAccess.exe"}</span></DialogRow>
+        <DialogRow label="Package d'installation">
+          <span className="font-mono text-[13px]">{updates?.latestVersion ? `monclub_access_${updates?.latestVersion}.exe` : "monclub_access_<version>.exe"}</span>
+        </DialogRow>
+        <DialogRow label="Fonctionnement" hint="Le .exe téléchargé installe ou met à jour automatiquement." />
+        {updates?.installRoot && <DialogRow label="Dossier d'installation"><span className="break-all font-mono text-[12.5px]">{updates.installRoot}</span></DialogRow>}
+        {updates?.lastCheckAt && <DialogRow label="Dernière vérification"><span className="font-mono text-[13px]">{updates.lastCheckAt}</span></DialogRow>}
+        <Note className="mt-3">Contactez l'équipe MonClub pour obtenir la dernière version.</Note>
+      </DialogFrame>
     </div>
   );
 }
