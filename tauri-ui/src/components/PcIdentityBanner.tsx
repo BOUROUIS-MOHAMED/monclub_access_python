@@ -1,6 +1,6 @@
-import { AlertTriangle, MonitorCog } from "lucide-react";
+import { AlertTriangle } from "lucide-react";
 
-import { Button } from "@/components/ui/button";
+import { ActionButton } from "@/components/ui/action-button";
 import { usePcIdentity } from "@/context/PcIdentityContext";
 
 export default function PcIdentityBanner() {
@@ -12,18 +12,20 @@ export default function PcIdentityBanner() {
     || status?.state === "invalid_token";
 
   return (
-    <div className="flex shrink-0 items-center gap-3 border-b border-amber-500/20 bg-amber-500/[0.08] px-6 py-2.5">
-      <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
-      <p className="min-w-0 flex-1 text-[12px] leading-5 text-amber-900 dark:text-amber-200">
-        <span className="font-bold">
+    <div
+      role="status"
+      className="mx-6 mt-3 flex shrink-0 items-center gap-3 rounded-[10px] bg-warning/16 px-3.5 py-2.5 text-[13.5px] text-warning-ink"
+    >
+      <AlertTriangle className="h-5 w-5 shrink-0" />
+      <p className="m-0 min-w-0 flex-1 leading-normal">
+        <strong className="font-bold">
           {interrupted ? "L’identité de ce PC doit être renouvelée." : "Ce PC n’est pas encore enregistré."}
-        </span>{" "}
+        </strong>{" "}
         La télémétrie est suspendue, mais le contrôle d’accès et les portes restent opérationnels.
       </p>
-      <Button variant="outline" size="sm" onClick={openSetup} className="h-8 shrink-0 gap-1.5 rounded-full bg-card">
-        <MonitorCog className="h-3.5 w-3.5" />
+      <ActionButton kind="warn" size="sm" onClick={openSetup} className="bg-card hover:bg-card/80">
         Configurer
-      </Button>
+      </ActionButton>
     </div>
   );
 }
