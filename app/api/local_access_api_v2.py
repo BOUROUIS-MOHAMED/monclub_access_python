@@ -3957,6 +3957,79 @@ def _connect_device(ctx: _Ctx, device_id: int) -> Tuple[Any, Optional[str]]:
         return None, str(e)
 
 
+def _ultra_worker_holding(ctx: _Ctx, device_id: int) -> Any:
+    """The running ULTRA worker of this PC for ``device_id``, or None -- the same test
+    ``_run_on_device_sdk`` uses to send a call through the worker's held connection."""
+    ultra_eng = getattr(ctx.app, "_ultra_engine", None)
+    if ultra_eng and getattr(ultra_eng, "running", False):
+        return ultra_eng._workers.get(device_id)
+    return None
+
+
+def _pullsdk_handle(sdk: Any) -> Tuple[Any, bool]:
+    """(low-level ``PullSDK``, on_worker) for a fn run by ``_run_on_device_sdk``.
+
+    The one-shot path hands fn the ``PullSDK`` from ``_connect_device``. The ULTRA path
+    hands it the worker's driver, a ``PullSDKDevice``, which does NOT expose the table
+    calls these handlers use (get_device_data_count / get_device_data_rows /
+    set_device_data / delete_device_data): its wrappers swallow failures (-1 / []). Its
+    held low-level handle does -- the worker's own member and full syncs push through
+    that same handle on the same thread (ultra_engine.py, ``getattr(self._sdk, "_sdk")``).
+    fn runs on the worker thread, between polls, so nothing else uses it meanwhile.
+    """
+    from app.sdk.pullsdk import PullSDKDevice
+    if isinstance(sdk, PullSDKDevice):
+        raw = getattr(sdk, "_sdk", None)
+        if raw is None:
+            raise RuntimeError("device not connected")
+        return raw, True
+    if not hasattr(sdk, "get_device_data_rows"):
+        raise RuntimeError(f"{type(sdk).__name__} is not driven over PullSDK")
+    return sdk, False
+
+
+# A table read through the ULTRA worker runs on its thread: rtlog polling and queued door
+# opens wait until it returns (guide §3.1a, "one connection per turnstile"). GetDeviceData has
+# no row limit -- ``maxRows`` is applied after the whole table is read, through a 1-8 MB buffer
+# ladder -- so the only bound is to count first and refuse a table above this many rows.
+# Chosen, not measured: three times the largest roster on record (914 members, pullsdk_guide),
+# so every member table reads; the door log (``transaction``) is the table it stops.
+_LIVE_TABLE_READ_MAX_ROWS = 3000
+
+
+def _read_table_capped(raw: Any, *, table: str, fields: str, filter_expr: str,
+                       on_worker: bool) -> Dict[str, Any]:
+    """Rows of one table, or {"tooLarge": True, ...} on the worker above the cap (or when
+    its size cannot be read). Off the worker nothing waits on the read: no cap."""
+    if on_worker:
+        n = int(raw.get_device_data_count(table=table, filter_expr=filter_expr))
+        if n < 0 or n > _LIVE_TABLE_READ_MAX_ROWS:
+            return {"tooLarge": True, "count": n if n >= 0 else None}
+    rows = raw.get_device_data_rows(table=table, fields=fields, filter_expr=filter_expr, options="")
+    return {"tooLarge": False, "rows": rows}
+
+
+def _send_table_too_large(ctx: _Ctx, table: str, count: Optional[int]) -> None:
+    cap = _LIVE_TABLE_READ_MAX_ROWS
+    if count is None:
+        why = f"le nombre de lignes de la table {table} n'a pas pu être lu"
+    else:
+        why = f"la table {table} compte {count} lignes (limite {cap})"
+    ctx.send_json(409, {
+        "ok": False, "code": "TABLE_TOO_LARGE_FOR_LIVE_READ", "table": table,
+        "count": count, "maxRows": cap,
+        "error": f"Lecture refusée : {why}. Le tourniquet est en service et sa lecture "
+                 f"bloquerait les passages pendant ce temps.",
+    })
+
+
+def _send_run_failure(ctx: _Ctx, r: Dict[str, Any]) -> None:
+    payload: Dict[str, Any] = {"ok": False, "error": r["error"]}
+    if "downForSec" in r:
+        payload["downForSec"] = r["downForSec"]
+    ctx.send_json(r["status"], payload)
+
+
 def _handle_device_connect(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
     _logger.info("[LocalAPI] device_connect: deviceId=%s", did)
@@ -4006,25 +4079,24 @@ def _handle_device_info(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
     if _unsupported_for_protocol(ctx, did, "la lecture des paramètres appareil"):
         return
-    sdk, err = _connect_device(ctx, did)
-    if err:
-        ctx.send_json(500, {"ok": False, "error": err})
-        return
-    try:
+    items = ctx.q("items", default=(
+        "~DeviceName,~SerialNumber,FirmVer,MachineType,"
+        "LockCount,ReaderCount,AuxInCount,AuxOutCount,"
+        "IPAddress,NetMask,GATEIPAddress,MAC,"
+        "~MaxUserCount,~MaxAttLogCount,~MaxUserFingerCount,"
+        "AntiPassback,InterLock,DeviceID,"
+        "Door1Drivertime,Door2Drivertime,Door3Drivertime,Door4Drivertime,"
+        "Door1SensorType,Door2SensorType,Door3SensorType,Door4SensorType,"
+        "Door1VerifyType,Door2VerifyType,Door3VerifyType,Door4VerifyType"
+    ))
+
+    # One GetDeviceParam and six GetDeviceDataCount calls -- no table read.
+    def _read(sdk):
+        h, _on_worker = _pullsdk_handle(sdk)
         params = {}
         raw = ""
-        items = ctx.q("items", default=(
-            "~DeviceName,~SerialNumber,FirmVer,MachineType,"
-            "LockCount,ReaderCount,AuxInCount,AuxOutCount,"
-            "IPAddress,NetMask,GATEIPAddress,MAC,"
-            "~MaxUserCount,~MaxAttLogCount,~MaxUserFingerCount,"
-            "AntiPassback,InterLock,DeviceID,"
-            "Door1Drivertime,Door2Drivertime,Door3Drivertime,Door4Drivertime,"
-            "Door1SensorType,Door2SensorType,Door3SensorType,Door4SensorType,"
-            "Door1VerifyType,Door2VerifyType,Door3VerifyType,Door4VerifyType"
-        ))
-        if sdk.supports_get_device_param():
-            raw = sdk.get_device_param(items=items, initial_size=65536)
+        if h.supports_get_device_param():
+            raw = h.get_device_param(items=items, initial_size=65536) or ""
             for part in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
                 for seg in part.split(","):
                     seg = seg.strip()
@@ -4034,17 +4106,18 @@ def _handle_device_info(ctx: _Ctx) -> None:
         counts = {}
         for t in ["user", "userauthorize", "transaction", "templatev10", "timezone", "holiday"]:
             try:
-                c = sdk.get_device_data_count(table=t)
+                c = h.get_device_data_count(table=t)
                 if c >= 0:
                     counts[t] = c
             except Exception:
                 pass
-        ctx.send_json(200, {"ok": True, "params": params, "counts": counts, "raw": raw})
-    except Exception as e:
-        ctx.send_json(500, {"ok": False, "error": str(e)})
-    finally:
-        try: sdk.disconnect()
-        except Exception: pass
+        return {"params": params, "counts": counts, "raw": raw}
+
+    r = _run_on_device_sdk(ctx, did, _read, label="device_info", timeout=15.0)
+    if not r["ok"]:
+        _send_run_failure(ctx, r)
+        return
+    ctx.send_json(200, {"ok": True, **(r["result"] or {})})
 
 
 def _handle_device_table(ctx: _Ctx) -> None:
@@ -4056,21 +4129,25 @@ def _handle_device_table(ctx: _Ctx) -> None:
 
     if _unsupported_for_protocol(ctx, did, "la lecture des tables PullSDK"):
         return
-    sdk, err = _connect_device(ctx, did)
-    if err:
-        ctx.send_json(500, {"ok": False, "error": err})
+
+    def _read(sdk):
+        h, on_worker = _pullsdk_handle(sdk)
+        return _read_table_capped(h, table=table_name, fields=fields, filter_expr=flt,
+                                  on_worker=on_worker)
+
+    r = _run_on_device_sdk(ctx, did, _read, label=f"table_read:{table_name}", timeout=15.0)
+    if not r["ok"]:
+        _send_run_failure(ctx, r)
         return
-    try:
-        rows = sdk.get_device_data_rows(table=table_name, fields=fields, filter_expr=flt, options="")
-        count = len(rows)
-        if max_rows > 0:
-            rows = rows[:max_rows]
-        ctx.send_json(200, {"ok": True, "table": table_name, "rows": rows, "count": count})
-    except Exception as e:
-        ctx.send_json(500, {"ok": False, "error": str(e)})
-    finally:
-        try: sdk.disconnect()
-        except Exception: pass
+    res = r["result"] or {}
+    if res.get("tooLarge"):
+        _send_table_too_large(ctx, table_name, res.get("count"))
+        return
+    rows = res.get("rows") or []
+    count = len(rows)
+    if max_rows > 0:
+        rows = rows[:max_rows]
+    ctx.send_json(200, {"ok": True, "table": table_name, "rows": rows, "count": count})
 
 
 _door_open_last: Dict[int, float] = {}  # M-003: per-device rate limit for door open
@@ -5090,25 +5167,28 @@ def _handle_device_users_list(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
     if _unsupported_for_protocol(ctx, did, "la liste des utilisateurs appareil"):
         return
-    sdk, err = _connect_device(ctx, did)
-    if err:
-        ctx.send_json(500, {"ok": False, "error": err})
+
+    def _read(sdk):
+        h, on_worker = _pullsdk_handle(sdk)
+        return _read_table_capped(h, table="user", fields="Pin;Name;CardNo", filter_expr="",
+                                  on_worker=on_worker)
+
+    r = _run_on_device_sdk(ctx, did, _read, label="users_list", timeout=15.0)
+    if not r["ok"]:
+        _send_run_failure(ctx, r)
         return
-    try:
-        rows = sdk.get_device_data_rows(table="user", fields="Pin;Name;CardNo", filter_expr="", options="")
-        users = []
-        for r in rows:
-            users.append({
-                "pin": _safe_str(r.get("Pin") or r.get("pin"), ""),
-                "name": _safe_str(r.get("Name") or r.get("name"), ""),
-                "cardNo": _safe_str(r.get("CardNo") or r.get("cardno"), ""),
-            })
-        ctx.send_json(200, {"ok": True, "users": users})
-    except Exception as e:
-        ctx.send_json(500, {"ok": False, "error": str(e)})
-    finally:
-        try: sdk.disconnect()
-        except Exception: pass
+    res = r["result"] or {}
+    if res.get("tooLarge"):
+        _send_table_too_large(ctx, "user", res.get("count"))
+        return
+    users = []
+    for row in res.get("rows") or []:
+        users.append({
+            "pin": _safe_str(row.get("Pin") or row.get("pin"), ""),
+            "name": _safe_str(row.get("Name") or row.get("name"), ""),
+            "cardNo": _safe_str(row.get("CardNo") or row.get("cardno"), ""),
+        })
+    ctx.send_json(200, {"ok": True, "users": users})
 
 
 def _handle_device_users_delete(ctx: _Ctx) -> None:
