@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::{
     image::Image,
-    menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder},
+    menu::{IconMenuItem, Menu, MenuBuilder, MenuItemBuilder, Submenu, SubmenuBuilder},
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager,
 };
@@ -139,6 +139,35 @@ fn desktop_window_icon(role: &str) -> Result<Image<'static>, Box<dyn std::error:
     } else {
         Ok(Image::from_bytes(include_bytes!("../icons/32x32.png"))?)
     }
+}
+
+// ─── Access tray menu icons ───
+// Lucide shapes from the v5 design (win.logic.js tray menu), stroked in the design's
+// icon grey #637381 so they read on a light and a dark menu. 16×16 because muda draws
+// every Windows menu bitmap into a fixed 16×16 rect (muda platform_impl/windows/icon.rs
+// `to_hbitmap`). The TV tray has no icons.
+const MENU_ICON_MONITOR: &[u8] = include_bytes!("../icons/menu/monitor.png");
+const MENU_ICON_PANEL: &[u8] = include_bytes!("../icons/menu/panel-left-close.png");
+const MENU_ICON_STAR: &[u8] = include_bytes!("../icons/menu/star.png");
+const MENU_ICON_MONITOR_PLAY: &[u8] = include_bytes!("../icons/menu/monitor-play.png");
+const MENU_ICON_DOOR_OPEN: &[u8] = include_bytes!("../icons/menu/door-open.png");
+const MENU_ICON_REFRESH: &[u8] = include_bytes!("../icons/menu/refresh-cw.png");
+const MENU_ICON_SCAN: &[u8] = include_bytes!("../icons/menu/scan-line.png");
+const MENU_ICON_POWER: &[u8] = include_bytes!("../icons/menu/power.png");
+
+/// Decode one embedded menu icon. A PNG that does not decode leaves the entry without
+/// an icon; it never fails the tray menu.
+fn menu_icon(png: &[u8]) -> Option<Image<'static>> {
+    Image::from_bytes(png).ok()
+}
+
+fn tray_icon_item(
+    app: &AppHandle,
+    id: &str,
+    text: &str,
+    png: &[u8],
+) -> tauri::Result<IconMenuItem<tauri::Wry>> {
+    IconMenuItem::with_id(app, id, text, true, menu_icon(png), None::<&str>)
 }
 
 fn api_base(port: u16) -> String {
@@ -409,15 +438,11 @@ fn rebuild_tray_menu(
     port: u16,
     devices: &[DeviceInfo],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // ── Show ──
-    let show_item = MenuItemBuilder::with_id("tray_show", "Afficher MonClub Access").build(app)?;
-    // ── Sync Now ──
-    let sync_item = MenuItemBuilder::with_id("tray_sync", "Synchroniser").build(app)?;
-    // ── Scan Card ──
-    let scan_item = MenuItemBuilder::with_id("tray_scan", "Scanner une carte").build(app)?;
-
     // ── Open submenu (devices → presets) ──
     let mut open_sub = SubmenuBuilder::with_id(app, "tray_open", "Ouvrir une porte");
+    if let Some(icon) = menu_icon(MENU_ICON_DOOR_OPEN) {
+        open_sub = open_sub.submenu_icon(icon);
+    }
 
     if devices.is_empty() {
         let no_dev = MenuItemBuilder::with_id("tray_no_devices", "Aucun appareil")
@@ -470,24 +495,7 @@ fn rebuild_tray_menu(
     }
 
     let open_menu = open_sub.build()?;
-
-    // ── Separator + Quit ──
-    let quit_item = MenuItemBuilder::with_id("tray_quit", "Quitter").build(app)?;
-    let panel_item = MenuItemBuilder::with_id("tray_panel", "Panneau rapide").build(app)?;
-    let favorites_item = MenuItemBuilder::with_id("tray_favorites", "Accès rapide (favoris)").build(app)?;
-    let popup_item = MenuItemBuilder::with_id("tray_popup", "Écran d’entrée").build(app)?;
-
-    let menu = MenuBuilder::new(app)
-        .item(&show_item)
-        .item(&panel_item)
-        .item(&favorites_item)
-        .item(&popup_item)
-        .item(&open_menu)
-        .item(&sync_item)
-        .item(&scan_item)
-        .separator()
-        .item(&quit_item)
-        .build()?;
+    let menu = build_access_tray_menu(app, &open_menu)?;
 
     // Update existing tray or ignore if not found
     if let Some(tray) = app.tray_by_id("main_tray") {
@@ -495,6 +503,36 @@ fn rebuild_tray_menu(
     }
 
     Ok(())
+}
+
+/// The access tray's right-click menu, built the same way at start-up
+/// (`setup_access_tray`) and on every refresh (`rebuild_tray_menu`) so the two never
+/// drift. `open_menu` is the « Ouvrir une porte » submenu. The ids are the ones the
+/// tray's `on_menu_event` matches.
+fn build_access_tray_menu(
+    app: &AppHandle,
+    open_menu: &Submenu<tauri::Wry>,
+) -> tauri::Result<Menu<tauri::Wry>> {
+    let show_item = tray_icon_item(app, "tray_show", "Afficher MonClub Access", MENU_ICON_MONITOR)?;
+    let panel_item = tray_icon_item(app, "tray_panel", "Panneau rapide", MENU_ICON_PANEL)?;
+    let favorites_item =
+        tray_icon_item(app, "tray_favorites", "Accès rapide (favoris)", MENU_ICON_STAR)?;
+    let popup_item = tray_icon_item(app, "tray_popup", "Écran d’entrée", MENU_ICON_MONITOR_PLAY)?;
+    let sync_item = tray_icon_item(app, "tray_sync", "Synchroniser", MENU_ICON_REFRESH)?;
+    let scan_item = tray_icon_item(app, "tray_scan", "Scanner une carte", MENU_ICON_SCAN)?;
+    let quit_item = tray_icon_item(app, "tray_quit", "Quitter", MENU_ICON_POWER)?;
+
+    MenuBuilder::new(app)
+        .item(&show_item)
+        .item(&panel_item)
+        .item(&favorites_item)
+        .item(&popup_item)
+        .item(open_menu)
+        .item(&sync_item)
+        .item(&scan_item)
+        .separator()
+        .item(&quit_item)
+        .build()
 }
 
 // ─── Setup tray on app start ───
@@ -1468,32 +1506,18 @@ fn unregister_favorite_shortcuts(app: AppHandle) -> Result<(), String> {
 fn setup_access_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::error::Error>> {
     let icon = desktop_window_icon("access")?;
 
-    let show_item = MenuItemBuilder::with_id("tray_show", "Afficher MonClub Access").build(app)?;
-    let panel_item = MenuItemBuilder::with_id("tray_panel", "Panneau rapide").build(app)?;
-    let favorites_item = MenuItemBuilder::with_id("tray_favorites", "Accès rapide (favoris)").build(app)?;
-    let popup_item = MenuItemBuilder::with_id("tray_popup", "Écran d’entrée").build(app)?;
-    let sync_item = MenuItemBuilder::with_id("tray_sync", "Synchroniser").build(app)?;
-    let scan_item = MenuItemBuilder::with_id("tray_scan", "Scanner une carte").build(app)?;
-    let open_sub = SubmenuBuilder::with_id(app, "tray_open", "Ouvrir une porte")
+    let mut open_sub = SubmenuBuilder::with_id(app, "tray_open", "Ouvrir une porte");
+    if let Some(icon) = menu_icon(MENU_ICON_DOOR_OPEN) {
+        open_sub = open_sub.submenu_icon(icon);
+    }
+    let open_sub = open_sub
         .item(
             &MenuItemBuilder::with_id("tray_no_devices", "Chargement…")
                 .enabled(false)
                 .build(app)?,
         )
         .build()?;
-    let quit_item = MenuItemBuilder::with_id("tray_quit", "Quitter").build(app)?;
-
-    let menu = MenuBuilder::new(app)
-        .item(&show_item)
-        .item(&panel_item)
-        .item(&favorites_item)
-        .item(&popup_item)
-        .item(&open_sub)
-        .item(&sync_item)
-        .item(&scan_item)
-        .separator()
-        .item(&quit_item)
-        .build()?;
+    let menu = build_access_tray_menu(app, &open_sub)?;
 
     let app_handle = app.clone();
 
