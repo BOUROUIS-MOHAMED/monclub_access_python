@@ -4704,9 +4704,11 @@ def _run_on_device_sdk(ctx: _Ctx, did: int, fn, *, label: str, timeout: float = 
     """Run ``fn(sdk)`` against a device and return {ok,result,error,mode,status}.
 
     Single place for the connection rule: ULTRA devices go through the worker's
-    held socket via the command queue (NEVER a 2nd Connect — handle-leak safe);
-    DEVICE-mode/unmanaged devices get a one-shot connection. Keeps the control
-    handlers (settings/reentry/clock) consistent.
+    held socket via the command queue (NEVER a 2nd Connect — one connection per
+    turnstile, handle-leak safe, guide §3.1c); DEVICE-mode/unmanaged devices get a
+    one-shot connection. Used by settings/reentry/clock, /info, /table, /users and
+    /users/push|delete. fn runs on the worker thread and blocks its loop (rtlog,
+    doors) while it runs: keep it short.
     """
     ultra_eng = getattr(ctx.app, "_ultra_engine", None)
     if ultra_eng and getattr(ultra_eng, "running", False):
