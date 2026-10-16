@@ -278,7 +278,7 @@ export function usePopupStream(maxHistory = 50) {
       // Create new popup window (laptop-size, stays open)
       new WebviewWindow(label, {
         url: "/popup",
-        title: "MonClub Access — Écran Notification",
+        title: "MonClub Access — Écran d’entrée",
         width: 1024,
         height: 600,
         resizable: true,

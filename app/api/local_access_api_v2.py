@@ -1079,7 +1079,7 @@ def _handle_auth_login(ctx: _Ctx) -> None:
 
 
 def _reset_gym_name_refresh(app: Any) -> None:
-    """Profil's gym name: the next online sync fetches it again (guide §3.13). Never fatal."""
+    """Profil's gym name: the next online sync fetches it again (guide §3.15). Never fatal."""
     try:
         app._gym_name_refresher.reset()
     except Exception:
@@ -1922,7 +1922,7 @@ def _handle_sync_history_list(ctx: _Ctx) -> None:
 
 
 def _handle_sync_history_detail(ctx: _Ctx) -> None:
-    from app.core.db import get_sync_run
+    from app.core.db import get_sync_run, list_push_batches_for_sync_run
 
     run_id = ctx.param_int("id")
     if run_id <= 0:
@@ -1932,7 +1932,10 @@ def _handle_sync_history_detail(ctx: _Ctx) -> None:
     if row is None:
         ctx.send_json(404, {"ok": False, "error": "Sync run not found"})
         return
-    ctx.send_json(200, {"ok": True, "item": row})
+    # The push batches recorded as answering this run (guide §3.13) -- empty for a run
+    # older than the link, a members-only delta (no batch is written) or a run that
+    # pushed nothing. Never matched by time.
+    ctx.send_json(200, {"ok": True, "item": row, "pushBatches": list_push_batches_for_sync_run(run_id)})
 
 
 def _handle_push_history_list(ctx: _Ctx) -> None:
@@ -1944,6 +1947,20 @@ def _handle_push_history_list(ctx: _Ctx) -> None:
     status = ctx.q("status", default="").strip() or None
     result = list_push_batches(page=page, size=size, device_id=device_id, status=status)
     ctx.send_json(200, {"ok": True, **result})
+
+
+def _handle_push_history_hourly(ctx: _Ctx) -> None:
+    """Push batches of one local day, per device and local hour (Historique push chart)."""
+    from datetime import datetime as _dt
+    from app.core.db import push_batch_hourly
+
+    day = ctx.q("date", default="").strip() or _dt.now().strftime("%Y-%m-%d")
+    try:
+        _dt.strptime(day, "%Y-%m-%d")
+    except ValueError:
+        ctx.send_json(400, {"ok": False, "error": "date must be YYYY-MM-DD"})
+        return
+    ctx.send_json(200, {"ok": True, **push_batch_hourly(day=day)})
 
 
 def _handle_push_history_pins(ctx: _Ctx) -> None:
@@ -2048,6 +2065,89 @@ def _handle_members_roster(ctx: _Ctx) -> None:
         "counts": counts,
         "limit": max(1, int(limit or 25)),
         "offset": max(0, int(offset or 0)),
+    })
+
+
+def _handle_member_card(ctx: _Ctx) -> None:
+    """GET /api/v2/members/{activeMembershipId}/card -- the member card's extra lines for ONE
+    membership, read when the card opens (never per roster row). Local copy only, works
+    offline. Never returns a fingerprint template. 404 when this PC holds no row for it."""
+    from app.core.db import get_member_card_details
+
+    amid = ctx.param_int("activeMembershipId", 0)
+    if amid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "a positive activeMembershipId is required"})
+        return
+    details = get_member_card_details(amid)
+    if details is None:
+        ctx.send_json(404, {"ok": False, "error": "membership not on this PC"})
+        return
+    ctx.send_json(200, {"ok": True, **details})
+
+
+def _handle_member_history(ctx: _Ctx) -> None:
+    """GET /api/v2/members/{activeMembershipId}/history?limit= -- the latest door events this PC
+    stored for the person behind the membership (db.list_member_access_history), shaped like
+    the dashboard feed: time (event time, else the PC's receive time), device name, door,
+    allowed, raw refusal code (the UI words it), method. ``retentionDays`` is the backend
+    history_retention_days the prune uses. 404 when this PC holds no row for the membership."""
+    from app.core.db import list_member_access_history
+    from app.core.device_attendance import (
+        _credential_type_from_raw,
+        _load_json_object,
+        _lower_keys,
+        _normalize_datetime_text,
+    )
+
+    amid = ctx.param_int("activeMembershipId", 0)
+    if amid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "a positive activeMembershipId is required"})
+        return
+    res = list_member_access_history(amid, limit=ctx.q_int("limit", default=20))
+    if res is None:
+        ctx.send_json(404, {"ok": False, "error": "membership not on this PC"})
+        return
+
+    device_names: Dict[int, str] = {}
+    try:
+        from access.store import list_sync_devices_payload
+
+        for dev in list_sync_devices_payload() or []:
+            did = _safe_int(dev.get("id") or dev.get("deviceId"), 0)
+            if did > 0:
+                device_names[did] = _safe_str(dev.get("name"), "")
+    except Exception:
+        pass
+    retention = None
+    try:
+        from app.core.settings_reader import get_backend_global_settings
+
+        retention = _safe_int((get_backend_global_settings() or {}).get("history_retention_days"), 0) or None
+    except Exception:
+        retention = None
+
+    out: List[Dict[str, Any]] = []
+    for r in res["rows"]:
+        did = _safe_int(r.get("device_id"), 0) if r.get("device_id") is not None else None
+        out.append({
+            "id": r.get("id"),
+            "at": _normalize_datetime_text(r.get("event_time"), fallback=r.get("created_at")),
+            "allowed": bool(r.get("allowed")),
+            "reason": _safe_str(r.get("reason"), ""),
+            "deviceId": did,
+            "deviceName": device_names.get(int(did or 0), ""),
+            "doorId": r.get("door_id"),
+            "method": _credential_type_from_raw(_lower_keys(_load_json_object(r.get("raw_json")))),
+            "activeMembershipId": r.get("active_membership_id"),
+            "source": _safe_str(r.get("history_source"), ""),
+        })
+    ctx.send_json(200, {
+        "ok": True,
+        "activeMembershipId": amid,
+        "userId": res["userId"],
+        "limit": res["limit"],
+        "retentionDays": retention,
+        "rows": out,
     })
 
 
@@ -3738,13 +3838,18 @@ def _handle_member_mutation(ctx: _Ctx) -> None:
 
 
 def _handle_mutations_list(ctx: _Ctx) -> None:
-    from app.core.db import list_offline_mutations, count_offline_mutations
+    from app.core.db import annotate_offline_mutation_targets, list_offline_mutations, count_offline_mutations
     raw = ctx.q("state", "states", default="")
     states = [s.strip().lower() for s in raw.replace(";", ",").split(",") if s.strip()] or None
     include_archived = _safe_str(ctx.q("includeArchived", "include", default=""), "") in ("1", "true")
     limit = ctx.q_int("limit", default=200)
     offset = ctx.q_int("offset", default=0)
     rows = list_offline_mutations(states=states, include_archived=include_archived, limit=limit, offset=offset)
+    # Display names for the UI only (Card M 8); a failed lookup leaves the rows as they were.
+    try:
+        annotate_offline_mutation_targets(rows)
+    except Exception:
+        pass
     total = count_offline_mutations(states=states, include_archived=include_archived)
     ctx.send_json(200, {"ok": True, "rows": rows, "total": total})
 
@@ -6658,6 +6763,13 @@ def _build_update_status_payload(app) -> Dict[str, Any]:
                 "availableUntil": lr.get("availableUntil"),
                 "minCompatibleVersion": lr.get("minCompatibleVersion"),
             }
+    if um is not None and callable(getattr(um, "local_rollback_info", None)):
+        # « Revenir à la version précédente »: previous\ is kept by Setup (not the server's
+        # rollback offer `rollback`). Files only -- this payload is polled every 3 s.
+        try:
+            data["localRollback"] = um.local_rollback_info()
+        except Exception:
+            data["localRollback"] = None
     return data
 
 
@@ -6703,6 +6815,56 @@ def _handle_component_update_install(ctx: _Ctx) -> None:
         ctx.send_json(500, {"ok": False, "error": str(exc) or "the installer could not be started"})
         return
     ctx.send_json(200, {"ok": True, "message": "installer started; the app restarts on the new version"})
+    try:
+        ctx.app.after(500, ctx.app.quit_app)  # let the response reach the UI first
+    except Exception:
+        pass
+
+
+def _update_actor() -> str:
+    """Who asked for it, for the logs: the Access account signed in on this PC."""
+    try:
+        from access.store import load_auth_token
+
+        auth = load_auth_token()
+        email = (getattr(auth, "email", None) or "").strip() if auth else ""
+        return f"Update page ({email})" if email else "Update page (no account signed in)"
+    except Exception:
+        return "Update page (account unknown)"
+
+
+def _handle_update_rollback(ctx: _Ctx) -> None:
+    """« Revenir à la version précédente » (Access only): start the restore helper FIRST
+    (shared/update_runtime.py::launch_rollback -- journal + the start-up check's restore helper,
+    which waits for this process to exit, puts previous\\ back and restarts the app); answer 200
+    and quit only when it runs. Body ``{previousVersion, currentVersion}`` = what the confirmation
+    named; a mismatch is refused. Any refusal answers 409 and the app keeps running."""
+    from shared.update_runtime import RollbackRefused
+
+    um = getattr(ctx.app, "_update_manager", None)
+    if not um or not callable(getattr(um, "launch_rollback", None)):
+        ctx.send_json(400, {"ok": False, "error": "update manager not available"})
+        return
+    body = ctx.body()
+    body = body if isinstance(body, dict) else {}
+    expected_previous = body.get("previousVersion")
+    expected_current = body.get("currentVersion")
+    if not isinstance(expected_previous, str) or not isinstance(expected_current, str):
+        ctx.send_json(400, {"ok": False, "error": "body must be {\"previousVersion\": str, \"currentVersion\": str}"})
+        return
+    actor = _update_actor()
+    try:
+        um.launch_rollback(expected_previous=expected_previous, expected_current=expected_current)
+    except RollbackRefused as exc:
+        ctx.app.logger.warning("[Update] rollback %s -> %s by %s refused: %s", expected_current, expected_previous, actor, exc)
+        ctx.send_json(409, {"ok": False, "code": exc.code, "error": str(exc)})
+        return
+    except Exception as exc:
+        ctx.app.logger.error("[Update] rollback %s -> %s by %s FAILED: %s", expected_current, expected_previous, actor, exc)
+        ctx.send_json(500, {"ok": False, "error": str(exc) or "the rollback could not be started"})
+        return
+    ctx.app.logger.warning("[Update] rollback %s -> %s started by %s; the app now exits", expected_current, expected_previous, actor)
+    ctx.send_json(200, {"ok": True, "message": "restore started; the app restarts on the previous version"})
     try:
         ctx.app.after(500, ctx.app.quit_app)  # let the response reach the UI first
     except Exception:
@@ -6971,6 +7133,14 @@ def _handle_db_tables(ctx: _Ctx) -> None:
         pass
 
     ctx.send_json(200, {"tables": tables, "dbSizeBytes": db_size})
+
+
+def _handle_db_kpis(ctx: _Ctx) -> None:
+    """Base locale tiles: memberships / people, cards held by two persons, door history
+    still to send (db.py::local_db_kpis, guide §3.13)."""
+    from app.core.db import local_db_kpis
+
+    ctx.send_json(200, {"ok": True, **local_db_kpis()})
 
 
 def _handle_db_table_query(ctx: _Ctx) -> None:

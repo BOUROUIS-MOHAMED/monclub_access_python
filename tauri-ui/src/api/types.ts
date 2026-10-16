@@ -487,6 +487,66 @@ export interface OfflineQueueListResponse {
   states: OfflineCreationState[];
 }
 
+// ─── Utilisateurs member card (GET /api/v2/members/{activeMembershipId}/card) ───
+// Read only when the card opens. Local copy of the server's data; no template, no secret.
+export interface MemberCardFingerprint {
+  fingerId: number | null;
+  label: string | null;
+  enabled: boolean;
+}
+
+export interface MemberCardResponse {
+  ok: boolean;
+  activeMembershipId: number;
+  userId: number | null;
+  /** The row sits in sync_users_held (off the turnstile roster for the gym date). */
+  held: boolean;
+  fingerprintCount: number;
+  fingerprints: MemberCardFingerprint[];
+  /** QR (TOTP) credentials granting this membership — state only, never the secret. */
+  qrCredentials: { enabled: boolean; rotatedAt: string | null; updatedAt: string | null }[];
+  /** The sync_users_held hold (reason frozen | expired | not_started, gym date), null on the roster. */
+  hold: { reason: string | null; forDate: string | null; at: string | null } | null;
+  /** Protocol-2 freeze days; null when this PC cannot say (no/untrusted windows, no window). */
+  freeze: {
+    gymDate: string;
+    frozenToday: boolean;
+    /** offDays after the gym date — freeze start/end dates are not synced. */
+    nextFreezeDays: string[];
+    beyondHorizon: boolean;
+    horizonEnd: string | null;
+  } | null;
+}
+
+// GET /api/v2/members/{activeMembershipId}/history?limit= — door events THIS PC stored for the
+// person behind the membership (rows with no resolved member are not attributable).
+export interface MemberHistoryRow {
+  id: number;
+  /** Local wall clock "YYYY-MM-DDTHH:MM:SS" (event time, else the PC's receive time). */
+  at: string;
+  allowed: boolean;
+  /** Raw refusal code; word it with aDenyCopy(reason).short. */
+  reason: string;
+  deviceId: number | null;
+  deviceName: string;
+  doorId: number | null;
+  /** CARD | FINGER_PRINT | QR_CODE … (same source as the dashboard feed). */
+  method: string;
+  /** The membership the event was resolved to (may be another plan of the same person). */
+  activeMembershipId: number | null;
+  source: string;
+}
+
+export interface MemberHistoryResponse {
+  ok: boolean;
+  activeMembershipId: number;
+  userId: number | null;
+  limit: number;
+  /** Backend history_retention_days (what the local prune uses), null if unknown. */
+  retentionDays: number | null;
+  rows: MemberHistoryRow[];
+}
+
 // ─── E) Local fingerprints (GET /api/v2/fingerprints) ───
 export interface LocalFingerprintDto {
   id: number;
@@ -523,6 +583,23 @@ export interface AgentDeviceSnap {
 }
 
 // ─── G) Updates (GET /api/v2/update/status) ───
+/** GET /update/status `localRollback` (shared/update_runtime.py::local_rollback_info). */
+export interface LocalRollbackInfo {
+  available: boolean;
+  currentVersion: string | null;
+  previousVersion: string | null;
+  /** Why it is not available: not_supported, not_installed_build, no_previous, previous_unreadable,
+   *  previous_other_component, previous_not_older, previous_too_old, helper_missing. */
+  reason: string | null;
+}
+
+/** POST /update/rollback — an error answer carries `code` (busy, changed, setup_running,
+ *  journal_present, update_in_progress, launch_failed, or one of LocalRollbackInfo.reason). */
+export interface UpdateRollbackResponse {
+  ok: boolean;
+  message?: string;
+}
+
 export interface UpdateStatusResponse {
   updateAvailable: boolean;
   downloaded: boolean;
@@ -563,6 +640,8 @@ export interface UpdateStatusResponse {
   pendingSince?: number | null;        // epoch seconds the offer was first verified
   installing?: boolean;
   lastResult?: UpdateLastResult | null;
+  // « Revenir à la version précédente »: the previous\ folder Setup kept (not the server's `rollback` offer).
+  localRollback?: LocalRollbackInfo | null;
 
   // Legacy block (backward compat)
   latestRelease?: {
@@ -670,6 +749,8 @@ export interface SyncRunHistoryResponse {
 export interface PushBatchHistoryRow {
   id: number;
   sync_run_id?: number | null;
+  /** Every sync run this batch answers: the DEVICE-mode column and the ULTRA link rows. */
+  sync_run_ids?: number[];
   device_id: number;
   device_name: string;
   policy: string;
@@ -682,12 +763,64 @@ export interface PushBatchHistoryRow {
   created_at: string;
 }
 
+/** GET /sync-history/{id}: the run and the push batches recorded as answering it. */
+export interface SyncRunDetailResponse {
+  ok: boolean;
+  item: SyncRunHistoryRow;
+  pushBatches?: PushBatchHistoryRow[];
+}
+
 export interface PushBatchHistoryResponse {
   ok: boolean;
   items: PushBatchHistoryRow[];
   total: number;
   page: number;
   size: number;
+}
+
+/** GET /db/kpis — Base locale tiles (counted per person for cards, see guide §3.13). */
+export interface LocalDbKpisResponse {
+  ok: boolean;
+  memberships: number;
+  people: number;
+  cards: {
+    distinct: number;
+    duplicated: number;
+    peopleInvolved: number;
+    /** At most 50, most-shared first. */
+    duplicates: { card: string; people: { fullName: string; userId: number | null; mainAccountId: number | null }[] }[];
+  };
+  historyToSend: { total: number; pending: number; retrying: number; oldestCreatedAt: string | null };
+}
+
+/** GET /push-history/hourly?date=YYYY-MM-DD — one local day, per device × local hour. */
+export interface PushHourlyCell {
+  hour: number;
+  batches: number;
+  success: number;
+  partial: number;
+  failed: number;
+  inProgress: number;
+  other: number;
+  pinsAttempted: number;
+  pinsSuccess: number;
+  pinsFailed: number;
+}
+
+export interface PushHourlyDevice {
+  deviceId: number;
+  deviceName: string;
+  /** Only the hours that have at least one batch. */
+  hours: PushHourlyCell[];
+}
+
+export interface PushHourlyResponse {
+  ok: boolean;
+  date: string;
+  fromUtc: string;
+  toUtc: string;
+  devices: PushHourlyDevice[];
+  totals: { batches: number; pinsAttempted: number; pinsSuccess: number; pinsFailed: number };
 }
 
 export interface PushPinHistoryRow {

@@ -3675,6 +3675,27 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_push_batch_history_device_id "
             "ON push_batch_history(device_id);"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_push_batch_history_sync_run_id "
+            "ON push_batch_history(sync_run_id);"
+        )
+        # Which sync runs asked for an ULTRA pass (guide §3.13). A worker coalesces the
+        # requests that arrive before its pass starts, so one pass (one batch row) can
+        # answer several runs: one row per (batch, run). DEVICE mode keeps using the
+        # single push_batch_history.sync_run_id column, as before.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS push_batch_sync_run (
+                batch_id    INTEGER NOT NULL REFERENCES push_batch_history(id) ON DELETE CASCADE,
+                sync_run_id INTEGER NOT NULL REFERENCES sync_run_history(id) ON DELETE CASCADE,
+                PRIMARY KEY (batch_id, sync_run_id)
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_push_batch_sync_run_run "
+            "ON push_batch_sync_run(sync_run_id);"
+        )
 
         conn.execute(
             """
@@ -8145,12 +8166,20 @@ def list_members_roster(
     list_sync_users_page before adding a consumer that would read them.
     [TEST: tests/test_local_state_template_free.py]"""
     users, _total = list_sync_users_page(limit=0, offset=0, include_templates=False)
+    # Held rows (§3.8: off the turnstile roster for the gym date -- frozen, expired, not
+    # started) are still memberships of the server's list on this PC; without them a member
+    # frozen today vanished from Utilisateurs. Flagged with heldReason so none reads as a plain
+    # roster row. [TEST: tests/test_member_card_details.py::TestHeldMembersOnTheRoster]
+    users = list(users) + _list_held_users_for_roster({
+        _to_int_or_none(u.get("activeMembershipId")) for u in users
+    })
     title_idx = _membership_title_index()
     muts_by_target = _active_mutations_by_target()
     today = datetime.now().date()
 
     enriched: List[Dict[str, Any]] = []
-    counts = {"all": 0, "active": 0, "expired": 0, "pending": 0}
+    # "held" is not a status: those rows are also counted in active/expired by validTo.
+    counts = {"all": 0, "active": 0, "expired": 0, "pending": 0, "held": 0}
     for u in users:
         row = dict(u)
         pending = bool(u.get("offlinePending"))
@@ -8176,6 +8205,8 @@ def list_members_roster(
         enriched.append(row)
         counts["all"] += 1
         counts[st] = counts.get(st, 0) + 1
+        if u.get("heldReason"):
+            counts["held"] += 1
 
     s = (status or "all").strip().lower()
     if s in ("active", "expired", "pending"):
@@ -8218,6 +8249,226 @@ def list_members_roster(
     off = max(0, int(offset or 0))
     page_rows = enriched[off:off + lim]
     return page_rows, filtered_total, counts
+
+
+def _list_held_users_for_roster(skip_ids: set) -> List[Dict[str, Any]]:
+    """sync_users_held rows as roster payloads, template-free (fingerprints_json is not
+    selected), each with ``heldReason`` / ``heldForDate`` and ``heldToday`` (held for the gym
+    date last applied by a flip, windows trusted). An id already on sync_users is skipped.
+    A read failure is logged and gives [] (the roster then shows sync_users only, as before)."""
+    try:
+        with get_conn() as conn:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(sync_users_held)").fetchall()]
+            keep = [c for c in cols if c != "fingerprints_json"]
+            if not keep:
+                return []
+            rows = [dict(r) for r in conn.execute(
+                "SELECT " + ", ".join(f'"{c}"' for c in keep) + " FROM sync_users_held"
+            ).fetchall()]
+            st = conn.execute("SELECT applied_date, trusted FROM access_v2_state WHERE id = 1").fetchone()
+    except Exception:
+        logging.getLogger(__name__).warning("members roster: held rows unreadable", exc_info=True)
+        return []
+    applied = str(st[0]) if st is not None and st[0] and st[1] else None
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        amid = _to_int_or_none(r.get("active_membership_id"))
+        if amid is not None and amid in skip_ids:
+            continue
+        u = _coerce_user_row_to_payload(r)
+        u["heldReason"] = r.get("held_reason")
+        u["heldForDate"] = r.get("held_for_date")
+        u["heldToday"] = bool(applied and r.get("held_for_date") == applied)
+        out.append(u)
+    return out
+
+
+def _member_row_for_card(conn: sqlite3.Connection, active_membership_id: int) -> tuple[Dict[str, Any] | None, Dict[str, Any] | None]:
+    """(row, hold) for one membership: the sync_users row, else the sync_users_held row with
+    its hold columns in ``hold``. Selects only the columns the member card reads -- one row's
+    fingerprints_json, never a roster-wide template read (list_sync_users_page CAUTION)."""
+    cols = "user_id, active_membership_id, membership_id, full_name, fingerprints_json"
+    r = conn.execute(
+        f"SELECT {cols} FROM sync_users WHERE active_membership_id = ? LIMIT 1",
+        (int(active_membership_id),),
+    ).fetchone()
+    if r is not None:
+        return dict(r), None
+    r = conn.execute(
+        f"SELECT {cols}, held_reason, held_for_date, held_at FROM sync_users_held "
+        "WHERE active_membership_id = ? LIMIT 1",
+        (int(active_membership_id),),
+    ).fetchone()
+    if r is None:
+        return None, None
+    d = dict(r)
+    hold = {
+        "reason": d.pop("held_reason", None),
+        "forDate": d.pop("held_for_date", None),
+        "at": d.pop("held_at", None),
+    }
+    return d, hold
+
+
+def get_member_card_details(active_membership_id: int) -> Dict[str, Any] | None:
+    """What the Utilisateurs member card shows beyond the roster row, for ONE membership,
+    read only when the card is opened (Access v5 Card M). None when this PC holds no row for
+    the membership (neither sync_users nor sync_users_held).
+
+    * ``fingerprints`` -- the prints of the local copy of the server's member row: finger id,
+      label, enabled. Never the template itself. ``fingerprintCount`` = number of entries.
+    * ``qrCredentials`` -- the rows of sync_gym_access_credentials (today's list, as the server
+      sent it) whose granted ids contain this membership: enabled flag and rotation date only.
+      ``secret_hex`` is never selected.
+    """
+    try:
+        amid = int(active_membership_id)
+    except (TypeError, ValueError):
+        return None
+    if amid <= 0:
+        return None
+    with get_conn() as conn:
+        row, hold = _member_row_for_card(conn, amid)
+        if row is None:
+            return None
+        cred_rows = [dict(r) for r in conn.execute(
+            "SELECT enabled, rotated_at, updated_at, granted_active_membership_ids_json "
+            "FROM sync_gym_access_credentials"
+        ).fetchall()]
+        state_row = conn.execute(
+            "SELECT trusted, applied_date, horizon_end FROM access_v2_state WHERE id = 1"
+        ).fetchone()
+        win_row = conn.execute(
+            "SELECT access_from, access_until, off_days_json, off_days_beyond_horizon "
+            "FROM member_access_window WHERE active_membership_id = ?",
+            (amid,),
+        ).fetchone()
+
+    qr: List[Dict[str, Any]] = []
+    for c in cred_rows:
+        granted = _expand_gym_access_credential_json_fields(c).get("granted_active_membership_ids") or []
+        # Parsed ids, never a substring match on the JSON text (12 would match 123).
+        if amid not in {i for i in (_to_int_or_none(g) for g in granted) if i is not None}:
+            continue
+        qr.append({
+            "enabled": bool(_to_int_or_none(c.get("enabled")) or 0),
+            "rotatedAt": c.get("rotated_at"),
+            "updatedAt": c.get("updated_at"),
+        })
+
+    fps: List[Dict[str, Any]] = []
+    try:
+        raw = json.loads(row.get("fingerprints_json") or "[]")
+    except Exception:
+        raw = []
+    for f in raw if isinstance(raw, list) else []:
+        if not isinstance(f, dict):
+            continue
+        fps.append({
+            "fingerId": _to_int_or_none(f.get("fingerId")),
+            "label": f.get("label") if isinstance(f.get("label"), str) else None,
+            "enabled": f.get("enabled") is not False,
+        })
+
+    return {
+        "activeMembershipId": amid,
+        "userId": _to_int_or_none(row.get("user_id")),
+        "held": hold is not None,
+        "fingerprintCount": len(fps),
+        "fingerprints": fps,
+        "qrCredentials": qr,
+        "hold": hold,
+        "freeze": _member_freeze_facts(state_row, win_row, hold),
+    }
+
+
+def _member_freeze_facts(state_row: Any, win_row: Any, hold: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    """The freeze lines of the member card from the protocol-2 data (§3.8), or None when that
+    data cannot say: no access_v2_state row, untrusted windows (the flip moves nothing then, and
+    neither does this card claim anything), no applied gym date, or no stored window.
+
+    * ``frozenToday`` -- the row is held out of the roster for reason ``frozen`` FOR the applied
+      gym date (a hold set on an earlier date does not say "today").
+    * ``nextFreezeDays`` -- the window's ``offDays`` AFTER the gym date, sorted. Freeze periods
+      (start/end) are not synced: only these days are known, up to ``horizonEnd``;
+      ``beyondHorizon`` = the server said more exist past it.
+    """
+    from app.core import access_dates as _ad
+
+    if state_row is None or win_row is None:
+        return None
+    st = dict(state_row)
+    if not st.get("trusted"):
+        return None
+    gym = _ad.parse_iso_date(st.get("applied_date"))
+    if gym is None:
+        return None
+    w = _window_from_columns(win_row[0], win_row[1], win_row[2], win_row[3])
+    if w is None:
+        return None
+    frozen_today = bool(
+        hold is not None
+        and str(hold.get("reason") or "") == "frozen"
+        and _ad.parse_iso_date(hold.get("forDate")) == gym
+    )
+    return {
+        "gymDate": gym.isoformat(),
+        "frozenToday": frozen_today,
+        "nextFreezeDays": [d.isoformat() for d in sorted(w.off_days) if d > gym],
+        "beyondHorizon": bool(w.off_days_beyond_horizon),
+        "horizonEnd": st.get("horizon_end"),
+    }
+
+
+MEMBER_HISTORY_LIMIT_MAX = 200
+
+
+def list_member_access_history(active_membership_id: int, *, limit: int = 20) -> Dict[str, Any] | None:
+    """The latest door events stored on THIS PC for the person behind one membership
+    (Utilisateurs member card, Card M 7c). None when this PC holds no row for the membership.
+
+    By person: access_history.user_id is resolved at insert time by the AGENT and ULTRA
+    writers, and the person's other memberships are the same visitor -- each row carries its
+    own active_membership_id so the UI can tell them apart. The query is the
+    ix_access_history_user_door_day prefix (user_id). Rows with no user_id (DEVICE-mode
+    attendance, an event no member was resolved for) cannot be attributed and are not listed.
+    A member row with no user_id falls back to ``active_membership_id = ?`` (no index, rare).
+    """
+    try:
+        amid = int(active_membership_id)
+    except (TypeError, ValueError):
+        return None
+    if amid <= 0:
+        return None
+    lim = max(1, min(int(limit or 20), MEMBER_HISTORY_LIMIT_MAX))
+    cols = (
+        "id, created_at, event_time, device_id, door_id, allowed, reason, event_type, "
+        "history_source, raw_json, active_membership_id"
+    )
+    with get_conn() as conn:
+        found = None
+        for table in ("sync_users", "sync_users_held"):
+            found = conn.execute(
+                f"SELECT user_id FROM {table} WHERE active_membership_id = ? LIMIT 1", (amid,),
+            ).fetchone()
+            if found is not None:
+                break
+        if found is None:
+            return None
+        uid = _to_int_or_none(found[0])
+        if uid is not None:
+            rows = conn.execute(
+                f"SELECT {cols} FROM access_history WHERE user_id = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (uid, lim),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT {cols} FROM access_history WHERE active_membership_id = ? "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (amid, lim),
+            ).fetchall()
+    return {"userId": uid, "limit": lim, "rows": [dict(r) for r in rows]}
 
 
 @_tel.timed("DB_READ_list_sync_users_by_active_membership_ids", slow_ms=50, warn_ms=1000)
@@ -10151,7 +10402,13 @@ def insert_push_batch(
     policy: str,
     status: str = "IN_PROGRESS",
     created_at: str,
+    sync_run_ids: Iterable[int] | None = None,
 ) -> int:
+    """Open a push batch row. ``sync_run_ids``: the sync runs whose request this ULTRA pass
+    answers (push_batch_sync_run, same transaction); a run row that no longer exists is
+    not linked."""
+    link_ids = sorted({int(run_id) for run_id in (sync_run_ids or ()) if run_id is not None})
+
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
         cur = conn.execute(
             """
@@ -10173,9 +10430,50 @@ def insert_push_batch(
                 created_at,
             ),
         )
-        return int(cur.lastrowid)
+        batch_id = int(cur.lastrowid)
+        for run_id in link_ids:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO push_batch_sync_run (batch_id, sync_run_id)
+                SELECT ?, id FROM sync_run_history WHERE id = ?
+                """,
+                (batch_id, run_id),
+            )
+        return batch_id
 
     return int(_run_db_write_sync("insert_push_batch", _write))
+
+
+def list_push_batches_for_sync_run(sync_run_id: int) -> List[Dict[str, Any]]:
+    """Every push batch recorded as answering this sync run: the DEVICE-mode column or an
+    ULTRA link row (push_batch_sync_run). Nothing is matched by time."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT b.id, b.device_id, b.device_name, b.policy, b.pins_attempted,
+                   b.pins_success, b.pins_failed, b.status, b.duration_ms,
+                   b.error_message, b.created_at
+            FROM push_batch_history b
+            WHERE b.sync_run_id = ?
+               OR b.id IN (SELECT batch_id FROM push_batch_sync_run WHERE sync_run_id = ?)
+            ORDER BY b.device_name COLLATE NOCASE ASC, b.id ASC
+            """,
+            (int(sync_run_id), int(sync_run_id)),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _push_batch_run_ids(conn: sqlite3.Connection, batch_ids: List[int]) -> Dict[int, List[int]]:
+    if not batch_ids:
+        return {}
+    placeholders = ",".join("?" for _ in batch_ids)
+    out: Dict[int, set] = {}
+    for row in conn.execute(
+        f"SELECT batch_id, sync_run_id FROM push_batch_sync_run WHERE batch_id IN ({placeholders})",
+        list(batch_ids),
+    ).fetchall():
+        out.setdefault(int(row[0]), set()).add(int(row[1]))
+    return {bid: sorted(ids) for bid, ids in out.items()}
 
 
 def update_push_batch(
@@ -10301,7 +10599,19 @@ def get_push_batch(batch_id: int) -> Dict[str, Any] | None:
             "SELECT * FROM push_batch_history WHERE id = ?",
             (int(batch_id),),
         ).fetchone()
-    return dict(row) if row else None
+        links = _push_batch_run_ids(conn, [int(batch_id)]) if row else {}
+    if not row:
+        return None
+    item = dict(row)
+    item["sync_run_ids"] = _batch_run_ids(item, links)
+    return item
+
+
+def _batch_run_ids(item: Dict[str, Any], links: Dict[int, List[int]]) -> List[int]:
+    ids = set(links.get(int(item["id"]), []))
+    if item.get("sync_run_id") is not None:
+        ids.add(int(item["sync_run_id"]))
+    return sorted(ids)
 
 
 def get_push_batch_pins(batch_id: int) -> List[Dict[str, Any]]:
@@ -10364,8 +10674,12 @@ def list_push_batches(
             """,
             [*params, page_size, page_num * page_size],
         ).fetchall()
+        items = [dict(row) for row in rows]
+        links = _push_batch_run_ids(conn, [int(item["id"]) for item in items])
+    for item in items:
+        item["sync_run_ids"] = _batch_run_ids(item, links)
     return {
-        "items": [dict(row) for row in rows],
+        "items": items,
         "total": total,
         "page": page_num,
         "size": page_size,
@@ -10384,6 +10698,117 @@ def prune_sync_run_history(*, retention_days: int = 30) -> int:
         )
         return int(cur.rowcount or 0)
     return _run_db_write_sync("prune_sync_run_history", _write)
+
+
+def _parse_push_batch_utc(value: Any) -> datetime | None:
+    """push_batch_history.created_at -> aware UTC datetime.
+
+    Every writer stores UTC, in two spellings: ``...Z`` (ULTRA standalone / MIRROR,
+    ``time.strftime(..., gmtime())``) and ``+00:00`` (``device_sync.py``,
+    ``isoformat()``). A value without an offset is read as UTC too (same writers);
+    an unparsable value is None -- left out, never guessed.
+    """
+    from datetime import timezone as _tz
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text.replace(" ", "T", 1))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_tz.utc)
+    return parsed.astimezone(_tz.utc)
+
+
+_PUSH_HOURLY_STATUS_KEY = {
+    "SUCCESS": "success",
+    "PARTIAL": "partial",
+    "FAILED": "failed",
+    "IN_PROGRESS": "inProgress",
+}
+
+
+def push_batch_hourly(*, day: str, tz: Any = None) -> Dict[str, Any]:
+    """Push batches of one LOCAL day, grouped by device and local hour (Historique push).
+
+    ``day`` is ``YYYY-MM-DD`` in the PC's local time (``tz`` overrides the zone, for
+    tests). A batch is placed by its ``created_at`` -- the moment its row was opened,
+    i.e. when that push started. Each cell counts batches by their stored ``status``
+    (an unknown status counts as ``other``) and sums the stored ``pins_*`` columns.
+    """
+    from datetime import timezone as _tz
+
+    start_naive = datetime.strptime(str(day), "%Y-%m-%d")
+    end_naive = start_naive + timedelta(days=1)
+    if tz is None:
+        start_local = start_naive.astimezone()      # the PC's zone at that midnight
+        end_local = end_naive.astimezone()
+    else:
+        start_local = start_naive.replace(tzinfo=tz)
+        end_local = end_naive.replace(tzinfo=tz)
+    start_utc = start_local.astimezone(_tz.utc)
+    end_utc = end_local.astimezone(_tz.utc)
+    # Coarse SQL window on the first 19 characters, which both spellings share, one
+    # day wider on each side; the exact cut is made below on the parsed value.
+    lo = (start_utc - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    hi = (end_utc + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, device_id, device_name, status, pins_attempted, pins_success,
+                   pins_failed, created_at
+            FROM push_batch_history
+            WHERE substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
+              AND substr(replace(created_at, ' ', 'T'), 1, 19) < ?
+            ORDER BY id ASC
+            """,
+            (lo, hi),
+        ).fetchall()
+
+    devices: Dict[int, Dict[str, Any]] = {}
+    totals = {"batches": 0, "pinsAttempted": 0, "pinsSuccess": 0, "pinsFailed": 0}
+    for row in rows:
+        created = _parse_push_batch_utc(row["created_at"])
+        if created is None or not (start_utc <= created < end_utc):
+            continue
+        local = created.astimezone(tz) if tz is not None else created.astimezone()
+        device_id = int(row["device_id"])
+        dev = devices.setdefault(device_id, {"deviceId": device_id, "deviceName": "", "hours": {}})
+        dev["deviceName"] = str(row["device_name"] or "")   # id order: the latest name wins
+        cell = dev["hours"].setdefault(int(local.hour), {
+            "hour": int(local.hour), "batches": 0,
+            "success": 0, "partial": 0, "failed": 0, "inProgress": 0, "other": 0,
+            "pinsAttempted": 0, "pinsSuccess": 0, "pinsFailed": 0,
+        })
+        status = str(row["status"] or "").strip().upper()
+        cell[_PUSH_HOURLY_STATUS_KEY.get(status, "other")] += 1
+        cell["batches"] += 1
+        totals["batches"] += 1
+        for src, dst in (("pins_attempted", "pinsAttempted"),
+                         ("pins_success", "pinsSuccess"),
+                         ("pins_failed", "pinsFailed")):
+            n = int(row[src] or 0)
+            cell[dst] += n
+            totals[dst] += n
+
+    out = []
+    for dev in sorted(devices.values(), key=lambda d: (d["deviceName"].lower(), d["deviceId"])):
+        out.append({
+            "deviceId": dev["deviceId"],
+            "deviceName": dev["deviceName"],
+            "hours": [dev["hours"][h] for h in sorted(dev["hours"])],
+        })
+    return {
+        "date": start_naive.strftime("%Y-%m-%d"),
+        "fromUtc": start_utc.isoformat(timespec="seconds"),
+        "toUtc": end_utc.isoformat(timespec="seconds"),
+        "devices": out,
+        "totals": totals,
+    }
 
 
 def prune_push_batch_history(*, retention_days: int = 30) -> int:
@@ -10882,6 +11307,111 @@ def list_pending_access_history_for_sync(*, limit: int = 200) -> List[AccessHist
             (ACCESS_HISTORY_SYNC_PENDING, ACCESS_HISTORY_SYNC_FAILED_RETRYABLE, now, lim),
         ).fetchall()
         return [AccessHistoryRow(**dict(r)) for r in rows]
+
+
+_LOCAL_DB_DUPLICATE_SAMPLE = 50
+
+
+def local_db_kpis() -> Dict[str, Any]:
+    """Base locale tiles (guide §3.13). Counts only what the tables store.
+
+    Duplicate cards are counted per PERSON, not per row: a person has one sync_users row per
+    membership, each repeating their cards. The person is ``main_account_id``, else -- when
+    no row of that ``user_id`` carries one -- the ``user_id``, else the membership, else the
+    row alone. A card
+    counts as duplicated when two or more persons hold it, in either card column. A card
+    value is trimmed; an empty value is no card.
+
+    « Passages à envoyer » is the door-history uploader's own filter
+    (``list_pending_access_history_for_sync``): PENDING or FAILED_RETRYABLE, blank MB2000
+    rows excluded -- without its due-now time condition (a row waiting for its retry time
+    is still to send).
+    """
+    from app.core.zkem_rtlog_filter import BLANK_HISTORY_SQL
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id, main_account_id, active_membership_id, full_name,
+                   first_card_id, second_card_id
+            FROM sync_users
+            """
+        ).fetchall()
+        waiting = conn.execute(
+            """
+            SELECT backend_sync_state, COUNT(*), MIN(created_at)
+            FROM access_history
+            WHERE backend_sync_state IN (?, ?)
+              AND NOT """ + BLANK_HISTORY_SQL + """
+            GROUP BY backend_sync_state
+            """,
+            (ACCESS_HISTORY_SYNC_PENDING, ACCESS_HISTORY_SYNC_FAILED_RETRYABLE),
+        ).fetchall()
+
+    account_by_user: Dict[int, int] = {}
+    for row in rows:
+        if row["user_id"] is not None and row["main_account_id"] is not None:
+            uid, mid = int(row["user_id"]), int(row["main_account_id"])
+            account_by_user[uid] = min(mid, account_by_user.get(uid, mid))
+
+    def _person(row: Any, index: int) -> str:
+        if row["main_account_id"] is not None:
+            return f"a:{int(row['main_account_id'])}"
+        if row["user_id"] is not None:
+            uid = int(row["user_id"])
+            if uid in account_by_user:
+                return f"a:{account_by_user[uid]}"
+            return f"u:{uid}"
+        if row["active_membership_id"] is not None:
+            return f"m:{int(row['active_membership_id'])}"
+        return f"r:{index}"     # nothing names the person: this row alone, never merged
+
+    people: Dict[str, Dict[str, Any]] = {}
+    holders: Dict[str, set] = {}
+    for index, row in enumerate(rows):
+        key = _person(row, index)
+        person = people.setdefault(key, {
+            "fullName": "", "userId": row["user_id"], "mainAccountId": None,
+        })
+        if not person["fullName"] and row["full_name"]:
+            person["fullName"] = str(row["full_name"])
+        if key.startswith("a:"):
+            person["mainAccountId"] = int(key[2:])
+        for col in ("first_card_id", "second_card_id"):
+            card = str(row[col] or "").strip()
+            if card:
+                holders.setdefault(card, set()).add(key)
+
+    duplicated = sorted((card for card, keys in holders.items() if len(keys) > 1),
+                        key=lambda c: (-len(holders[c]), c))
+    involved = set()
+    for card in duplicated:
+        involved |= holders[card]
+
+    by_state = {str(r[0]): (int(r[1] or 0), r[2]) for r in waiting}
+    pending, pending_oldest = by_state.get(ACCESS_HISTORY_SYNC_PENDING, (0, None))
+    retrying, retrying_oldest = by_state.get(ACCESS_HISTORY_SYNC_FAILED_RETRYABLE, (0, None))
+    oldest = min([v for v in (pending_oldest, retrying_oldest) if v], default=None)
+
+    return {
+        "memberships": len(rows),
+        "people": len(people),
+        "cards": {
+            "distinct": len(holders),
+            "duplicated": len(duplicated),
+            "peopleInvolved": len(involved),
+            "duplicates": [
+                {"card": card, "people": [people[k] for k in sorted(holders[card])]}
+                for card in duplicated[:_LOCAL_DB_DUPLICATE_SAMPLE]
+            ],
+        },
+        "historyToSend": {
+            "total": pending + retrying,
+            "pending": pending,
+            "retrying": retrying,
+            "oldestCreatedAt": oldest,
+        },
+    }
 
 
 def mark_access_history_synced(*, row_ids: Iterable[int], synced_at: str | None = None) -> int:
@@ -12226,6 +12756,47 @@ def list_offline_mutations(
     params.extend([max(1, int(limit or 200)), max(0, int(offset or 0))])
     with get_conn() as conn:
         return [_mutation_row_to_dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+
+
+def annotate_offline_mutation_targets(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Add ``targetMemberName`` / ``targetMembershipTitle`` to the rows whose target is an
+    ``active_membership`` this PC holds (sync_users, else sync_users_held), for the « Modifications
+    d'abonnement » tab (Card M 8). One batch read of three columns -- never ``SELECT *``, which
+    would load fingerprint templates. Tax/freeze targets (other id spaces) and memberships no
+    longer on this PC are left as they are: the UI shows ``#id``. Mutates and returns ``rows``."""
+    ids = sorted({
+        int(t) for t in (
+            _to_int_or_none(r.get("target_id")) for r in rows
+            if str(r.get("target_kind") or "") == "active_membership"
+        ) if t is not None and t > 0
+    })
+    if not ids:
+        return rows
+    found: Dict[int, tuple[str | None, Any]] = {}
+    with get_conn() as conn:
+        for table in ("sync_users_held", "sync_users"):          # sync_users last: it wins
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                ph = ",".join("?" for _ in chunk)
+                for r in conn.execute(
+                    f"SELECT active_membership_id, full_name, membership_id FROM {table} "
+                    f"WHERE active_membership_id IN ({ph})",
+                    tuple(chunk),
+                ).fetchall():
+                    found[int(r[0])] = (r[1], r[2])
+    if not found:
+        return rows
+    titles = _membership_title_index()
+    for r in rows:
+        if str(r.get("target_kind") or "") != "active_membership":
+            continue
+        hit = found.get(_to_int_or_none(r.get("target_id")) or 0)
+        if hit is None:
+            continue
+        name, membership_id = hit
+        r["targetMemberName"] = name or ""
+        r["targetMembershipTitle"] = titles.get(str(membership_id), "") if membership_id is not None else ""
+    return rows
 
 
 def count_offline_mutations(*, states: List[str] | None = None, include_archived: bool = False) -> int:

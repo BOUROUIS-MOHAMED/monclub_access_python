@@ -25,6 +25,9 @@
       recover     The journal rule of design section 8.0 (stale journal -> claim -> restore or drop ->
                   last_update.json). Exit 0 no journal; 20 restored; 21 dropped (no restore
                   needed); 22 journal present but not stale (stand down); 23 restore failed.
+                  A journal written by the app's manual rollback (shared/update_runtime.py
+                  launch_rollback) carries reason 'user_rollback': the ROLLED_BACK of exit 20
+                  then says so instead of 'interrupted'. Any other reason is ignored.
 
     The install journal ({app}\state\install_journal.json) and last_update.json formats are
     the L2/L3 contract in design.md section 8.0. All JSON is written ASCII-only, without BOM.
@@ -464,7 +467,7 @@ try {
             }
             $journal = $null
             try { $journal = Get-Content -LiteralPath $JournalPath -Raw | ConvertFrom-Json } catch { }
-            $phase = ''; $jFrom = ''; $jTo = ''; $at = $null; $jSetupPid = 0
+            $phase = ''; $jFrom = ''; $jTo = ''; $at = $null; $jSetupPid = 0; $jReason = 'interrupted'
             if ($journal) {
                 if ($journal.PSObject.Properties.Name -contains 'setupPid') {
                     try { $jSetupPid = [int] $journal.setupPid } catch { $jSetupPid = 0 }
@@ -472,6 +475,8 @@ try {
                 if ($journal.PSObject.Properties.Name -contains 'phase') { $phase = [string] $journal.phase }
                 if ($journal.PSObject.Properties.Name -contains 'from') { $jFrom = [string] $journal.from }
                 if ($journal.PSObject.Properties.Name -contains 'to') { $jTo = [string] $journal.to }
+                # Only the manual rollback's own reason is taken from the journal; Setup writes none.
+                if (($journal.PSObject.Properties.Name -contains 'reason') -and ([string] $journal.reason -ceq 'user_rollback')) { $jReason = 'user_rollback' }
                 if ($journal.PSObject.Properties.Name -contains 'at') {
                     try {
                         $at = [DateTime]::ParseExact([string] $journal.at, "yyyy-MM-dd'T'HH:mm:ss'Z'",
@@ -515,7 +520,7 @@ try {
                 exit 21
             }
             if (Invoke-Restore) {
-                Write-LastUpdate 'ROLLED_BACK' $jTo $jFrom 'interrupted'
+                Write-LastUpdate 'ROLLED_BACK' $jTo $jFrom $jReason
                 Remove-Item -LiteralPath $claimed -Force -ErrorAction SilentlyContinue
                 exit 20
             }

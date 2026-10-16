@@ -248,6 +248,30 @@ def test_recover_restores_previous_from_a_stale_journal(root: Path, phase: str):
     assert set(last) == {"result", "from", "to", "reason", "log", "at"}
 
 
+def test_recover_names_a_manual_rollback_in_its_result(root: Path):
+    """The app's « Revenir à la version précédente » (shared/update_runtime.py launch_rollback)
+    writes a journal with reason user_rollback: the restore says so instead of 'interrupted'."""
+    write_payload(root / "previous", "1.0.0")
+    write_payload(root / "current", "2.0.0")
+    j = {"phase": "restoring", "from": "1.0.0", "to": "2.0.0", "at": utc(-30), "setupPid": 0, "reason": "user_rollback"}
+    (root / "state" / "install_journal.json").write_text(json.dumps(j), encoding="ascii")
+    r = run_helper("recover", root)
+    assert r.returncode == 20, r.stdout + r.stderr
+    assert tree(root / "current") == tree(root / "previous")
+    last = read_json(root / "state" / "last_update.json")
+    assert (last["result"], last["from"], last["to"], last["reason"]) == ("ROLLED_BACK", "2.0.0", "1.0.0", "user_rollback")
+
+
+@pytest.mark.parametrize("reason", ["crash", "USER_ROLLBACK", "user_rollback x", ""])
+def test_recover_ignores_any_other_journal_reason(root: Path, reason: str):
+    write_payload(root / "previous", "1.0.0")
+    (root / "current").mkdir()
+    j = {"phase": "copying", "from": "1.0.0", "to": "2.0.0", "at": utc(-30), "setupPid": 0, "reason": reason}
+    (root / "state" / "install_journal.json").write_text(json.dumps(j), encoding="ascii")
+    assert run_helper("recover", root).returncode == 20
+    assert read_json(root / "state" / "last_update.json")["reason"] == "interrupted"
+
+
 def test_recover_drops_a_stale_backing_up_journal_without_touching_current(root: Path):
     write_payload(root / "current", "1.0.0")
     before = tree(root / "current")

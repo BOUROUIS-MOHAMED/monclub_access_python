@@ -1,30 +1,34 @@
 // "Keep MonClub Access running (watchdog)" -- design section 12 (owner decision O7).
-// Self-contained on purpose: the BLUE v5 redesign restyles it later without touching
-// ConfigPage. Reads GET /api/v2/watchdog on mount, after a change and on "Refresh" (each read
-// starts a hidden PowerShell on the PC, so there is no fast polling); the switch posts
+// Self-contained on purpose: it sits in Configuration › « Démarrage Windows » without touching
+// ConfigPage's save model. Reads GET /api/v2/watchdog on mount, after a change and on "Refresh"
+// (each read starts a hidden PowerShell on the PC, so there is no fast polling); the switch posts
 // {enabled} and shows the fresh status the server returns.
+// v5 look (DialogRow / Chip / Note / ConfirmDialog). Only Configuration renders it — the TV build
+// does not import it.
 import { useCallback, useEffect, useState } from "react";
 import { ShieldCheck, Loader2, RefreshCw } from "lucide-react";
 
 import { get, post, ApiError } from "@/api/client";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { Alert, AlertDescription } from "@/components/ui/alert";
+import { ActionButton } from "@/components/ui/action-button";
+import { Chip, ToneIcon } from "@/components/ui/chip";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { DialogRow } from "@/components/ui/dialog-frame";
+import { Note } from "@/components/ui/panel";
+import type { Tone } from "@/components/ui/tone";
 import {
-  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription,
-  AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
-import {
-  chipVariant, formatWhen, lastCheckText, loadLang, needsConfirm, saveLang, switchDisabled,
-  watchdogChip, watchdogTexts, type Lang, type WatchdogStatus,
+  formatWhen, lastCheckText, loadLang, needsConfirm, saveLang, switchDisabled,
+  watchdogChip, watchdogTexts, type Lang, type WatchdogChip, type WatchdogStatus,
 } from "@/lib/watchdogStatus";
 
 // The server's worst case for one change: read 20 s + register 120 s (its hidden-launcher probe
 // alone may take 30 s) + read 20 s + Enable/Disable 30 s + read 20 s = 210 s (review #3).
 const CHANGE_TIMEOUT_MS = 240_000;
+
+// Same meaning as `chipVariant` (old badge look), in the v5 tones.
+const CHIP_TONE: Record<WatchdogChip, Tone> = {
+  loading: "grey", on: "success", off: "grey", notInstalled: "grey", stoodDown: "warning", error: "error",
+};
 
 export default function WatchdogCard() {
   const [lang, setLang] = useState<Lang>(() => loadLang());
@@ -85,83 +89,71 @@ export default function WatchdogCard() {
   const lastEvent = status?.lastLogEntry && !status.lastLogEntry.fromLastCheck ? status.lastLogEntry : null;
 
   return (
-    <Card data-testid="watchdog-card">
-      <CardHeader>
-        <CardTitle className="text-sm flex items-center gap-2">
-          <ShieldCheck className="h-4 w-4" /> {t.title}
-          <Badge variant={chipVariant(chip)} className="text-xs" data-testid="watchdog-chip">{t.chip[chip]}</Badge>
-          <span className="ml-auto flex items-center gap-1">
-            <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={toggleLang} title="FR / EN">
-              {t.langSwitch}
-            </Button>
-            <Button size="sm" variant="ghost" className="h-7 px-2" onClick={() => { void load(); }}
-              disabled={loading || busy} title={t.refresh} aria-label={t.refresh}>
-              <RefreshCw className={loading ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
-            </Button>
-          </span>
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        <div className="flex items-start justify-between gap-4">
-          <div className="space-y-1">
-            <Label htmlFor="watchdog-switch">{t.switchLabel}</Label>
-            <p className="text-sm text-muted-foreground">{t.explain(minutes)}</p>
+    <div data-testid="watchdog-card">
+      <div className="flex flex-wrap items-center gap-2.5 pb-1 pt-1">
+        <ToneIcon icon={ShieldCheck} tone={CHIP_TONE[chip]} size={34} />
+        <div className="min-w-[160px] flex-1 text-[14px] font-bold leading-snug">{t.title}</div>
+        <Chip tone={CHIP_TONE[chip]} dot data-testid="watchdog-chip">{t.chip[chip]}</Chip>
+        <ActionButton kind="ghost" size="xs" onClick={toggleLang} title="FR / EN">{t.langSwitch}</ActionButton>
+        <ActionButton
+          kind="outline" size="xs" iconOnly icon={RefreshCw} spin={loading}
+          onClick={() => { void load(); }} disabled={loading || busy} title={t.refresh}
+        >
+          {t.refresh}
+        </ActionButton>
+      </div>
+
+      <DialogRow
+        label={<label htmlFor="watchdog-switch">{t.switchLabel}</label>}
+        hint={(
+          <>
+            {t.explain(minutes)}
             {status && status.registered !== null && (
-              <p className="text-xs text-muted-foreground" data-testid="watchdog-last-check">
-                {lastCheckText(status, lang)}
-              </p>
+              <span className="mt-1 block text-[12px]" data-testid="watchdog-last-check">{lastCheckText(status, lang)}</span>
             )}
             {lastEvent && (
-              <p className="text-xs text-muted-foreground">
+              <span className="mt-1 block text-[12px]">
                 {t.lastEvent} ({formatWhen(lastEvent.at, lang) ?? lastEvent.rawAt ?? "?"}) : {lastEvent.message}
-              </p>
+              </span>
             )}
             {status && status.restartsLastHour > 0 && (
-              <p className="text-xs text-muted-foreground">{t.restarts(status.restartsLastHour)}</p>
+              <span className="mt-1 block text-[12px]">{t.restarts(status.restartsLastHour)}</span>
             )}
-          </div>
-          <div className="flex items-center gap-3">
-            {busy && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" aria-label={t.saving} />}
-            <Switch
-              id="watchdog-switch"
-              data-testid="watchdog-switch"
-              checked={status?.enabled === true}
-              disabled={switchDisabled(status, busy || loading, fetchError)}
-              onCheckedChange={(checked: boolean) => onSwitch(checked)}
-            />
-          </div>
-        </div>
-
-        {chip === "stoodDown" && status && (
-          <Alert variant="warning"><AlertDescription>{t.stoodDown(status.restartsLastHour)}</AlertDescription></Alert>
+          </>
         )}
-        {chip === "notInstalled" && <p className="text-xs text-muted-foreground">{t.notInstalled}</p>}
-        {chip === "off" && <p className="text-xs text-muted-foreground">{t.offHint}</p>}
-        {status && !status.available && <p className="text-xs text-muted-foreground">{t.unavailable}</p>}
+        className="border-b-0"
+      >
+        {busy && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" aria-label={t.saving} />}
+        <Switch
+          id="watchdog-switch"
+          data-testid="watchdog-switch"
+          checked={status?.enabled === true}
+          disabled={switchDisabled(status, busy || loading, fetchError)}
+          onCheckedChange={(checked: boolean) => onSwitch(checked)}
+        />
+      </DialogRow>
+
+      <div className="flex flex-col gap-2">
+        {chip === "stoodDown" && status && <Note tone="warning">{t.stoodDown(status.restartsLastHour)}</Note>}
+        {chip === "notInstalled" && <Note tone="grey">{t.notInstalled}</Note>}
+        {chip === "off" && <Note tone="grey">{t.offHint}</Note>}
+        {status && !status.available && <Note tone="grey">{t.unavailable}</Note>}
         {(fetchError || status?.lastError) && (
-          <Alert variant="destructive">
-            <AlertDescription>{t.readError} {status?.lastError || fetchError}</AlertDescription>
-          </Alert>
+          <Note tone="error">{t.readError} {status?.lastError || fetchError}</Note>
         )}
-        {changeError && (
-          <Alert variant="destructive"><AlertDescription>{t.changeError} {changeError}</AlertDescription></Alert>
-        )}
-      </CardContent>
+        {changeError && <Note tone="error">{t.changeError} {changeError}</Note>}
+      </div>
 
-      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>{t.confirmTitle}</AlertDialogTitle>
-            <AlertDialogDescription>{t.confirmBody}</AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>{t.cancel}</AlertDialogCancel>
-            <AlertDialogAction onClick={() => { setConfirmOpen(false); void apply(false); }}>
-              {t.confirmOk}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-    </Card>
+      <ConfirmDialog
+        open={confirmOpen}
+        onOpenChange={setConfirmOpen}
+        title={t.confirmTitle}
+        description={t.confirmBody}
+        cancelLabel={t.cancel}
+        confirmLabel={t.confirmOk}
+        confirmKind="primary"
+        onConfirm={() => { setConfirmOpen(false); void apply(false); }}
+      />
+    </div>
   );
 }

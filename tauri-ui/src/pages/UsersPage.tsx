@@ -1,8 +1,10 @@
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode } from "react";
 import { useUsers } from "@/api/hooks";
 import { get, openSSE, patch, post } from "@/api/client";
 import type {
+  MemberCardResponse,
+  MemberHistoryResponse,
   OfflineAttemptResponse,
   OfflineCreationKind,
   OfflineCreationRow,
@@ -42,6 +44,7 @@ import {
   ImagePlus,
   Loader2,
   Pencil,
+  QrCode,
   RefreshCw,
   Repeat,
   ScanLine,
@@ -53,8 +56,10 @@ import {
   UserPlus,
   Users as UsersIcon,
   X,
+  type LucideIcon,
 } from "lucide-react";
 import { usePageChrome } from "@/context/PageChromeContext";
+import { aDenyCopy } from "@/pages/PopupWindow";
 import { cn } from "@/lib/utils";
 
 type MembershipChoice = { id: number | string; title?: string };
@@ -85,6 +90,11 @@ type MemberRosterRow = {
   pendingMutations?: { localId: string; opKind: string; state: string; money: boolean }[];
   pendingDelete?: boolean;
   hasConflict?: boolean;
+  /** Set on rows of sync_users_held: off the turnstile roster for the gym date (frozen, expired, not_started). */
+  heldReason?: string | null;
+  heldForDate?: string | null;
+  /** Held for the gym date the PC last applied (not an older hold). */
+  heldToday?: boolean;
 };
 
 type MutationRow = {
@@ -101,6 +111,9 @@ type MutationRow = {
   server_result_json?: string | null;
   expected_version?: number | null;
   payload?: Record<string, any>;
+  /** Set by GET /mutations when target_kind is active_membership and the PC holds that row. */
+  targetMemberName?: string;
+  targetMembershipTitle?: string;
 };
 
 const MUTATION_ACTIVE_STATES = ["pending", "processing", "failed_retryable", "blocked_auth", "conflict"];
@@ -141,6 +154,21 @@ const CITIES: { v: string; l: string }[] = [
 
 const NONE = "__none__";
 const ROSTER_SIZE = 25;
+/** Passages listed on the member card (the endpoint caps at 200). */
+const VISITS_SHOWN = 10;
+
+/** Same words as the dashboard feed (DashboardPage methodLabel). */
+function visitMethod(method: string): string {
+  const m = (method || "").toUpperCase();
+  if (m.includes("QR") || m.includes("TOTP")) return "QR Code";
+  if (m.includes("FINGER") || m.includes("FP") || m.includes("BIO")) return "empreinte";
+  return "carte";
+}
+/** "2026-10-16T14:32:05" (local wall clock) → "16/10/2026 14:32". */
+function visitTime(at: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/.exec(n(at));
+  return m ? `${m[3]}/${m[2]}/${m[1]} ${m[4]}:${m[5]}` : (n(at) || "—");
+}
 
 const MEMBERSHIP_FORM_INIT = {
   accountUsernameId: "",
@@ -303,9 +331,19 @@ function periodUsedPct(m: MemberRosterRow): number | null {
   return Math.max(0, Math.min(100, Math.round(pct)));
 }
 
-/** The one flag shown next to a member's name (same priority as before). */
+/** Flag of a row the PC took off the turnstiles for the gym date (sync_users_held). */
+function heldFlag(m: MemberRosterRow): { label: string; tone: Tone } | null {
+  if (!m.heldReason) return null;
+  if (m.heldReason === "frozen") return { label: m.heldToday ? "gelé aujourd'hui" : "gelé", tone: "info" };
+  if (m.heldReason === "not_started") return { label: "pas encore commencé", tone: "grey" };
+  return { label: "hors des tourniquets", tone: "grey" };
+}
+
+/** The one flag shown next to a member's name (same priority as before; a held row second). */
 function rowFlag(m: MemberRosterRow): { label: string; tone: Tone } | null {
   if (m.hasConflict) return { label: "conflit", tone: "error" };
+  const held = heldFlag(m);
+  if (held) return held;
   if (m.offlinePending) return { label: "créé hors ligne", tone: "info" };
   if (m.pendingDelete) return { label: "suppression…", tone: "warning" };
   if ((m.pendingMutations?.length ?? 0) > 0) return { label: "sync en attente", tone: "warning" };
@@ -1061,6 +1099,36 @@ export default function UsersPage() {
   // falls back to the default rail when the row leaves the page.
   const selected = selectedKey ? roster.find((m) => memberKey(m) === selectedKey) ?? null : null;
 
+  // The card's extra lines (prints, …) come from GET /members/{id}/card, read once when a
+  // card opens and again after each roster reload — never per roster row. Keyed by the
+  // membership id so a slow answer for a previous card is never shown on the next one.
+  const selectedAmid = selected && !selected.offlinePending && Number(selected.activeMembershipId) > 0
+    ? Number(selected.activeMembershipId) : 0;
+  const [cardInfo, setCardInfo] = useState<{ amid: number; data: MemberCardResponse | null; error: string | null }>({ amid: 0, data: null, error: null });
+  useEffect(() => {
+    if (!selectedAmid) return;
+    let alive = true;
+    setCardInfo((c) => (c.amid === selectedAmid ? c : { amid: selectedAmid, data: null, error: null }));
+    get<MemberCardResponse>(`/members/${selectedAmid}/card`)
+      .then((d) => { if (alive) setCardInfo({ amid: selectedAmid, data: d, error: null }); })
+      .catch((e) => { if (alive) setCardInfo({ amid: selectedAmid, data: null, error: e?.message || String(e) }); });
+    return () => { alive = false; };
+  }, [selectedAmid, roster]);
+  const card = cardInfo.amid === selectedAmid ? cardInfo : { amid: selectedAmid, data: null, error: null };
+
+  // « Derniers passages »: same rule — read when the card opens, keyed by membership id.
+  const [visitInfo, setVisitInfo] = useState<{ amid: number; data: MemberHistoryResponse | null; error: string | null }>({ amid: 0, data: null, error: null });
+  useEffect(() => {
+    if (!selectedAmid) return;
+    let alive = true;
+    setVisitInfo((c) => (c.amid === selectedAmid ? c : { amid: selectedAmid, data: null, error: null }));
+    get<MemberHistoryResponse>(`/members/${selectedAmid}/history`, { limit: String(VISITS_SHOWN) })
+      .then((d) => { if (alive) setVisitInfo({ amid: selectedAmid, data: d, error: null }); })
+      .catch((e) => { if (alive) setVisitInfo({ amid: selectedAmid, data: null, error: e?.message || String(e) }); });
+    return () => { alive = false; };
+  }, [selectedAmid, roster]);
+  const visits = visitInfo.amid === selectedAmid ? visitInfo : { amid: selectedAmid, data: null, error: null };
+
   // Rail figures. Every one is derived from the roster page the API returned
   // (rosterCounts) or from flags the backend already sets on each row
   // (offlinePending / hasConflict / pendingDelete / pendingMutations).
@@ -1147,6 +1215,90 @@ export default function UsersPage() {
 
   const canMutate = (m: MemberRosterRow) => !m.offlinePending && Number(m.activeMembershipId) > 0;
 
+  // One line of the card fed by GET /members/{id}/card: loading, honest error, or the value.
+  // An offline-created member has no server id yet, so nothing is read for it.
+  const cardDetailLine = (
+    Icon: LucideIcon,
+    label: string,
+    m: MemberRosterRow,
+    show: (d: MemberCardResponse) => { v: string; muted?: boolean; tone?: Tone; title?: string },
+  ) => {
+    let v: string;
+    let cls = "text-muted-foreground";
+    let title: string | undefined;
+    if (m.offlinePending || !(Number(m.activeMembershipId) > 0)) {
+      v = "après synchronisation";
+    } else if (card.error) {
+      v = "indisponible";
+      cls = INK.error;
+      title = card.error;
+    } else if (!card.data) {
+      v = "chargement…";
+    } else {
+      const r = show(card.data);
+      v = r.v;
+      cls = r.tone ? INK[r.tone] : r.muted ? "text-muted-foreground" : "text-foreground";
+      title = r.title;
+    }
+    return (
+      <div className="mt-[9px] flex items-center gap-2.5 text-[13.5px]">
+        <Icon className="h-[17px] w-[17px] shrink-0 text-muted-foreground" />
+        <span className="flex-1">{label}</span>
+        <span className={cn("text-right text-[12.5px]", cls)} title={title}>{v}</span>
+      </div>
+    );
+  };
+
+  // « Derniers passages »: door events stored on THIS PC for the member (GET /members/{id}/history).
+  const renderVisits = (m: MemberRosterRow) => {
+    const amid = Number(m.activeMembershipId);
+    const d = visits.data;
+    const retention = d?.retentionDays ?? null;
+    const footnote = [
+      `Passages vus par ce PC${d ? ` (les ${d.limit} derniers au plus)` : ""}.`,
+      retention ? `Ceux de plus de ${retention} jours peuvent avoir été effacés.` : "",
+      "Un passage non rattaché à un membre n'apparaît pas.",
+    ].filter(Boolean).join(" ");
+    let body: ReactNode;
+    if (m.offlinePending || !(amid > 0)) {
+      body = <div className="mt-2 text-[12.5px] text-muted-foreground">Disponible après synchronisation.</div>;
+    } else if (visits.error) {
+      body = <div className={cn("mt-2 text-[12.5px]", INK.error)} title={visits.error}>Historique indisponible.</div>;
+    } else if (!d) {
+      body = <div className="mt-2 text-[12.5px] text-muted-foreground">Chargement…</div>;
+    } else if (d.rows.length === 0) {
+      body = <div className="mt-2 text-[12.5px] text-muted-foreground">Aucun passage enregistré sur ce PC.</div>;
+    } else {
+      body = (
+        <div className="mt-1">
+          {d.rows.map((r) => {
+            const other = r.activeMembershipId != null && Number(r.activeMembershipId) !== amid;
+            const where = [r.deviceName || (r.deviceId != null ? `Appareil #${r.deviceId}` : ""), r.doorId != null ? `porte ${r.doorId}` : ""].filter(Boolean).join(" · ");
+            const sub = [r.allowed ? visitMethod(r.method) : aDenyCopy(r.reason).short, where, other ? "autre abonnement" : ""].filter(Boolean).join(" · ");
+            return (
+              <div key={r.id} className="mt-[7px] flex items-start gap-2.5 text-[13px]" title={r.allowed ? undefined : r.reason || undefined}>
+                {r.allowed
+                  ? <CircleCheck className={cn("mt-[1px] h-4 w-4 shrink-0", INK.success)} />
+                  : <CircleX className={cn("mt-[1px] h-4 w-4 shrink-0", INK.error)} />}
+                <div className="min-w-0 flex-1">
+                  <div className="font-mono text-[12.5px]">{visitTime(r.at)}</div>
+                  <div className="truncate text-[12px] text-muted-foreground">{sub || "—"}</div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+    return (
+      <div className="border-b border-dashed border-grey/20 px-[18px] py-3">
+        <div className="text-[12px] font-bold uppercase tracking-[0.04em] text-muted-foreground">Derniers passages</div>
+        {body}
+        {amid > 0 && !m.offlinePending ? <div className="mt-2 text-[11.5px] text-muted-foreground">{footnote}</div> : null}
+      </div>
+    );
+  };
+
   // ── Fiche membre (right rail) ─────────────────────────────────────────
   const renderFiche = (m: MemberRosterRow) => {
     const st = statusOf(m.status);
@@ -1209,7 +1361,35 @@ export default function UsersPage() {
               <span className={cn("font-mono text-[12.5px]", c.v ? "text-foreground" : "text-muted-foreground")}>{c.v || "—"}</span>
             </div>
           ))}
+          {cardDetailLine(Fingerprint, "Empreintes", m, (d) => {
+            if (d.fingerprintCount === 0) return { v: "aucune", muted: true };
+            const ids = d.fingerprints.map((f) => (f.fingerId != null ? `#${f.fingerId}${f.enabled ? "" : " (désactivée)"}` : "?"));
+            return { v: `${d.fingerprintCount} · ${ids.join(", ")}`, title: "Copie locale du serveur" };
+          })}
+          {cardDetailLine(Snowflake, "Gel", m, (d) => {
+            const f = d.freeze;
+            if (!f) {
+              return { v: "non connu", muted: true, title: "Les jours de gel viennent de la synchronisation (protocole 2) ; ce poste ne les a pas, ou ses données de dates ne sont pas fiables." };
+            }
+            const fmt = (iso: string) => frDate(iso).slice(0, 5);
+            const next = f.nextFreezeDays.slice(0, 4).map(fmt).join(", ") + (f.nextFreezeDays.length > 4 ? ` +${f.nextFreezeDays.length - 4}` : "");
+            const title = [
+              f.horizonEnd ? `Jours de gel connus jusqu'au ${frDate(f.horizonEnd)}${f.beyondHorizon ? " ; le serveur en signale d'autres après" : ""}.` : "",
+              "Les dates de début et de fin du gel ne sont pas synchronisées : seuls ces jours sont connus.",
+            ].filter(Boolean).join(" ");
+            if (f.frozenToday) return { v: next ? `gelé aujourd'hui · puis ${next}` : "gelé aujourd'hui", tone: "info", title };
+            if (next) return { v: `prochains jours : ${next}`, title };
+            return { v: f.beyondHorizon ? "aucun jour proche" : "aucun jour prévu", muted: true, title };
+          })}
+          {cardDetailLine(QrCode, "QR code (application)", m, (d) => {
+            const on = d.qrCredentials.filter((c) => c.enabled);
+            const why = "Accordé à cet abonnement par le serveur (copie locale). Le contrôle QR peut encore refuser un passage (jours d'accès, liste des membres).";
+            if (on.length > 0) return { v: "activé sur le compte", tone: "success", title: why };
+            if (d.qrCredentials.length > 0) return { v: "désactivé", muted: true, title: why };
+            return { v: "aucun", muted: true };
+          })}
         </div>
+        {renderVisits(m)}
         <div className="flex flex-wrap gap-2 px-[18px] pb-4 pt-3">
           {canMutate(m) ? (
             <>
@@ -1393,6 +1573,7 @@ export default function UsersPage() {
                 ["Actifs", rosterCounts.active ?? 0, CircleCheck, "success"],
                 ["Expirés", rosterCounts.expired ?? 0, CircleX, "error"],
                 ["En attente (créés hors ligne)", rosterCounts.pending ?? 0, CloudUpload, "info"],
+                ["dont hors des tourniquets (gel, fin, début à venir)", rosterCounts.held ?? 0, Snowflake, "grey"],
               ] as const).map(([l, v, icon, tone]) => (
                 <ListRow
                   key={l}
@@ -1533,10 +1714,10 @@ export default function UsersPage() {
         label="Modifications d'abonnement"
         columns={[
           { label: "Opération", flex: 1.2 },
-          { label: "Abonnement", flex: 0.9 },
+          { label: "Abonnement", flex: 1.6 },
           { label: "État", flex: 1.1 },
           { label: "Argent", flex: 0.6 },
-          { label: "Erreur", flex: 2 },
+          { label: "Erreur", flex: 1.5 },
           { label: "Actions", flex: 1.9, align: "right" },
         ]}
         empty="Aucune modification en file."
@@ -1548,10 +1729,18 @@ export default function UsersPage() {
           return (
             <FlexRow key={mu.local_id} minHeight={60}>
               <FlexCell flex={1.2}><CellText title={op} strong /></FlexCell>
-              <FlexCell flex={0.9}><CellText title={`#${mu.target_id}`} mono /></FlexCell>
+              <FlexCell flex={1.6}>
+                {mu.targetMemberName != null ? (
+                  <CellText
+                    title={[mu.targetMembershipTitle, mu.targetMemberName].filter(Boolean).join(" · ") || `#${mu.target_id}`}
+                    sub={`#${mu.target_id}`}
+                    subMono
+                  />
+                ) : <CellText title={`#${mu.target_id}`} mono />}
+              </FlexCell>
               <FlexCell flex={1.1}><Chip tone={st.tone}>{st.l}</Chip></FlexCell>
               <FlexCell flex={0.6}>{mu.money ? <Chip tone="warning" size="sm">argent</Chip> : <CellText title="—" titleClassName="text-muted-foreground" />}</FlexCell>
-              <FlexCell flex={2} title={mu.last_error_message || ""}>
+              <FlexCell flex={1.5} title={mu.last_error_message || ""}>
                 <CellText title={mu.last_error_message || "—"} titleClassName={mu.last_error_message ? INK.error : "text-muted-foreground"} />
               </FlexCell>
               <FlexCell flex={1.9} align="right" className="gap-1.5">

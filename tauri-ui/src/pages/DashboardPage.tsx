@@ -29,6 +29,7 @@ import { FlexCell, FlexRow, FlexTable, IconCell, PersonCell } from "@/components
 import { ListRow, Note, PageGrid, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
 import { INK, initialsOf, type Tone } from "@/components/ui/tone";
 import { hasAgentDevices } from "@/lib/agentMode";
+import { formatDate, relativeTimeFr } from "@/lib/historyCopy";
 import { aDenyCopy } from "@/pages/PopupWindow";
 import { cn } from "@/lib/utils";
 import type { DashboardFeedItem, DashboardOverview, DashboardToday } from "@/api/types";
@@ -132,6 +133,8 @@ interface HeroLine {
   tone: Tone;
   title: string;
   sub?: string;
+  /** Tooltip on the sub line (the exact time behind a relative one). */
+  subTitle?: string;
   action?: { label: string; kind: "danger" | "outline"; run: () => void | Promise<unknown> };
 }
 
@@ -234,12 +237,15 @@ export default function DashboardPage() {
 
   // ── "Maintenant" lines: the sync line, then the machine line. Only real,
   // currently observable faults are surfaced.
-  const lastSyncWhen = whenLabel(sync.lastSyncAt, now);
+  // « il y a 2 min » refreshed by the page's 1 s clock; the exact time stays in the tooltip,
+  // and the clock time is shown when no relative time can be given.
+  const lastSyncWhen = relativeTimeFr(sync.lastSyncAt, now) ?? whenLabel(sync.lastSyncAt, now);
+  const lastSyncExact = sync.lastSyncAt ? formatDate(sync.lastSyncAt) : undefined;
   const syncLine: HeroLine = dspActive
     ? { key: "sync", icon: Upload, tone: "primary", title: "Envoi des membres", sub: dsp!.total > 0 ? `${dspPct} %` : "Connexion à l'appareil…" }
     : sync.lastOk
-      ? { key: "sync", icon: RefreshCw, tone: "success", title: "Synchronisation à jour", sub: lastSyncWhen ? `dernière ${lastSyncWhen}` : undefined }
-      : { key: "sync", icon: AlertTriangle, tone: "warning", title: "Dernière synchronisation en échec", sub: lastSyncWhen || undefined, action: { label: "Relancer", kind: "outline", run: handleSync } };
+      ? { key: "sync", icon: RefreshCw, tone: "success", title: "Synchronisation à jour", sub: lastSyncWhen ? `dernière ${lastSyncWhen}` : undefined, subTitle: lastSyncExact }
+      : { key: "sync", icon: AlertTriangle, tone: "warning", title: "Dernière synchronisation en échec", sub: lastSyncWhen || undefined, subTitle: lastSyncExact, action: { label: "Relancer", kind: "outline", run: handleSync } };
 
   const machineLine: HeroLine =
     showAgent && !agent.running
@@ -308,7 +314,7 @@ export default function DashboardPage() {
             >
               <l.icon className="h-[18px] w-[18px] shrink-0" />
               <span className="min-w-0 flex-1 truncate font-semibold">{l.title}</span>
-              {l.sub && <span className="truncate text-muted-foreground">{l.sub}</span>}
+              {l.sub && <span className="truncate text-muted-foreground" title={l.subTitle}>{l.sub}</span>}
               {l.action && (
                 <ActionButton kind={l.action.kind} size="xs" onClick={() => { void l.action!.run(); }}>
                   {l.action.label}

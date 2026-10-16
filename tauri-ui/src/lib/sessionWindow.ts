@@ -1,4 +1,4 @@
-// Profil's session row (Card P, guide §3.13): the stored access token's window,
+// Profil's session row (Card P, guide §3.15): the stored access token's window,
 // sessionIssuedAt -> sessionExpiresAt from /status. Pure TypeScript so node:test
 // can run it.
 

@@ -123,10 +123,19 @@ const ITEM_HIT: Record<FlashTone, string> = {
 };
 const KBD = "rounded border border-grey/40 bg-muted px-1 font-mono";
 
+// How long a flash stays. A success (« … : ouverture acceptée ») keeps the short 2.6 s it
+// always had; a pilot request, warning or error is longer text that must be read, so it
+// stays ~65 ms per character on top of 1.5 s, between 4 s and 12 s.
+const FLASH_SHORT_MS = 2600;
+function flashDurationMs(f: NonNullable<FlashState>): number {
+  if (f.tone === "success") return FLASH_SHORT_MS;
+  return clamp(1500 + f.msg.length * 65, 4000, 12000);
+}
+
 // The Rust shortcut handler (src-tauri/src/lib.rs, `favorite-shortcut-triggered`)
-// reports a door request filed for the PC pilote as ok=false with one of these two
-// texts. They are not failures: map them to info / warning here. If the Rust text
-// changes, these fall back to the red error flash.
+// says what happened in `status`. A shell built before `status` existed reports a door
+// request filed for the PC pilote as ok=false with one of these two texts: they are
+// matched only when `status` is missing (fallback), anything else is the red flash.
 const RUST_REQUEST_SENT = "demandé au PC pilote (résultat non visible ici)";
 const RUST_REQUEST_DRIVER_OFFLINE = "PC pilote non connecté : la demande expirera sans ouvrir";
 
@@ -365,6 +374,7 @@ export default function FavoritesOverlayPage() {
           doorName: string;
           deviceName: string;
           shortcut: string;
+          status?: "opened" | "requested" | "requested_offline" | "failed";
           ok: boolean;
           error?: string | null;
         }>("favorite-shortcut-triggered", (event) => {
@@ -372,11 +382,17 @@ export default function FavoritesOverlayPage() {
           const label = p.doorName?.trim() || p.deviceName || `Favori ${p.favoriteId}`;
           // Keyed on the favourite so its row lights up like a click would.
           const key = String(p.favoriteId);
-          if (p.ok) {
+          const status = p.status ?? (
+            p.ok ? "opened"
+              : p.error === RUST_REQUEST_SENT ? "requested"
+                : p.error === RUST_REQUEST_DRIVER_OFFLINE ? "requested_offline"
+                  : "failed"
+          );
+          if (status === "opened") {
             setFlash({ key, tone: "success", msg: `${p.shortcut} → ${label} : ouverture acceptée` });
-          } else if (p.error === RUST_REQUEST_SENT) {
+          } else if (status === "requested") {
             setFlash({ key, tone: "info", msg: `${p.shortcut} → ${label} : demande envoyée au PC pilote. Son résultat n'est pas visible ici.` });
-          } else if (p.error === RUST_REQUEST_DRIVER_OFFLINE) {
+          } else if (status === "requested_offline") {
             setFlash({ key, tone: "warning", msg: `${p.shortcut} → ${label} : demande enregistrée, mais le PC pilote n'est pas connecté : elle expirera sans ouvrir.` });
           } else {
             setFlash({ key, tone: "error", msg: `${p.shortcut} → ${label} : ${p.error ?? "erreur"}` });
@@ -436,9 +452,10 @@ export default function FavoritesOverlayPage() {
   }, []);
 
   // ── Auto-clear flash ──────────────────────────────────────────────────────
+  // Only the banner's own lifetime; the dock's open/collapse timers are separate.
   useEffect(() => {
     if (!flash) return undefined;
-    const t = window.setTimeout(() => setFlash(null), 2600);
+    const t = window.setTimeout(() => setFlash(null), flashDurationMs(flash));
     return () => window.clearTimeout(t);
   }, [flash]);
 

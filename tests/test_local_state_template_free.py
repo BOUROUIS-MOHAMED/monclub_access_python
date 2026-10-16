@@ -198,7 +198,7 @@ class TestMembersRoster:
         rows, total, counts = seeded.list_members_roster()
 
         assert total == 3
-        assert counts == {"all": 3, "active": 2, "expired": 1, "pending": 0}
+        assert counts == {"all": 3, "active": 2, "expired": 1, "pending": 0, "held": 0}
         by_id = {r["userId"]: r for r in rows}
         assert by_id[100]["status"] == "active"
         assert by_id[100]["membershipTitle"] == "Gold"

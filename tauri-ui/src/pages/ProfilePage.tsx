@@ -4,7 +4,7 @@
 //
 // Everything rendered here comes from the /status snapshot the app already
 // polls (session / mode / sync / pullsdk / ultra / updates / deviceSync) plus
-// LocalDbPage's unlock lease. Card P (guide §3.13): the session row reads the
+// LocalDbPage's unlock lease. Card P (guide §3.15): the session row reads the
 // stored token's window (sessionIssuedAt → sessionExpiresAt) for its days and
 // bar; the role comes from the token's `roles` claim; the gym name from
 // GET gym/me, cached per login; the account name is the holder's name from

@@ -58,14 +58,16 @@ This file is only useful while it is true. If you change any of the following, y
 | The one-shot credentials re-send at startup — what it drops, its marker table, its place and catch in `init_db` (`db.py::_force_one_credentials_resend`, `::_run_one_shot_credentials_resend`, `local_one_shot_steps`; `tools/bench_credential_resend.py`) | §3.1b "The upgrade window" |
 | What happens when an `init_db` step fails — the six schema migrations and the inline `device_write_hold.pin_scheme` `ALTER` that stop startup, the steps that log and go on, a `try` or an `import logging` added inside `init_db` (`db.py::init_db`, `::_relax_firmware_profiles_not_null`, `::_rebuild_sync_users_without_legacy_fingerprint`, `::_ensure_main_account_id_column`, `::_ensure_pin_scheme_column`, `::_ensure_column_forcing_refresh`, `sync_device_store.py::ensure_ultra_merge_device_columns`, `::_run_one_shot_credentials_resend`) | §3.2d "A failing migration stops startup", §3.1b "The upgrade window" |
 | Anything in `app/core/v2/` (the server clock, the v2 client, the notice socket, leases, commands, ownership backup, problem reports, loss re-add), `access/v2_routes.py`, or a lease-gate call site (`ultra_engine.py::_v2_writes_blocked` and the `_lease_gate` calls, `device_sync.py`, `realtime_agent.py`, `device_attendance.py`, `ultra_worker_pool.py::devices_to_drive`, `access/local_api_routes.py::LEASE_GATED_HANDLERS` / `SCANNER_GATED_HANDLERS`) | §3.9 |
-| The software updater client — check / verify / download / install / start-up gate / journal restore / loop guard / telemetry / update pages (`shared/update_runtime.py`, `shared/release_manifest.py`, `shared/ed25519.py`, `shared/release_keys.py`, `shared/update_versions.py`, `shared/update_files.py`, `shared/update_wrapper.py`, `shared/update_startup.py`, `access/update_runtime.py`, the update handlers in `local_access_api_v2.py`, `UpdatePage.tsx` / `TvUpdatePage.tsx`); the installer half — the safe swap, journal, health wait, same-version / zkemkeeper rules, uninstall data (`installer/MonClubAccess.iss`, `installer/MonClubTV.iss`, `installer/update_safety.iss`, `installer/update_helper.ps1`), the watchdog's journal rule (`packaging/watchdog/monclub_access_watchdog.ps1`), the watchdog task's registration and its Settings control (`packaging/watchdog/register_watchdog.ps1`, the `[Run]` entry and `WatchdogWhenMissing` in `MonClubAccess.iss`, `access/watchdog_control.py`, the `_handle_watchdog_*` handlers in `local_access_api_v2.py`, `tauri-ui/src/components/WatchdogCard.tsx`), the build / sign / publish gates (`build_release.ps1`, `tools/release_sign.py`, `publish_github_release.ps1`) | §11 Software updates |
+| The software updater client — check / verify / download / install / start-up gate / journal restore / loop guard / telemetry / update pages / the manual rollback « Revenir à la version précédente » (`shared/update_runtime.py`, `shared/release_manifest.py`, `shared/ed25519.py`, `shared/release_keys.py`, `shared/update_versions.py`, `shared/update_files.py`, `shared/update_wrapper.py`, `shared/update_startup.py`, `access/update_runtime.py`, the update handlers in `local_access_api_v2.py`, `UpdatePage.tsx` / `TvUpdatePage.tsx`); the installer half — the safe swap, journal, health wait, same-version / zkemkeeper rules, uninstall data (`installer/MonClubAccess.iss`, `installer/MonClubTV.iss`, `installer/update_safety.iss`, `installer/update_helper.ps1`), the watchdog's journal rule (`packaging/watchdog/monclub_access_watchdog.ps1`), the watchdog task's registration and its Settings control (`packaging/watchdog/register_watchdog.ps1`, the `[Run]` entry and `WatchdogWhenMissing` in `MonClubAccess.iss`, `access/watchdog_control.py`, the `_handle_watchdog_*` handlers in `local_access_api_v2.py`, `tauri-ui/src/components/WatchdogCard.tsx`), the build / sign / publish gates (`build_release.ps1`, `tools/release_sign.py`, `publish_github_release.ps1`) | §11 Software updates |
 | What `push_safety.check_bulk_removal` defers (`add_only`, `handover_release`) or lets through (a Confirm-removal approval) | §3.2g, §3.9 |
 | The removal log (`db.py::_log_v2_removal` in `clear_device_revocation_state` / `delete_device_sync_state`) | §3.4a, §3.9 |
 | The Erase-content wizard or the write hold (`app/core/erase_wizard.py` — incl. `::refill_roster`, `::held_waiting_count`, `EraseWizard._refill_check`, and since lane 1c `::_sync_staleness` / `::_sync_max_age_sec` with `app.py`'s `_last_sync_ok_mono` stamp, `::terminal_people` / `::not_refilled` / `::_bind_not_refilled` / `KEEP_MARK`, `::_refill_recheck`, `::_prune_now` / `::_folder_times`, `::_no_answer`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s codes —, `app/core/device_hold.py` — incl. `load(release_unstarted=)` and the `erase-prep`/`erase` phases —, `db.py::set_device_write_hold` / `::clear_device_write_hold` / `::list_device_write_holds`, `::begin_device_erase`, `::release_unstarted_erase_holds`, `::undo_device_erase_record` / `::device_list_is_authoritative` (lane 1f), `erase_wizard.py::check_erase_switch` / `monclub_api.py::get_erase_wizard_switch` (the gym's server switch), `erase_wizard.py::prune_erase_backups` (30-day retention), `::retire_device_records`, `::invalidate_device_records`, `device_sync.py::_filter_users_for_device(quiet=)`, `PullSDKDevice.ERASABLE_TABLES`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s offline answer, the hold in `ultra_engine.py::_v2_writes_blocked`, the worker's `_connected_addr` (`::_connect` / `::_disconnect`), `device_sync.py`'s three hold checks, `v2/handlers.py::device_reconcile`, `app.py`'s start-up `device_hold.load()` and `_sync_tick`'s `device_hold.ensure_loaded()`, `ownership.py::OwnershipSync._worker_idle`, the `erase` routes and handlers, `local_access_api_v2.py::_refuse_held_or_frozen`, `PullSDKDevice.count_table_strict` / `::read_table_strict` / `::erase_table`, `ZKStandaloneDevice.read_device_status` / `::read_user_templates` and the listing's `privilege`, `tauri-ui/src/components/EraseWizardDialog.tsx`) | §3.2h, pullsdk_guide §5, zkemkeeper_guide §4 |
 | What a turnstile's heartbeat line reports as waiting (`device_sync.py::count_waiting_pins`, `ultra_engine.py::_count_waiting_pins` and the snapshot's `failed_pins`, `_sync_one_device`'s `_last_waiting_pins`, `realtime_agent.py::get_status_snapshot`'s `failedPins`, `pc_identity.py::build_heartbeat_payload`, `::_report_held_turnstiles` and its `held` key, `erase_wizard.py::held_waiting_count`, the wizard's `_set_waiting`) | §3.10 |
 | Who writes to `access.db` — the DbWriter, `_run_db_write_sync` (its lanes, `priority=`, the inline nested call, the 60 s wait), a write outside it, the tripwire's allowlist (`tests/test_db_single_writer.py::ALLOWED_DIRECT`), which writes are in the door lane (`db.py::insert_access_history`, `::save_agent_rtlog_state`), the AGENT history claim (`realtime_agent.py::DecisionService.run`'s `F-013` block) | §3.11 |
 | The member fee lines of the entry screen -- what is stored, how it reaches the popup, how the screen judges and draws it (`db.py::_member_fees_json`, `::_member_fees_list`, `::_ensure_column_forcing_refresh`, `sync_users.fees_json` in `_SYNC_USER_COLUMNS` and the five member writers, `sync_access_software_settings.fee_due_soon_days`, `settings_reader.py::normalize_global_settings`'s `fee_due_soon_days`, `access_types.py::NotificationRequest.fees`, `ultra_engine.py::_enqueue_notification(user_fees=)`, `ultra_pc_entry.py::member_popup_fields`, `realtime_agent.py::_popup_payload_from_request`, `tauri-ui/src/lib/feeAlerts.ts`, `PopupWindow.tsx` `AFeeLine` / `AFeeMark`) | §3.12 |
-| What `/api/v2/status` shows Profil about the login -- `sessionIssuedAt` / `sessionExpiresAt` / `accountRole` (`shared/auth_state.py::read_jwt_claims`, `::jwt_session_window`, `::jwt_account_role`), `gymName` / `accountName` and their cache (`app/core/gym_info.py`, `MonClubApi.get_gym_me`, `db.py::save_gym_name` / `::load_gym_name` / `::load_account_name`, the `auth_state.gym_name*` and `account_name` columns, the call in the sync worker) | §3.13 Profil |
+| What `/api/v2/status` shows Profil about the login -- `sessionIssuedAt` / `sessionExpiresAt` / `accountRole` (`shared/auth_state.py::read_jwt_claims`, `::jwt_session_window`, `::jwt_account_role`), `gymName` / `accountName` and their cache (`app/core/gym_info.py`, `MonClubApi.get_gym_me`, `db.py::save_gym_name` / `::load_gym_name` / `::load_account_name`, the `auth_state.gym_name*` and `account_name` columns, the call in the sync worker) | §3.15 Profil |
+| Which sync run a push batch answers -- the `push_batch_sync_run` link and what carries its ids (`db.py::insert_push_batch(sync_run_ids=)`, `::list_push_batches_for_sync_run`; `app.py::_request_running_ultra_sync(sync_run_id=)` and its two calls in the sync tick; `ultra_engine.py::UltraEngine.request_sync_now(sync_run_ids=)`, `::_worker_full_sync_accepted_or_pending`, `UltraDeviceWorker.request_full_sync(sync_run_ids=)`, `::_drain_full_sync_commands`'s `run_kw`, `::_run_standalone_full_sync`, `::_maybe_mirror_reconcile`; `device_sync.py::run_one_device_on_connected_sdk` / `::_run_single_device_sync` / `::_sync_one_device`) -- or the history and Base locale figures (`db.py::push_batch_hourly`, `::local_db_kpis`) | §3.13 |
+| The Utilisateurs member card data and the mutation-queue names (`db.py::get_member_card_details`, `::_member_row_for_card`, `::_member_freeze_facts`, `::_list_held_users_for_roster` and its call in `::list_members_roster`, `::list_member_access_history`, `::annotate_offline_mutation_targets`, `local_access_api_v2.py::_handle_member_card`, `::_handle_mutations_list`'s names, `::_handle_member_history`, `tauri-ui/src/pages/UsersPage.tsx` `cardDetailLine`) | §3.14 |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -1802,6 +1804,8 @@ Access desktop UI (`tauri-ui/src`) was grepped in this repo. `[CODE]`
 | `GET /api/v2/push-history/{batchId}/pins`, `GET /api/v2/devices/{deviceId}/mirror-plan`, `GET /api/v2/db/access-history`, `GET /api/v2/popup/poll` | — | Raw pins / stored rows / engine-enriched notifications, no pin → member mapping in the handler (`popup/poll` payloads are enriched by `_handle_allow`, which is converted) | Display only |
 | `POST /api/v2/members/photo`, `POST /api/v2/members/mutation`, `POST /api/v2/enroll/retry-push` | `activeMembershipId` / `targetId` | Backend-side membership ids; no device pin | n/a |
 | `GET /api/v2/sync/cache/users`, `GET /api/v2/members` (`_handle_members_roster`) | paging/filter | Cached rows; they now also carry `mainAccountId` | n/a |
+| `GET /api/v2/members/{activeMembershipId}/card` (`_handle_member_card`, tauri-ui UsersPage member card) | path id | One membership's extra card lines from the local copy (§3.14); no device pin | n/a |
+| `GET /api/v2/members/{activeMembershipId}/history` (`_handle_member_history`, tauri-ui UsersPage member card) | path id, `limit` | `access_history` rows by the membership's `user_id` (stored at insert); no pin → member mapping in the handler (§3.14) | Display only |
 | `POST /api/v2/devices/{deviceId}/force-resync` | — | `clear_device_sync_hashes` (UPDATE) + scheduler `force_resync` | n/a |
 
 `[UNVERIFIED]` Whether any dashboard or UI screen calls `users/push` or `users/delete` with a pin: the
@@ -3876,7 +3880,7 @@ no `tzdata`, so `zoneinfo.ZoneInfo('Africa/Tunis')` raises; the Tunis offset is 
 | `access_v2_state` (one row) | the last `syncMeta`, `trusted`, the clock (`server_epoch`, `utc_offset_sec`, `skew_sec`, `floor_date`, `max_pc_epoch`, `clock_suspect`, `clock_reason`), `applied_date`, `grace_days`. NOT cleared by `clear_version_tokens` |
 | `member_access_window` | the window of every membership of today's set; replaced whole by each members section |
 | `sync_upcoming_users`, `sync_upcoming_credentials` | `upcoming[]` / `upcomingCredentials` exactly as last sent (the row's JSON; credentials stored disabled) |
-| `sync_users_held` | rows of today's set taken off the roster for a later gym date; the same 20 columns as `sync_users` (`_SYNC_USER_COLUMNS`) + reason/date |
+| `sync_users_held` | rows of today's set taken off the roster for a later gym date; the same 20 columns as `sync_users` (`_SYNC_USER_COLUMNS`) + reason/date. Also listed, flagged, on the Utilisateurs roster and member card (§3.14) |
 | `member_person_link` | membership → `userId` (+ `mainAccountId`), never deleted; written with `member_account_link` by every `sync_users` writer (no `mainAccountId` filter), back-filled at `init_db` — used by §3.4f |
 
 `windowsVersion` lives in `sync_version_tokens` (so logout and hard reset drop it and the request
@@ -4442,8 +4446,12 @@ drive while v2 is ON (`local_api_routes.py::_door_request_via_driver`: the desk'
 `{ok, requested, notDriver, targetConnected}`), so every caller — the Devices page, the favourites overlay, the
 tray panel, the tray menu and the global favourite shortcuts (`src-tauri/src/lib.rs`) — reaches the driver
 (review round 5: before, only the Devices page did); every caller shows it as "demandé au PC pilote", never
-as an opened door (review round 6: `lib.rs` shortcut → red flash with that text, tray menu → log line, overlay
-→ red flash, tray panel → info/destructive notice); a request filed by the local route itself (a remote command
+as an opened door (review round 6; v5: the tray panel and a click in the favourites dock show info when
+`targetConnected`, warning when not; the `lib.rs` shortcut event `favorite-shortcut-triggered` carries
+`status` = `opened` (2xx accepted) / `requested` / `requested_offline` / `failed`, and the dock flashes
+success / info / warning / red from it — `ok` + the French `error` text stay, matched only when `status` is
+missing, for an older shell `[CODE: lib.rs FavoriteShortcutEvent, FavoritesOverlayPage.tsx]`; tray menu → log
+line); a request filed by the local route itself (a remote command
 run in process, `LocalCtx.in_process`) is never re-filed. The server's DOOR_OPEN payload is `{doorNumber}`
 only (`AccessPcCommandPayloads.doorOpen`), so a favourite's own pulse time is lost: the driver pulses 3 s
 (`handlers.py::door_open`) — a contract limit (P3c-2). With v2 not ON it answers 409 `notDriver` as before;
@@ -4792,9 +4800,170 @@ tile's photo (red when a fee is unpaid, else gold). `[TEST: tauri-ui src/lib/fee
 (npm test)]` The layout on a real entry TV with two fee lines and the gold expiry footer together
 is `[UNVERIFIED]`: checked by type-check and by reading the 1280×720 stage sizes only.
 
+### 3.13 History pages and Base locale figures (Access v5 Card H, 2026-10-16)
+
+Read-only figures the Access UI shows on Historique push, Historique sync and Base locale. No
+handler here carries a member or a pin (so none belongs in §3.2f).
+
+- **`GET /api/v2/push-history/hourly?date=YYYY-MM-DD`** → `_handle_push_history_hourly` →
+  `db.py::push_batch_hourly` (tauri-ui `PushHourlyMatrix`, « Envois par heure »). `date` is a day of the
+  PC's local time (default today; anything else is 400). `push_batch_history.created_at` is UTC in two
+  spellings -- `...Z` (`ultra_engine.py` standalone pass and MIRROR, `time.strftime(..., gmtime())`) and
+  `+00:00` (`device_sync.py::_sync_one_device`, `isoformat()`); `_parse_push_batch_utc` reads both (a value
+  without an offset as UTC; an unparsable one is left out). Rows are cut on the local day and grouped by
+  device and local hour of `created_at` -- the moment the batch row was opened, i.e. when the push
+  started. A cell holds the batch count per stored `status` (`other` for anything but SUCCESS / PARTIAL /
+  FAILED / IN_PROGRESS) and the sums of the stored `pins_*`; nothing is inferred. The device name is the
+  latest stored for that device that day. On a day with a daylight-saving change the repeated hour is
+  one cell (grouped by hour number). `[TEST: test_push_history_hourly.py]`
+- **A sync run's result per device -- a recorded link, never a time match** (Historique sync, run
+  detail « Résultat par appareil »; `GET /api/v2/sync-history/{id}` now also answers `pushBatches`,
+  from `db.py::list_push_batches_for_sync_run`). Two sources, both written when the batch row is opened:
+  - DEVICE mode, unchanged: `push_batch_history.sync_run_id`, from the actor dispatch context
+    `_sync_all_devices` sets (`device_sync.py::_DeviceSyncActorAdapter._build_session` reads it when the
+    actor builds its session).
+  - ULTRA: before this change every ULTRA batch had `sync_run_id=None`. Now the sync tick passes its
+    `sync_run_history` id to `app.py::_request_running_ultra_sync(sync_run_id=)` -- only the two calls
+    inside the tick (members-only delta, device refresh); the other callers pass none -- which sends
+    `sync_run_ids={id}` to `UltraEngine.request_sync_now`. It reaches the worker only on the live-worker
+    full-sync route (`_worker_full_sync_accepted_or_pending` → `UltraDeviceWorker.request_full_sync`). The
+    worker merges every request that arrives before its pass starts into one pending request, so the ids
+    are a **set, unioned on merge** (never "last wins"), kept under the `sync_run_ids` key only when
+    non-empty. `_drain_full_sync_commands` hands them to the pass (`_run_standalone_full_sync`, which also
+    hands them to the MIRROR batch, or `run_one_device_on_connected_sdk` → `_sync_one_device`), and its
+    two re-queues of the SAME request (link dead, no raw PullSDK handle) carry them. The worker's own
+    follow-ups (`push-capped`, `revoke-failed`, `intent-promoted`, removal and erase requests) never
+    claim a run. `insert_push_batch(sync_run_ids=)` writes one `push_batch_sync_run (batch_id,
+    sync_run_id)` row per run in the batch's own transaction, linking only run rows that exist; the
+    ULTRA batch's `sync_run_id` column stays NULL. Both FKs cascade (`PRAGMA foreign_keys = ON`), so the
+    30-day prunes of either table remove the link rows. The ids are metadata only: no revoke, exclusion,
+    lease or hash decision reads them. `[CODE]` `[TEST: test_sync_run_push_link.py,
+    test_standalone_incremental_sync.py::TestSyncRunLink]`
+  - **Not linked, on purpose** (the run detail then says « Pas de détail par appareil pour ce
+    passage »): runs before this change; a members-only delta on ULTRA (targeted member syncs write no
+    push batch at all); the scheduler fallback for a worker whose thread is dead
+    (`UltraSyncScheduler.request_sync_now` / `_sync_all` do not carry the ids); a request the worker
+    reports as already covered without queuing a pass; a pass skipped because the roster hash did not
+    change (scheduler path) -- and a pass that has not started yet when the detail is opened (its row
+    appears once it starts). `[CODE]`
+- **`GET /api/v2/db/kpis`** → `_handle_db_kpis` → `db.py::local_db_kpis` (Base locale tiles, loaded once
+  per unlock):
+  - « Abonnements »: `sync_users` rows (one per membership) and the number of persons (key below).
+  - « Cartes en doublon »: a card value (trimmed; an empty string is no card -- what the cache stores
+    for a member without a card) held by **two or more persons**, in either `first_card_id` or
+    `second_card_id`. Counted per person, never per row: a person has one row per membership, each
+    repeating their cards, so counting rows would report false duplicates. The person is
+    `main_account_id`; when a row has none, the `main_account_id` another row of the same `user_id`
+    carries; else the `user_id` (tagged, so an account id and a user id never merge); else the
+    membership; else the row alone (never merged with another). `main_account_id` can be NULL on every row (§3.2d: a backend that does not send it) --
+    then persons are user ids, and two user ids of one account would count as two persons. The answer
+    also lists up to 50 duplicated cards with their persons' names (the page's tooltip).
+  - « Passages à envoyer »: the door-history uploader's own filter (`list_pending_access_history_for_sync`:
+    `PENDING` or `FAILED_RETRYABLE`, blank MB2000 rows excluded), without its due-now retry-time
+    condition; `retrying` is the `FAILED_RETRYABLE` part. `FAILED_TERMINAL` rows are never sent and are
+    not counted.
+  - Not shown (no column backs them without reading every fingerprint blob): the v4 « Empreintes »
+    tile. `[TEST: test_local_db_kpis.py]`
+
+### 3.14 The Utilisateurs member card data (Access v5 Card M, 2026-10-16)
+
+The member card (Utilisateurs › Répertoire › « Voir la fiche ») shows lines the roster row does not
+carry. They come from `GET /api/v2/members/{activeMembershipId}/card` (`_handle_member_card` →
+`db.py::get_member_card_details`), called by `UsersPage.tsx` only when a card is open — once when it
+opens and again after each roster reload — never per roster row, and never for an offline-created
+member (no server id yet: the card says « après synchronisation »). 404 when this PC holds no row for
+the membership in `sync_users` nor `sync_users_held`. `[CODE]`
+
+- **Fingerprints (« Empreintes »).** `_member_row_for_card` reads that ONE row's `fingerprints_json`
+  (from `sync_users`, else `sync_users_held`); the answer carries `fingerprintCount` and, per entry,
+  `fingerId` / `label` / `enabled` — never `templateData`. The roster keeps its template-free read
+  (`list_members_roster` → `include_templates=False`, the 8.8 s field measurement of
+  `list_sync_users_page`). The count is the local copy of the server's member row, like Enrôlement's
+  « Déjà enregistrées ». `[TEST: tests/test_member_card_details.py::TestFingerprintCount,
+  ::TestCardEndpoint]`
+- **QR (« QR code (application) »).** The rows of `sync_gym_access_credentials` — today's list as
+  the server sent it — whose `granted_active_membership_ids_json`, parsed as JSON (never a text
+  match: 12 must not match 123), contains the membership. The answer carries `enabled`,
+  `rotatedAt`, `updatedAt`; `secret_hex` is not even selected. `sync_users.qr_code_payload` is not
+  used: nothing fills it (the backend sends no such field). The card says « activé sur le compte »,
+  not "valid": the QR check (§3.1b roster check, allowed days) can still refuse a scan, and the
+  upcoming credentials of §3.8 (a renewal starting today) are not read here. `[TEST:
+  tests/test_member_card_details.py::TestQrCredential]`
+- **Visits (« Derniers passages »).** `GET /api/v2/members/{activeMembershipId}/history?limit=`
+  (`_handle_member_history` → `db.py::list_member_access_history`, default 20, capped at
+  `MEMBER_HISTORY_LIMIT_MAX` = 200; the card asks 10). It lists `access_history` rows of the PERSON:
+  the membership's `sync_users`/`sync_users_held` `user_id`, then `WHERE user_id = ?` newest first —
+  the `ix_access_history_user_door_day` prefix, no new index. A row resolved to another plan of the
+  same person carries its own `activeMembershipId` and the card marks it « autre abonnement ». Rows
+  are shaped like the dashboard feed (`_handle_dashboard_overview`): time = `event_time`, else
+  `created_at` (the list is ORDERED by `created_at`, so a late-arriving device record can sit above a
+  later-timed one); device name from the synced devices; door number; `method` from
+  `_credential_type_from_raw`; the raw refusal code, worded in the UI by `aDenyCopy(reason).short`.
+  Limits, said in the card's footnote: only events THIS PC stored (a READER PC under driver leases,
+  or a gym whose turnstiles another PC drives, may have few or none); `user_id` is filled at insert
+  by the AGENT and ULTRA writers only, so DEVICE-mode attendance and unresolved events are not
+  listed; rows are pruned after the backend `history_retention_days` (`retentionDays` in the
+  answer, from `settings_reader.get_backend_global_settings`) once uploaded (§3.5; the prune runs in
+  `device_attendance.py::DeviceAttendanceMaintenanceEngine.run_blocking`, called on every sync tick
+  whatever the mode). The ULTRA writer
+  stores `user_id` = the resolved roster row's `userId` (`ultra_engine.py`, `_resolved_user_id`), the
+  same id space as `sync_users.user_id`. `[TEST:
+  tests/test_member_card_details.py::TestMemberHistory]`
+- **Freeze (« Gel ») and held members.** From the protocol-2 data of §3.8, never `datetime.now()`:
+  `_member_freeze_facts` returns None (the card says « non connu ») without an `access_v2_state`
+  row, with untrusted windows (the flip moves nothing then either), without an `applied_date` or
+  without a `member_access_window` row. Else `frozenToday` = the row is in `sync_users_held` with
+  `held_reason = 'frozen'` AND `held_for_date` = the applied gym date (an older hold does not say
+  "today"); `nextFreezeDays` = the window's `offDays` after the gym date; `horizonEnd` /
+  `beyondHorizon` bound what is known. Freeze start/end dates are not synced and are not shown —
+  only days. **The roster now lists held rows** (`list_members_roster` →
+  `_list_held_users_for_roster`, template-free like the roster read): a member frozen today used to
+  vanish from Utilisateurs. Each carries `heldReason` / `heldForDate` / `heldToday` and gets a flag
+  (« gelé aujourd'hui », « gelé », « pas encore commencé », « hors des tourniquets »); an id on both
+  tables is listed once (the `sync_users` row); `heldToday` also needs trusted windows. Counts
+  (« abonnements sur ce poste ») include them, like `db.list_local_member_ids` (a held member is
+  still in the server's list); their status stays the `validTo` one (a member frozen today counts in
+  « Actifs »), so `counts.held` is returned too and L'effectif shows « dont hors des tourniquets ».
+  A failed held read is logged and the roster falls back to `sync_users` only. Nothing on the door
+  path reads the roster. `[TEST: tests/test_member_card_details.py::TestFreeze,
+  ::TestHeldMembersOnTheRoster]`
+- **Names on « Modifications d'abonnement ».** `GET /api/v2/mutations` (`_handle_mutations_list`)
+  runs `db.py::annotate_offline_mutation_targets` on the listed rows: for `target_kind =
+  'active_membership'` one batch read of `active_membership_id, full_name, membership_id` from
+  `sync_users_held` then `sync_users` (the roster row wins), plus `_membership_title_index`, adds
+  `targetMemberName` / `targetMembershipTitle`; the tab shows « {plan} · {member} » over `#id`.
+  `list_offline_mutations` itself is unchanged (the drain never pays for the join). Tax and freeze
+  targets (other id spaces) and memberships no longer on this PC keep the bare `#id`. A failed
+  lookup leaves the rows as they were. `[TEST: tests/test_member_card_details.py::TestMutationTargetNames]`
+
+**Not built: « Renouveler » (Card M 7e).** Two facts block an honest renew button. `[CODE]`
+1. `renew` is a money op (`db.py::_MONEY_OP_KINDS`) and `app.py`'s `_offline_money_mutations_enabled`
+   is `False` with no code path setting it: `submit_offline_mutation` queues a money op without a
+   live attempt and the drain skips it (`money-gated`), so a renew would wait in the queue forever.
+   The flag waits for backend idempotency on `ActiveMembershipController` (see
+   `docs/plans/2026-09-11_gym_agents_in_access_and_offline_verifier.md`); on backend `main`
+   (77fae5eb6) `X-Idempotency-Key` / `clientRequestId` are still handled by other controllers
+   (tax, events, passes, orders), not this one.
+2. Backend `ActiveMembershipController` `/gym/activeMembership/renew` (and `/renew/quote`) calls
+   `requireAgentFromCookieIfGym`: a GYM account must send the `currentAgentId` cookie of an agent
+   holding `ACTIVE_MEMBERSHIP_MANAGEMENT` + `ACTIVE_MEMBERSHIP_RENEWAL`, else 400 « Please choose a
+   gym agent first ». `monclub_api.py::_lifecycle_request` sends no cookie; its `requests.Session`
+   could only hold one from a `Set-Cookie`, and Access calls no `GymAgentController` endpoint (the
+   one that issues the server-verified `currentAgentId`, `AgentSessionCookieFilter`) while the login
+   answer sets only `token` / `refreshToken`. Access has no agent
+   or role data to mirror the gate (`tauri-ui/src/lib/agentMode.ts` is about the AGENT
+   `accessDataMode`, not staff accounts). The same helper guards `updateActiveMembership`,
+   `deleteActiveMembership` and `ActiveMembershipFreezeController` create/cancel, so Access's
+   Modifier / Geler / Supprimer from a GYM account would get that 400 too
+   `[CODE: backend local checkout 77fae5eb6; UNVERIFIED in the field]`.
+   The backend also computes the renewal dates itself (`renewalKind` QUEUED / START_TODAY /
+   AFTER_EXPIRY, from `/renew/quote`), requires `price` and `payedPrice` (no default to the plan
+   price), refuses an outstanding debt without `debtResolution` (409) and a door loss without
+   `acknowledgeDoorLoss` (409) — none of which the PC can know offline.
+
 ---
 
-### 3.13 Profil — the session window, the role and the gym name (Access v5 Card P, 2026-10-16)
+### 3.15 Profil — the session window, the role and the gym name (Access v5 Card P, 2026-10-16)
 
 **Display only.** Five `/api/v2/status` `session` fields feed the Profil page and nothing else:
 no door decision, sync, restriction or logout reads them. `[CODE:
@@ -5738,8 +5907,8 @@ installer through the wrapper below; `updater_exe_name`, `_launch_installer_exe`
 
 | File | Written by | Read by |
 |---|---|---|
-| `state\install_journal.json` `{phase,from,to,at,setupPid}` | Setup | app start-up, wrapper, watchdog |
-| `state\last_update.json` `{result,from,to,reason,log,at}` | Setup, the wrapper (`ABORTED setup_exit_<n>`), the restore helper (`ROLLED_BACK interrupted`) | the app; renamed to `last_update.consumed.json` once reported |
+| `state\install_journal.json` `{phase,from,to,at,setupPid}` | Setup; the app's manual rollback (`phase restoring`, plus `reason user_rollback`, §11.12) | app start-up, wrapper, watchdog |
+| `state\last_update.json` `{result,from,to,reason,log,at}` | Setup, the wrapper (`ABORTED setup_exit_<n>`), the restore helper (`ROLLED_BACK interrupted`, or `user_rollback` for a manual rollback) | the app; renamed to `last_update.consumed.json` once reported |
 | `state\boot_ok.json` `{version,pid,at}` | the app, once its local API listens | Setup (health wait) |
 | `state\update_state.json` | the app only | the app only: pending update, install attempt, per-version strikes/bans, telemetry outbox, TV install id |
 | `logs\update-<ver>-<utc>.log`, `logs\update-wrapper.log`, `logs\update-restore.log`, `logs\update-startup.log` | Setup `/LOG`, wrapper, restore helper, start-up journal check | people |
@@ -5882,7 +6051,8 @@ the watchdog-started 1.5.0 launched the wrapper and quit; the wrapper ran Setup 
   shutdown) or a PC with Fast Startup off retries at the next start. Journal staleness does
   not depend on the boot rule alone (10 min / dead `setupPid` also make it stale), and claim
   liveness uses the restorer's start time (§11.4).
-  `same_version` is no strike. The install button (« Redémarrer et installer » on Access,
+  `same_version` is no strike. A manual rollback (§11.12) bans the version it leaves itself
+  (`banReason user_rollback`) before the app exits. The install button (« Redémarrer et installer » on Access,
   "Restart to update" on TV) still works on a banned version; the page warns.
 - **Direction of `last_update.json`** (L2's `UpdWriteLastUpdate`, the restore helper, the
   wrapper): `ROLLED_BACK` from = the version that failed, to = the one restored;
@@ -5923,8 +6093,8 @@ shared Pascal `installer/update_safety.iss`, file work in `installer/update_help
 extracted to `{tmp}` and also installed into `{app}\watchdog`). `[CODE]`
 
 - **`{app}` layout:** `current\` (the running version; `[Files]` still target it, which keeps
-  Inno's uninstall log valid), `previous\` (the version before the last update — a manual
-  rollback is copying it back), `state\` (§11.1), `logs\`, `downloads\`, `watchdog\` (Access: watchdog
+  Inno's uninstall log valid), `previous\` (the version before the last update — the Update
+  page's « Revenir à la version précédente » copies it back, §11.12), `state\` (§11.1), `logs\`, `downloads\`, `watchdog\` (Access: watchdog
   scripts + `update_helper.ps1`; TV: `update_helper.ps1` only — the client's wrapper runs it). `[CODE]`
 - **`PrepareToInstall`:** FIRST `update_helper -Action other-setup`: another process with this product's
   Setup image name that is not our own Setup (`.exe` stub / `.tmp` ancestors) = a second installer run
@@ -6133,3 +6303,82 @@ detection reads the uninstalling user's HKCU only; an Access installed in the le
   Only `-DryRun` was ever executed (it refused a test-key file before any `gh` call).
 - The C# zip updater (`updater/`, `installer/updater/*.exe`, `build_updater.ps1`) is deleted
   (D2, D27, D28). `[TEST: ::test_the_zip_updater_is_gone]`
+
+### 11.12 Manual rollback — « Revenir à la version précédente » (Access v5 Card B, 2026-10-16)
+
+The Access Update page can put `previous\` (§11.8) back into `current\`. **It has no copy code of
+its own:** the restore is the start-up check's restore helper (§11.4) running the installed
+`update_helper.ps1 -Action recover` (§11.3, §11.9) — the code Setup and the watchdog already run.
+`[CODE: shared/update_runtime.py::local_rollback_info, ::launch_rollback]`
+
+- **When it is offered** (`GET /api/v2/update/status` → `localRollback {available, currentVersion,
+  previousVersion, reason}`, files only, the page polls it every 3 s): target `access` (TV: never,
+  `not_supported`); a frozen build running from `{app}\current` (the `_auto_install_allowed` rule —
+  a source run resolves `%LOCALAPPDATA%\MonClubAccess`, which may be a real install, and is refused as
+  `not_installed_build`); `previous\` holds the exe and `version.json` (`no_previous`); its version
+  parses (`previous_unreadable`), its `component`, when present, is `access`
+  (`previous_other_component`), it is strictly older than the running one (`previous_not_older`) and
+  not older than **`ROLLBACK_MIN_VERSION` = 1.5.0** (`previous_too_old`); `{app}\watchdog\update_helper.ps1`
+  exists (`helper_missing` — without it the wrapper's inline fallback would run and write
+  `interrupted`). Not the server's `rollback` flag, which is a signed downgrade offer (§11.2). `[CODE; TEST:
+  test_updater_v2_user_rollback.py::test_the_rollback_is_not_offered_when]`
+- **Why 1.5.0:** design.md §2 ("remote rollback / downgrade works only for PCs already on ≥ 1.5.0"):
+  a pre-v2 client does not read `update_state.json`, so it would ignore the ban below and update
+  straight back. "1.5.0 = the first v2 release" is the design's name for it; no v2 release has been
+  published yet `[UNVERIFIED: the real number of the first v2 release]`.
+- **`POST /api/v2/update/rollback`** `{previousVersion, currentVersion}` (both required, else 400) =
+  the versions the confirmation named; X-Local-Token gated (not in `_AUTH_EXEMPT`). It refuses with
+  409 `{code}` (nothing written, the app keeps running) when anything above fails, the versions
+  differ (`changed`), an install is starting (`busy`), an Access Setup runs (`setup_running`, unknown
+  = running), a journal or any `install_journal.restoring-*.json` claim exists (`journal_present`),
+  or the pause sentinel is under 30 min old (`update_in_progress`). Otherwise, in this order: **(1)**
+  the running version is banned in `update_state.json` (`versions[v] = {banned: true, banReason:
+  "user_rollback"}`, other fields kept); **(2)** the journal `{phase: "restoring", from: <previous>,
+  to: <running>, at, setupPid: <this pid>, reason: "user_rollback"}` (Setup's direction); **(3)**
+  `build_restore_script` unchanged, started with `launch_hidden_powershell`. A helper that does not
+  start → journal deleted, the ban undone (the entry as it was), 409 `launch_failed`. Then the
+  pending download is dropped, 200, and the app quits after 500 ms — like « Redémarrer et
+  installer ». The app log names who asked (`[Update] rollback … by Update page (<email>)`).
+  `[TEST: ::test_launch_*, ::test_a_helper_that_does_not_start_leaves_no_journal_and_no_ban,
+  ::test_the_handler_*]`
+- **Why the journal is safe:** while the app lives, `setupPid` is alive and the journal is under
+  10 min old, so the app's start-up check and the watchdog's `recover` stand down (exit 22). Once it
+  exits, the journal is stale at once (dead `setupPid`, §11.4) and whichever restorer claims it first
+  — the helper, the watchdog's next tick, a new start-up — finishes the restore; the others back off
+  on the claim. The helper waits up to 90 s for the app, then stops that pid. A process that dies
+  after (2) still gets rolled back. `[CODE]`
+- **The restore:** `recover` (exit 20) mirrors `previous` → `current` after stopping the app + UI
+  running from `current\`, writes `ROLLED_BACK` from = the version left, to = the previous one; the
+  reason is `user_rollback` **only** when the journal carries exactly that value (`-ceq`; anything
+  else, and every Setup journal, keeps `interrupted`; `restore_failed` unchanged). The helper then
+  starts `current\MonClubAccess.exe` unless it runs (the watchdog may have started it after its own
+  restore). `previous\` itself stays as it is. `[TEST: ::test_a_rollback_runs_for_real_through_the_installed_helper_and_relaunches
+  — real PowerShell + the real helper on a throw-away root; test_updater_v2_install_helper.py::test_recover_names_a_manual_rollback_in_its_result,
+  ::test_recover_ignores_any_other_journal_reason]`
+- **The re-update guard is the loop guard's existing ban (§11.5)**, written by the version left
+  because the build that starts afterwards — and consumes the result — is the OLDER one, with its own
+  code: it records `user_rollback` as one strike (not in its `_BAN_REASONS`), which leaves `banned`
+  set (a second strike rewrites `banReason` to `user_rollback (twice)`, still banned). Its start-up
+  gate and 24 h fallback skip the banned version (it is still downloaded and shown); the Update page
+  button still installs it; a NEWER release installs automatically as usual. Nothing in the engine
+  ever clears `banned` (`git log -S banned` on `shared/update_runtime.py` since `793cb61`). The pending
+  download is dropped so the restored version does not install it at its first start; the restored
+  version's normal check downloads the next offer again. `[TEST: ::test_the_restored_version_does_not_install_the_version_left_by_itself
+  (today's engine with the older ban set), ::test_a_newer_release_than_the_version_left_still_installs_automatically]`
+- **What the older version shows:** its telemetry sends `ROLLED_BACK` from = previous, to = the
+  version left, detail `reason=user_rollback`. Its Update page shows the raw reason where it has no
+  text for it (`UpdateNotices*.tsx` `REASONS[reason] ?? reason`): the last result reads as rolled back
+  with reason `user_rollback`, and while the version left is offered the loop-guard warning says it
+  "failed before (user_rollback)" (French on a v5 page, English before). From this change on both
+  notice components have a text for it. `[CODE]`
+- **UI** (`tauri-ui/src/pages/UpdatePage.tsx`, panel « Revenir en arrière »): shown only when
+  `localRollback.available`; the confirmation (`ConfirmDialog`) names both versions (frozen when it
+  opens and sent as the body), warns that the app closes and restarts and the turnstiles pause, says
+  the version left will no longer be installed automatically; it stays open on « Redémarrage… » once
+  the helper runs. `[CODE]`
+- **Not covered / residuals:** the Windows uninstall entry keeps the newer version's
+  `DisplayVersion` (the journal restore never rewrites it — same as an interrupted install; Setup's
+  same-version rule reads `current\version.json`, not the entry) `[CODE: MonClubAccess.iss same-version check]`. No `PENDING` telemetry is
+  sent when the rollback starts. The real restart of the frozen app and its Tauri UI, the watchdog
+  racing the helper on a real PC, and the restored app's first start-up gate are
+  `[UNVERIFIED — spare-PC test pending]`.

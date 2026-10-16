@@ -1,7 +1,7 @@
 // P3b-2: this PC's role (pilote / lecteur), its turnstiles, the notice socket, and — for a
 // reader — the door history of the drivers it reads, from the server (a reader never
 // connects to a turnstile).
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Activity, Clock, Loader2, RadioTower, RefreshCw, Router } from "lucide-react";
 
 import { realtime, ROLE_LABEL_FR, type ReaderDoorEvent, type RealtimeStatus } from "@/api/realtime";
@@ -37,6 +37,9 @@ function formatDate(value: string | null | undefined): string {
 export default function RealtimePage() {
   const [status, setStatus] = useState<RealtimeStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Own error for the door history: the 10 s status poll clears `error` on success, which used to
+  // wipe a failed history load before anyone could read it.
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const [history, setHistory] = useState<ReaderDoorEvent[]>([]);
   const [nextBefore, setNextBefore] = useState<number | null>(null);
   const [loadingHistory, setLoadingHistory] = useState(false);
@@ -46,24 +49,34 @@ export default function RealtimePage() {
     catch (e) { setError(String(e)); }
   }, []);
 
+  // Only the latest history request may write: a « Plus » page that lands after a reload
+  // must not be appended to the fresh list.
+  const historySeqRef = useRef(0);
   const loadHistory = useCallback(async (before?: number | null) => {
+    const seq = ++historySeqRef.current;
     setLoadingHistory(true);
     try {
       const page = await realtime.readerHistory(before ?? null, 50);
+      if (seq !== historySeqRef.current) return;
       setHistory((h) => (before ? [...h, ...page.items] : page.items));
       setNextBefore(page.nextBeforeId);
-    } catch (e) { setError(String(e)); }
-    finally { setLoadingHistory(false); }
+      setHistoryError(null);
+    } catch (e) { if (seq === historySeqRef.current) setHistoryError(String(e)); }
+    finally { if (seq === historySeqRef.current) setLoadingHistory(false); }
   }, []);
 
   useEffect(() => { load(); const id = setInterval(load, 10_000); return () => clearInterval(id); }, [load]);
   const isReader = status?.role === "READER";
-  useEffect(() => { if (isReader || (status?.readerOf?.length ?? 0) > 0) loadHistory(null); }, [isReader, status?.readerOf?.length, loadHistory]);
+  const showsHistory = isReader || (status?.readerOf?.length ?? 0) > 0;
+  useEffect(() => { if (showsHistory) loadHistory(null); }, [showsHistory, status?.readerOf?.length, loadHistory]);
+
+  // « Actualiser » also reloads the door history when it is on screen (the only retry after a failed load).
+  const refresh = useCallback(() => { void load(); if (showsHistory) void loadHistory(null); }, [load, loadHistory, showsHistory]);
 
   usePageChrome(() => ({
     subtitle: isReader ? "Ce PC lit l'historique, il n'écrit dans aucun tourniquet" : "Qui écrit dans quel tourniquet",
-    actions: <ActionButton kind="outline" icon={RefreshCw} onClick={load}>Actualiser</ActionButton>,
-  }), [isReader, load]);
+    actions: <ActionButton kind="outline" icon={RefreshCw} onClick={refresh}>Actualiser</ActionButton>,
+  }), [isReader, refresh, showsHistory]);
 
   if (!status) {
     return error
@@ -141,9 +154,10 @@ export default function RealtimePage() {
         </Panel>
       )}
 
-      {(isReader || status.readerOf.length > 0) && (
+      {showsHistory && (
         <Panel>
           <PanelHeader title="Historique des portes" sub="Depuis le serveur · tourniquets des PC pilotes suivis" />
+          {historyError && <Note tone="error" className="mx-[18px] mt-3">Historique non chargé : {historyError}</Note>}
           <FlexTable
             label="Historique des portes"
             columns={[
@@ -155,7 +169,7 @@ export default function RealtimePage() {
             ]}
             empty={loadingHistory
               ? <Loader2 className="mx-auto h-5 w-5 animate-spin text-primary" />
-              : "Aucun passage à afficher."}
+              : historyError ? "Historique non chargé." : "Aucun passage à afficher."}
             footer={
               <>
                 {nextBefore && (
@@ -188,9 +202,8 @@ export default function RealtimePage() {
         </Panel>
       )}
 
-      {(status.lastError || error) && (
-        <Note tone="warning">{status.lastError || error}</Note>
-      )}
+      {status.lastError && <Note tone="warning">{status.lastError}</Note>}
+      {error && <Note tone="warning">Statut non actualisé : {error}</Note>}
     </div>
   );
 }

@@ -9,6 +9,7 @@ const REASONS: Record<string, string> = {
   setup_failed: "the installer failed",
   restore_failed: "the previous version could not be fully restored",
   same_version: "this version was already installed",
+  user_rollback: "you went back to the previous version from the Update page",
   no_result: "the installer did not report a result",
 };
 
@@ -64,7 +65,16 @@ export default function UpdateNotices({ status, installError }: { status: Update
           </span>
         </div>
       )}
-      {status?.updateAvailable && status.autoInstallBlocked && (
+      {status?.updateAvailable && status.autoInstallBlocked && status.autoInstallBlockedReason?.startsWith("user_rollback") && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-[12px]">
+          <Undo2 className="h-4 w-4 shrink-0 text-amber-500" />
+          <span className="text-foreground">
+            You went back from version {status.latestVersion}: it will not be installed automatically again.
+            "Restart to update" still installs it.
+          </span>
+        </div>
+      )}
+      {status?.updateAvailable && status.autoInstallBlocked && !status.autoInstallBlockedReason?.startsWith("user_rollback") && (
         <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-[12px]">
           <AlertCircle className="h-4 w-4 shrink-0 text-amber-500" />
           <span className="text-foreground">
