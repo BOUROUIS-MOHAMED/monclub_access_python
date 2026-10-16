@@ -1,4 +1,5 @@
-"""Profil's gym name: ``GET /manager/access/v1/gym/me``, cached in ``auth_state``.
+"""Profil's gym name and account holder's name (Card P2): ``GET /manager/access/v1/gym/me``
+(``name``, ``account_name``), cached in ``auth_state``.
 
 Display only. The answer's ``enabled`` flag is NOT read: the backend sets it false for every
 non-GYM account (an ADMIN login), and nothing here may gate access, restrict the app or log
@@ -32,6 +33,13 @@ def gym_name_from_answer(body: Any) -> str:
         return ""
     name = name.strip()
     return "" if name == NO_GYM_NAME else name
+
+
+def account_name_from_answer(body: Any) -> str:
+    """The account holder's name of a ``gym/me`` answer (``account_name``, backend Card P2), or ""
+    when it carries none: an older backend without the key, an unset name, or not a string."""
+    name = body.get("account_name") if isinstance(body, dict) else None
+    return name.strip() if isinstance(name, str) else ""
 
 
 class GymNameRefresher:
@@ -100,7 +108,8 @@ class GymNameRefresher:
         try:
             body = self._api_factory().get_gym_me(token=token, timeout=REQUEST_TIMEOUT_SEC)
             # An answer with no gym clears the cached name: the account has none now.
-            save_gym_name(email=email, gym_name=gym_name_from_answer(body))
+            save_gym_name(email=email, gym_name=gym_name_from_answer(body),
+                          account_name=account_name_from_answer(body))
             interval = SUCCESS_INTERVAL_SEC
         except Exception as exc:
             self._logger.info("[GYM-ME] gym name not refreshed: %s", exc)

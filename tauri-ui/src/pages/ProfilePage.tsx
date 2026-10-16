@@ -7,9 +7,9 @@
 // LocalDbPage's unlock lease. Card P (guide §3.13): the session row reads the
 // stored token's window (sessionIssuedAt → sessionExpiresAt) for its days and
 // bar; the role comes from the token's `roles` claim; the gym name from
-// GET gym/me, cached per login. Not rendered because no data source exists:
-//   · a person's name — no account that can log in has one on the backend, so
-//     the account name is the e-mail's local part; · a member count.
+// GET gym/me, cached per login; the account name is the holder's name from
+// that same answer (Card P2), else the e-mail's local part. Not rendered
+// because no data source exists: · a member count.
 
 import { useEffect, useState } from "react";
 import { useApp } from "@/context/AppContext";
@@ -116,7 +116,8 @@ export default function ProfilePage() {
   const ultraConnected = ultraWorkers.filter((d) => d?.connected).length;
   const readerConnected = status.pullsdk?.connected || ultraConnected > 0;
 
-  const accountName = s.email ? s.email.split("@")[0] : "Compte";
+  // Card P2: the holder's name set in the dashboard; without it, the e-mail's local part.
+  const accountName = s.accountName || (s.email ? s.email.split("@")[0] : "Compte");
   const avatarLetter = (accountName[0] || "?").toUpperCase();
   const roleLabel = s.accountRole ? ROLE_LABEL[s.accountRole] : undefined;
 

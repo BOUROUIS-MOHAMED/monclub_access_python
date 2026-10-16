@@ -854,6 +854,7 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
     session["sessionExpiresAt"] = None
     session["accountRole"] = None
     session["gymName"] = None
+    session["accountName"] = None
     if auth and auth.token:
         try:
             from shared.auth_state import jwt_account_role, jwt_session_window
@@ -863,9 +864,10 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
         except Exception:
             pass
         try:
-            from app.core.db import load_gym_name
+            from app.core.db import load_account_name, load_gym_name
 
             session["gymName"] = load_gym_name(auth.email)
+            session["accountName"] = load_account_name(auth.email)
         except Exception:
             pass
 

@@ -65,7 +65,7 @@ This file is only useful while it is true. If you change any of the following, y
 | What a turnstile's heartbeat line reports as waiting (`device_sync.py::count_waiting_pins`, `ultra_engine.py::_count_waiting_pins` and the snapshot's `failed_pins`, `_sync_one_device`'s `_last_waiting_pins`, `realtime_agent.py::get_status_snapshot`'s `failedPins`, `pc_identity.py::build_heartbeat_payload`, `::_report_held_turnstiles` and its `held` key, `erase_wizard.py::held_waiting_count`, the wizard's `_set_waiting`) | §3.10 |
 | Who writes to `access.db` — the DbWriter, `_run_db_write_sync` (its lanes, `priority=`, the inline nested call, the 60 s wait), a write outside it, the tripwire's allowlist (`tests/test_db_single_writer.py::ALLOWED_DIRECT`), which writes are in the door lane (`db.py::insert_access_history`, `::save_agent_rtlog_state`), the AGENT history claim (`realtime_agent.py::DecisionService.run`'s `F-013` block) | §3.11 |
 | The member fee lines of the entry screen -- what is stored, how it reaches the popup, how the screen judges and draws it (`db.py::_member_fees_json`, `::_member_fees_list`, `::_ensure_column_forcing_refresh`, `sync_users.fees_json` in `_SYNC_USER_COLUMNS` and the five member writers, `sync_access_software_settings.fee_due_soon_days`, `settings_reader.py::normalize_global_settings`'s `fee_due_soon_days`, `access_types.py::NotificationRequest.fees`, `ultra_engine.py::_enqueue_notification(user_fees=)`, `ultra_pc_entry.py::member_popup_fields`, `realtime_agent.py::_popup_payload_from_request`, `tauri-ui/src/lib/feeAlerts.ts`, `PopupWindow.tsx` `AFeeLine` / `AFeeMark`) | §3.12 |
-| What `/api/v2/status` shows Profil about the login -- `sessionIssuedAt` / `sessionExpiresAt` / `accountRole` (`shared/auth_state.py::read_jwt_claims`, `::jwt_session_window`, `::jwt_account_role`), `gymName` and its cache (`app/core/gym_info.py`, `MonClubApi.get_gym_me`, `db.py::save_gym_name` / `::load_gym_name`, the `auth_state.gym_name*` columns, the call in the sync worker) | §3.13 Profil |
+| What `/api/v2/status` shows Profil about the login -- `sessionIssuedAt` / `sessionExpiresAt` / `accountRole` (`shared/auth_state.py::read_jwt_claims`, `::jwt_session_window`, `::jwt_account_role`), `gymName` / `accountName` and their cache (`app/core/gym_info.py`, `MonClubApi.get_gym_me`, `db.py::save_gym_name` / `::load_gym_name` / `::load_account_name`, the `auth_state.gym_name*` and `account_name` columns, the call in the sync worker) | §3.13 Profil |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -4796,7 +4796,7 @@ is `[UNVERIFIED]`: checked by type-check and by reading the 1280×720 stage size
 
 ### 3.13 Profil — the session window, the role and the gym name (Access v5 Card P, 2026-10-16)
 
-**Display only.** Four `/api/v2/status` `session` fields feed the Profil page and nothing else:
+**Display only.** Five `/api/v2/status` `session` fields feed the Profil page and nothing else:
 no door decision, sync, restriction or logout reads them. `[CODE:
 local_access_api_v2.py::_build_status_payload_uncached; grep finds no other reader]`
 
@@ -4839,12 +4839,17 @@ fetch still in flight at a reset finishes but does not re-arm the throttle. A fa
 loop. `[TEST: tests/test_profile_session_data.py]` Not seen against the live backend or in the
 running app `[UNVERIFIED]`.
 
-**No person's name.** The account behind an Access login has none: the backend creates GYM
-accounts with `.user(null)` (the GymModel is their profile) and the ADMIN account with no
-profile at all, and the web dashboard itself shows the gym name or « Administrateur ». Profil
-shows the e-mail's local part as the account name. `[CODE: backend
-AccountAuthenticationService (GYM and ADMIN account creation); mon_club_dashboard
-account-popover.tsx accountLabel]`
+**The account holder's name — `accountName` (Card P2, 2026-10-16).** The backend added
+`main_account.display_name` (« Nom du responsable », set in the dashboard's /account page by the
+ADMIN account or a gym agent with `GYM_SETTINGS_MANAGEMENT`) and returns it in the same `gym/me`
+answer as `account_name`. `gym_info.py::account_name_from_answer` reads it (blank, non-string or
+absent = `""`), `db.py::save_gym_name(account_name=)` stores it in `auth_state.account_name` with
+the gym name and the same e-mail binding, `::load_account_name` reads it back. Before Card P2 no
+account that can log in had a name at all (GYM accounts are created with `.user(null)`, the ADMIN
+account with no profile). Profil shows `accountName`, else the e-mail's local part — so a backend
+without the key, or a name nobody set, keeps the old display. `[TEST:
+tests/test_profile_session_data.py]` The backend side is on branch
+`claude/account-display-name` (V144 hand-run DDL) and is not deployed `[UNVERIFIED]`.
 
 ---
 

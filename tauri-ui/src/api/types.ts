@@ -39,6 +39,9 @@ export interface SessionBlock {
   accountRole?: string | null;
   /** The gym name cached from GET gym/me for this login; null until fetched or with no gym. */
   gymName?: string | null;
+  /** Card P2: the account holder's name (gym/me `account_name`), cached per login; null when
+   * unset or the backend predates it -- Profil then falls back to the e-mail's local part. */
+  accountName?: string | null;
 }
 
 export interface ModeBlock {

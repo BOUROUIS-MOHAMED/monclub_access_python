@@ -136,6 +136,33 @@ def test_the_name_of_a_gym_me_answer(body, want) -> None:
     assert gym_info.gym_name_from_answer(body) == want
 
 
+@pytest.mark.parametrize("body, want", [
+    ({"name": "Oxyfit Lac", "account_name": " Sami Ben Ali "}, "Sami Ben Ali"),
+    ({"name": "Oxyfit Lac", "account_name": None}, ""),
+    ({"name": "Oxyfit Lac"}, ""),  # a backend before Card P2
+    ({"account_name": 12}, ""),
+    (["x"], ""),
+])
+def test_the_account_name_of_a_gym_me_answer(body, want) -> None:
+    assert gym_info.account_name_from_answer(body) == want
+
+
+def test_the_account_name_is_cached_with_the_gym_name_for_the_same_email(db) -> None:
+    db.save_auth_token(email="gym@club.tn", token=GYM_TOKEN)
+    db.save_gym_name(email="gym@club.tn", gym_name="Oxyfit Lac", account_name="Sami Ben Ali")
+    assert db.load_account_name("gym@club.tn") == "Sami Ben Ali"
+    assert db.load_account_name("other@club.tn") is None
+    db.save_gym_name(email="gym@club.tn", gym_name="Oxyfit Lac")  # no account_name: cleared
+    assert db.load_account_name("gym@club.tn") is None
+    assert db.load_gym_name("gym@club.tn") == "Oxyfit Lac"
+
+
+def test_init_db_adds_the_account_name_column(db) -> None:
+    with db.get_conn() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(auth_state)").fetchall()}
+    assert "account_name" in cols
+
+
 # ================================================================ the refresher
 class _Clock:
     def __init__(self) -> None:
@@ -173,6 +200,19 @@ def test_the_first_online_sync_fetches_and_caches_the_name(db) -> None:
     api = _Api({"name": "Oxyfit Lac", "enabled": True})
     assert _refresher(api, _Clock()).maybe_refresh() is True
     assert api.calls == [(GYM_TOKEN, gym_info.REQUEST_TIMEOUT_SEC)]
+    assert db.load_gym_name("gym@club.tn") == "Oxyfit Lac"
+
+
+def test_the_refresher_stores_the_account_name_and_an_old_backend_leaves_none(db) -> None:
+    db.save_auth_token(email="gym@club.tn", token=GYM_TOKEN)
+    api, clock = _Api({"name": "Oxyfit Lac", "account_name": "Sami Ben Ali"}), _Clock()
+    r = _refresher(api, clock)
+    r.maybe_refresh()
+    assert db.load_account_name("gym@club.tn") == "Sami Ben Ali"
+    api.answer = {"name": "Oxyfit Lac", "enabled": True, "contract_end_date": None}
+    r.reset()
+    r.maybe_refresh()
+    assert db.load_account_name("gym@club.tn") is None
     assert db.load_gym_name("gym@club.tn") == "Oxyfit Lac"
 
 
@@ -398,6 +438,7 @@ def test_status_exposes_the_token_window_role_and_cached_gym_name(db) -> None:
     assert s["sessionExpiresAt"] == "2026-10-31T00:00:00+00:00"
     assert s["accountRole"] == "GYM"
     assert s["gymName"] == "Oxyfit Lac"
+    assert s["accountName"] is None  # nobody set it: Profil falls back to the e-mail prefix
     assert s["email"] == "gym@club.tn"
     # The token (or any part of it) is never on the wire.
     wire = json.dumps(payload, default=str)
@@ -413,3 +454,15 @@ def test_status_fields_are_null_when_logged_out_or_unreadable(db) -> None:
     with _status_deps(auth):
         s = local_access_api_v2._build_status_payload_uncached(_StatusApp())["session"]
     assert (s["sessionIssuedAt"], s["sessionExpiresAt"], s["accountRole"], s["gymName"]) == (None, None, None, None)
+
+
+def test_status_exposes_the_cached_account_name(db) -> None:
+    db.save_auth_token(email="gym@club.tn", token=GYM_TOKEN)
+    db.save_gym_name(email="gym@club.tn", gym_name="Oxyfit Lac", account_name="Sami Ben Ali")
+    auth = SimpleNamespace(email="gym@club.tn", token=GYM_TOKEN, last_login_at="")
+    with _status_deps(auth):
+        s = local_access_api_v2._build_status_payload_uncached(_StatusApp())["session"]
+    assert s["accountName"] == "Sami Ben Ali"
+    with _status_deps(None):
+        s = local_access_api_v2._build_status_payload_uncached(_StatusApp())["session"]
+    assert s["accountName"] is None
