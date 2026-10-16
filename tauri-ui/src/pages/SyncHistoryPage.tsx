@@ -15,8 +15,9 @@ import { CellText, FlexCell, FlexRow, FlexTable } from "@/components/ui/flex-tab
 import { KpiCard, KpiRow } from "@/components/ui/kpi-card";
 import { ListRow, Note, PageGrid, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
 import {
-  RUN_TYPE, STATUS_FILTER_OPTIONS, TRIGGER_SOURCE, formatDate, formatDuration, runStatus,
+  RUN_TYPE, STATUS_FILTER_OPTIONS, TRIGGER_SOURCE, formatDate, formatDuration, relativeTimeFr, runStatus,
 } from "@/lib/historyCopy";
+import { useNowTick } from "@/hooks/useNowTick";
 
 function parseJsonBlock(value: string | null | undefined): string {
   if (!value) return "—";
@@ -45,6 +46,8 @@ const RUN_TYPE_OPTIONS = [
 
 export default function SyncHistoryPage() {
   const navigate = useNavigate();
+  // Keeps « Dernière réussie : il y a … » current (display only, no request).
+  const now = useNowTick();
   const [rows, setRows] = useState<SyncRunHistoryRow[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -128,8 +131,10 @@ export default function SyncHistoryPage() {
       <KpiRow cols={4}>
         <KpiCard
           label="Dernière réussie"
-          value={lastOk ? clockOf(lastOk.created_at) : "—"}
-          sub={lastOk ? `${formatDate(lastOk.created_at).slice(0, 10)} · ${formatDuration(lastOk.duration_ms)}` : "aucune dans les runs chargés"}
+          value={lastOk
+            ? <span title={formatDate(lastOk.created_at)}>{relativeTimeFr(lastOk.created_at, now) ?? clockOf(lastOk.created_at)}</span>
+            : "—"}
+          sub={lastOk ? `${clockOf(lastOk.created_at)} · ${formatDuration(lastOk.duration_ms)}` : "aucune dans les runs chargés"}
           icon={CircleCheck}
           tone="success"
         />

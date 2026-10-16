@@ -20,6 +20,8 @@ import { Segmented } from "@/components/ui/segmented";
 import { ListRow, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
 import { cn } from "@/lib/utils";
 import { formatLogClock, normalizeLogLine, upsertLogLine } from "@/lib/logs";
+import { formatDate, relativeTimeFr } from "@/lib/historyCopy";
+import { useNowTick } from "@/hooks/useNowTick";
 import {
   Search, Download, Trash2, FolderOpen, CircleX, FileText, Pause, Play, CircleCheck, Tag, Send, X,
 } from "lucide-react";
@@ -48,6 +50,8 @@ function categoryOf(line: LogLine): string {
 const LEVEL_INK = { ERROR: "text-error-ink", WARNING: "text-warning-ink", INFO: "text-success-ink" } as const;
 
 export default function LogsPage() {
+  // Keeps the « À traiter » times (« il y a … ») current (display only, no request).
+  const now = useNowTick();
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [search, setSearch] = useState("");
   const [level, setLevel] = useState<LevelKey>("ALL");
@@ -289,7 +293,11 @@ export default function LogsPage() {
                 wrap
                 mono
                 title={<span className="break-all text-[12.5px]">{l.rawText || l.text}</span>}
-                sub={`${categoryOf(l)} · ${formatLogClock(l.lastSeenAt || l.ts)}${(l.repeatCount ?? 0) > 1 ? ` · ×${l.repeatCount}` : ""}`}
+                sub={(
+                  <span title={formatDate(l.lastSeenAt || l.ts)}>
+                    {`${categoryOf(l)} · ${relativeTimeFr(l.lastSeenAt || l.ts, now) ?? formatLogClock(l.lastSeenAt || l.ts)}${(l.repeatCount ?? 0) > 1 ? ` · ×${l.repeatCount}` : ""}`}
+                  </span>
+                )}
               />
             )) : (
               <ListRow
