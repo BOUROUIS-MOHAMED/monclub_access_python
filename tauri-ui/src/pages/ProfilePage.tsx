@@ -4,10 +4,11 @@
 //
 // Everything rendered here comes from the /status snapshot the app already
 // polls (session / mode / sync / pullsdk / ultra / updates / deviceSync) plus
-// LocalDbPage's unlock lease. Not rendered because no data source exists:
+// LocalDbPage's unlock lease. Card P (guide §3.13): the session row reads the
+// stored token's window (sessionIssuedAt → sessionExpiresAt) for its days and
+// bar. Not rendered because no data source exists:
 //   · a person's name or role — SessionBlock only has the e-mail (the account
-//     name is its local part); · the gym name; · a member count;
-//   · the session progress bar — /status gives the days left, not the total.
+//     name is its local part); · the gym name; · a member count.
 
 import { useEffect, useState } from "react";
 import { useApp } from "@/context/AppContext";
@@ -17,6 +18,7 @@ import { Avatar, Chip } from "@/components/ui/chip";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { ListRow, Note, PageGrid, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
 import { hasAgentDevices } from "@/lib/agentMode";
+import { tokenWindow } from "@/lib/sessionWindow";
 import {
   Bot, Clock, Database, Info, LogIn, LogOut, Mail, RefreshCw, Router, ShieldCheck, Users,
 } from "lucide-react";
@@ -108,6 +110,11 @@ export default function ProfilePage() {
 
   const accountName = s.email ? s.email.split("@")[0] : "Compte";
   const avatarLetter = (accountName[0] || "?").toUpperCase();
+  // Session row: the token's clock when its window is readable (days, bar and
+  // the 7-day warning all from it), otherwise the server's loginDaysRemaining.
+  const tw = tokenWindow(s.sessionIssuedAt, s.sessionExpiresAt);
+  const sessionDays = tw ? tw.daysLeft : s.loginDaysRemaining;
+  const sessionWarning = tw ? tw.daysLeft <= 7 : s.loginWarning;
 
   const handleLogout = async () => {
     setLogoutConfirm(false);
@@ -189,13 +196,15 @@ export default function ProfilePage() {
         <PanelList>
           <ListRow
             icon={Clock}
-            tone={s.loginWarning ? "warning" : "primary"}
+            tone={sessionWarning ? "warning" : "primary"}
             title="Session"
-            sub={s.loginDaysRemaining != null
-              ? `${plural(s.loginDaysRemaining, "jour", "jours")} avant expiration`
+            sub={sessionDays != null
+              ? `${plural(sessionDays, "jour", "jours")} avant expiration`
               : "durée restante inconnue"}
-            subTone={s.loginWarning ? "warning" : undefined}
-            trailing={s.loginWarning ? <Chip tone="warning">Expire bientôt</Chip> : undefined}
+            subTone={sessionWarning ? "warning" : undefined}
+            trailing={sessionWarning ? <Chip tone="warning">Expire bientôt</Chip> : undefined}
+            bar={tw ? tw.pctLeft : undefined}
+            barTone={sessionWarning ? "warning" : "primary"}
             actions={
               <ActionButton kind="outline" size="sm" icon={LogIn} onClick={() => setLogoutConfirm(true)}>
                 Renouveler maintenant

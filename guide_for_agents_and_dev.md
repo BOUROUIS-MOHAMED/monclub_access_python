@@ -65,6 +65,7 @@ This file is only useful while it is true. If you change any of the following, y
 | What a turnstile's heartbeat line reports as waiting (`device_sync.py::count_waiting_pins`, `ultra_engine.py::_count_waiting_pins` and the snapshot's `failed_pins`, `_sync_one_device`'s `_last_waiting_pins`, `realtime_agent.py::get_status_snapshot`'s `failedPins`, `pc_identity.py::build_heartbeat_payload`, `::_report_held_turnstiles` and its `held` key, `erase_wizard.py::held_waiting_count`, the wizard's `_set_waiting`) | §3.10 |
 | Who writes to `access.db` — the DbWriter, `_run_db_write_sync` (its lanes, `priority=`, the inline nested call, the 60 s wait), a write outside it, the tripwire's allowlist (`tests/test_db_single_writer.py::ALLOWED_DIRECT`), which writes are in the door lane (`db.py::insert_access_history`, `::save_agent_rtlog_state`), the AGENT history claim (`realtime_agent.py::DecisionService.run`'s `F-013` block) | §3.11 |
 | The member fee lines of the entry screen -- what is stored, how it reaches the popup, how the screen judges and draws it (`db.py::_member_fees_json`, `::_member_fees_list`, `::_ensure_column_forcing_refresh`, `sync_users.fees_json` in `_SYNC_USER_COLUMNS` and the five member writers, `sync_access_software_settings.fee_due_soon_days`, `settings_reader.py::normalize_global_settings`'s `fee_due_soon_days`, `access_types.py::NotificationRequest.fees`, `ultra_engine.py::_enqueue_notification(user_fees=)`, `ultra_pc_entry.py::member_popup_fields`, `realtime_agent.py::_popup_payload_from_request`, `tauri-ui/src/lib/feeAlerts.ts`, `PopupWindow.tsx` `AFeeLine` / `AFeeMark`) | §3.12 |
+| What `/api/v2/status` shows Profil about the login -- `sessionIssuedAt` / `sessionExpiresAt` (`shared/auth_state.py::read_jwt_claims`, `::jwt_session_window`) | §3.13 Profil |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -4790,6 +4791,27 @@ renouveler. », the last line ending « +N autre(s) »; `AMulti` puts one small 
 tile's photo (red when a fee is unpaid, else gold). `[TEST: tauri-ui src/lib/feeAlerts.test.ts
 (npm test)]` The layout on a real entry TV with two fee lines and the gold expiry footer together
 is `[UNVERIFIED]`: checked by type-check and by reading the 1280×720 stage sizes only.
+
+---
+
+### 3.13 Profil — the session window (Access v5 Card P, 2026-10-16)
+
+**Display only.** Two `/api/v2/status` `session` fields feed the Profil page and nothing else:
+no door decision, sync, restriction or logout reads them. `[CODE:
+local_access_api_v2.py::_build_status_payload_uncached; grep finds no other reader]`
+
+- `sessionIssuedAt` / `sessionExpiresAt` — the stored access token's `iat` / `exp` claims, as
+  ISO-8601 UTC strings with an offset (`shared/auth_state.py::jwt_session_window`). The payload
+  is read **without** a signature check (`::read_jwt_claims`); the backend checks it on every
+  call. The token's length is the backend's `app.jwt.access-expiry-ms` (env
+  `JWT_ACCESS_EXPIRY_MS`, 30-day fallback), so `exp − iat` is read, never assumed. A missing or
+  non-numeric claim is `null`. `[TEST: tests/test_profile_session_data.py]`
+  This is the token's clock, **not** the local restriction's: `_restriction_reasons` /
+  `_compute_expiry_warnings` measure `last_login_at` + `max_login_age_minutes` (default
+  43200 = 30 days, naive local time). Both restart on a successful refresh
+  (`do_proactive_refresh` calls `save_auth_token`, which writes `last_login_at = now_iso()`), so
+  they run together when both lengths are 30 days; they differ when an operator changes either.
+  `[CODE: app.py::_restriction_reasons, monclub_api.py::do_proactive_refresh, db.py::save_auth_token]`
 
 ---
 

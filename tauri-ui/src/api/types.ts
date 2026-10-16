@@ -31,6 +31,10 @@ export interface SessionBlock {
   gymDate?: string | null;
   /** True once a protocol-2 sync answer has been trusted (windows/upcoming lists valid). */
   accessDatesTrusted?: boolean;
+  /** Card P: the stored access token's `iat` / `exp` (ISO-8601 UTC with an offset), read from
+   * its claims; null when absent or unreadable. Optional: the TV status omits them. */
+  sessionIssuedAt?: string | null;
+  sessionExpiresAt?: string | null;
 }
 
 export interface ModeBlock {

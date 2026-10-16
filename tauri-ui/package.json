@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc --noEmit -p . && vite build",
     "typecheck": "tsc --noEmit -p .",
-    "test": "node --experimental-strip-types --test src/lib/pcIdentityState.test.ts src/lib/releaseNotes.test.ts src/lib/watchdogStatus.test.ts src/lib/feeAlerts.test.ts",
+    "test": "node --experimental-strip-types --test src/lib/pcIdentityState.test.ts src/lib/releaseNotes.test.ts src/lib/watchdogStatus.test.ts src/lib/feeAlerts.test.ts src/lib/sessionWindow.test.ts",
     "preview": "vite preview",
     "tauri": "tauri"
   },

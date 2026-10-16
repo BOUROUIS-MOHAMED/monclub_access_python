@@ -847,6 +847,18 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
         "contractEndDate": (contract_meta.get("contractEndDate") if contract_meta else None),
     }
 
+    # Profil (Access v5): the stored access token's window, read from its claims (no signature
+    # check -- display only; the token itself is never sent). Unknown values are None, never guessed.
+    session["sessionIssuedAt"] = None
+    session["sessionExpiresAt"] = None
+    if auth and auth.token:
+        try:
+            from shared.auth_state import jwt_session_window
+
+            session["sessionIssuedAt"], session["sessionExpiresAt"] = jwt_session_window(auth.token)
+        except Exception:
+            pass
+
     try:
         expiry = app._compute_expiry_warnings()
         session["loginDaysRemaining"] = expiry.get("loginDaysRemaining")

@@ -151,10 +151,52 @@ def is_refresh_due(next_refresh_at: str) -> bool:
         return False
 
 
+def read_jwt_claims(token: str) -> dict | None:
+    """The payload of a JWT, read WITHOUT checking its signature.
+
+    For display only (the session window and the role on Profil): the backend checks the
+    signature on every call, nothing here grants anything. None when the token is not a
+    three-part JWT or its payload is not a JSON object.
+    """
+    import json
+
+    parts = (token or "").split(".")
+    if len(parts) != 3 or not parts[1]:
+        return None
+    try:
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8"))
+    except Exception:
+        return None
+    return claims if isinstance(claims, dict) else None
+
+
+def _epoch_to_utc_iso(value) -> str | None:
+    from datetime import datetime, timezone
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def jwt_session_window(token: str) -> tuple[str | None, str | None]:
+    """(issued, expires) of the stored access token as ISO-8601 UTC strings with an offset,
+    from its ``iat`` / ``exp`` claims (epoch seconds). The backend sets the lifetime
+    (``app.jwt.access-expiry-ms``), so ``exp - iat`` is the real length of this token.
+    A missing or unreadable claim is None, never guessed."""
+    claims = read_jwt_claims(token) or {}
+    return _epoch_to_utc_iso(claims.get("iat")), _epoch_to_utc_iso(claims.get("exp"))
+
+
 __all__ = [
     "AuthTokenState",
     "protect_auth_token",
     "unprotect_auth_token",
     "next_refresh_at_from_expires",
     "is_refresh_due",
+    "read_jwt_claims",
+    "jwt_session_window",
 ]
