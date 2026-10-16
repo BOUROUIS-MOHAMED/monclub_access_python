@@ -62,13 +62,13 @@ function splitRunError(error: string): { code: string | null; detail: string } {
 
 function LangSwitch({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) {
   return (
-    <div className="flex overflow-hidden rounded-lg border border-border text-[11px] font-bold">
+    <div className="flex overflow-hidden rounded-lg border border-grey/32 text-[11px] font-bold">
       {(["fr", "en"] as Lang[]).map((l) => (
         <button
           key={l}
           type="button"
           onClick={() => setLang(l)}
-          className={cn("px-2 py-0.5 uppercase", lang === l ? "bg-primary text-primary-foreground" : "text-muted-foreground")}
+          className={cn("px-2 py-0.5 uppercase", lang === l ? "bg-foreground text-background" : "text-muted-foreground")}
         >
           {l}
         </button>
@@ -87,13 +87,13 @@ function Choice({
 }) {
   return (
     <label className={cn(
-      "flex cursor-pointer items-start gap-2.5 rounded-xl border px-3 py-2 text-[12.5px]",
-      checked ? "border-primary bg-primary/[0.05]" : "border-border",
+      "flex cursor-pointer items-start gap-2.5 rounded-xl border px-3 py-2.5 text-[13px]",
+      checked ? "border-primary/48 bg-primary/8" : "border-grey/32",
       disabled && "cursor-not-allowed", dim && "opacity-50",
     )}>
       <input
         type={type} name={name} checked={checked} disabled={disabled} onChange={onChange}
-        className="mt-0.5 h-4 w-4 accent-[var(--primary,#e2203f)]"
+        className="mt-0.5 h-4 w-4 accent-primary"
       />
       <span className="min-w-0 flex-1">{children}</span>
     </label>
@@ -424,22 +424,22 @@ export default function EraseWizardDialog({
   const busy = run?.state === "RUNNING" || starting;
 
   const refillInfo = refillCheck && !backupOnly ? (
-    <div className="flex flex-col gap-0.5 rounded-xl border border-border p-2.5 text-[12px]">
+    <div className="flex flex-col gap-0.5 rounded-xl border border-grey/32 p-3 text-[12.5px]">
       {refillCheck.members !== null && (
         <span className="font-semibold">{t.refillWillWrite(refillCheck.members, schemeName(refillCheck.scheme))}</span>
       )}
-      <span className={cn(refillCheck.staleWhy ? "text-destructive" : "text-muted-foreground")}>
+      <span className={cn(refillCheck.staleWhy ? "text-error-ink" : "text-muted-foreground")}>
         {t.listAge(refillCheck.lastSyncAgeSec, refillCheck.syncMaxAgeSec)}
       </span>
       {refillCheck.ifAccount && (
-        <span className={cn(refillCheck.ifAccount.withheld > 0 && "text-amber-700")}>
+        <span className={cn(refillCheck.ifAccount.withheld > 0 && "text-warning-ink")}>
           {t.refillIfAccount(refillCheck.ifAccount.members, refillCheck.ifAccount.withheld)}
         </span>
       )}
       {refillCheck.cacheUpdatedAt && (
         <span className="text-muted-foreground">{t.refillCacheAt(refillCheck.cacheUpdatedAt)}</span>
       )}
-      {refillProblem && <span className="text-destructive">{problemText(refillProblem, refillCheck)}</span>}
+      {refillProblem && <span className="text-error-ink">{problemText(refillProblem, refillCheck)}</span>}
       {refillProblem && !refillCheck.problem && refill === "hold" && !heldBefore && (
         <span className="text-muted-foreground">{t.withheldOnlyIfAccount}</span>
       )}
@@ -449,7 +449,7 @@ export default function EraseWizardDialog({
   // Fingerprints only (an MB2000 "fingerprints", a C3 fingerprint table): the cards keep working.
   const fingersOut = !locksOut && ["fingerprints", "templatev10", "template"].some((k) => chosen.has(k));
   const lockoutLine = !backupOnly && (locksOut || fingersOut) ? (
-    <p className="text-[12px] font-semibold text-amber-700">
+    <p className="text-[12.5px] font-semibold text-warning-ink">
       {locksOut ? (refill === "hold" ? t.lockoutHold : t.lockoutRefill)
         : (refill === "hold" ? t.lockoutFingersHold : t.lockoutFingersRefill)}
     </p>
@@ -457,13 +457,13 @@ export default function EraseWizardDialog({
 
   // Steps 3 and 4: who the refill will NOT put back, by pin and name; the tick in step 4.
   const leftOutBox = (withTick: boolean) => (backupOnly || !preview ? null : leftOutUnknown ? (
-    <p className="text-[12px] font-semibold text-destructive">{t.notRefilledUnknown}</p>
+    <p className="text-[12.5px] font-semibold text-error-ink">{t.notRefilledUnknown}</p>
   ) : leftOutCount === 0 ? (
     <p className="text-[12px] text-muted-foreground">{t.notRefilledNone}</p>
   ) : (
-    <div className="flex flex-col gap-1.5 rounded-xl border border-amber-500/50 bg-amber-500/[0.06] p-2.5 text-[12px]">
-      <p className="font-semibold text-amber-800">{t.notRefilledTitle(leftOutCount, schemeName(leftOut?.scheme), leftOutWhat)}</p>
-      <ul className="max-h-[120px] overflow-y-auto rounded-lg border border-border bg-background px-2 py-1 font-mono text-[11.5px]">
+    <div className="flex flex-col gap-1.5 rounded-xl border border-warning/48 bg-warning/8 p-3 text-[12.5px]">
+      <p className="font-semibold text-warning-ink">{t.notRefilledTitle(leftOutCount, schemeName(leftOut?.scheme), leftOutWhat)}</p>
+      <ul className="max-h-[120px] overflow-y-auto rounded-lg border border-grey/20 bg-card px-2 py-1 font-mono text-[12px]">
         {(leftOut?.people ?? []).map((p) => <li key={p.pin}>{p.pin} — {p.name || t.unknown}</li>)}
       </ul>
       <p className="text-muted-foreground">{t.notRefilledBackup}</p>
@@ -480,21 +480,21 @@ export default function EraseWizardDialog({
   const header = (
     <DialogHeader>
       <div className="flex items-center justify-between gap-3 pr-6">
-        <DialogTitle className="flex items-center gap-2 text-[15px]">
-          <Trash2 className="h-4 w-4 text-primary" />
+        <DialogTitle className="flex items-center gap-2 text-[18px] font-bold">
+          <Trash2 className="h-[18px] w-[18px] text-error-ink" />
           {t.title} — {deviceName}
         </DialogTitle>
         <LangSwitch lang={lang} setLang={setLang} />
       </div>
       {unlocked && mode === "erase" && (
-        <ol className="mt-2 flex gap-1.5">
+        <ol className="mt-3 flex gap-2">
           {t.steps.map((label, i) => (
             <li key={label} className={cn(
-              "flex items-center gap-1.5 rounded-lg px-2 py-1 text-[11px] font-bold",
-              i === step ? "bg-primary text-primary-foreground"
-                : i < step ? "bg-primary/[0.09] text-primary" : "bg-muted text-muted-foreground",
+              "flex min-w-0 flex-1 flex-col gap-1.5 text-[12px]",
+              i === step ? "font-bold text-foreground" : "font-medium text-muted-foreground",
             )}>
-              <span>{i + 1}</span><span>{label}</span>
+              <span className={cn("h-1 rounded-full", i <= step ? "bg-primary" : "bg-muted")} />
+              <span className="truncate">{i + 1}. {label}</span>
             </li>
           ))}
         </ol>
@@ -523,15 +523,15 @@ export default function EraseWizardDialog({
   );
 
   const holdPanel = (hold: boolean) => hold ? (
-    <Alert className="border-amber-500/40 bg-amber-500/[0.08]">
-      <PauseCircle className="h-4 w-4 text-amber-600" />
+    <Alert className="border-warning/48 bg-warning/8 [&>svg]:text-warning-ink">
+      <PauseCircle className="h-4 w-4" />
       <AlertDescription className="flex flex-col gap-2 text-[12.5px]">
         <span className="font-semibold">{t.holdBanner}</span>
         {holdsUnknown
-          ? <span className="text-destructive">{t.holdsUnknown}</span>
+          ? <span className="text-error-ink">{t.holdsUnknown}</span>
           : <span>{t.schemeNote(holdScheme === undefined ? t.unknown : schemeName(holdScheme))}</span>}
         {!holdsUnknown && schemeMoved && (
-          <span className={cn("font-semibold", schemeMovedBlocked ? "text-destructive" : "text-amber-700")}>
+          <span className={cn("font-semibold", schemeMovedBlocked ? "text-error-ink" : "text-warning-ink")}>
             {schemeMovedBlocked
               ? t.schemeMovedHold(holdTerminal === null ? null : schemeName(holdTerminal), schemeName(holdScheme))
               : t.schemeMovedBack(schemeName(holdTerminal))}
@@ -541,7 +541,7 @@ export default function EraseWizardDialog({
           <span className="text-muted-foreground">{t.mbPasses(preview.limits.mbPinsPerPass)}</span>
         ) : null}
         <span className="text-muted-foreground">{t.handoverWaits}</span>
-        {refillError && <span className="text-destructive">{refillError}</span>}
+        {refillError && <span className="text-error-ink">{refillError}</span>}
         {adminClash && adminClash.length > 0 && (
           <Choice type="checkbox" name="confirm-admins" checked={confirmAdmins}
                   onChange={() => setConfirmAdmins((v) => !v)}>
@@ -562,20 +562,20 @@ export default function EraseWizardDialog({
 
   const refillDone = refillMsg ? (
     <>
-      <Alert><CheckCircle2 className="h-4 w-4 text-emerald-600" /><AlertDescription>{refillMsg}</AlertDescription></Alert>
-      {refillWarnings.map((w) => <p key={w} className="text-[12px] font-semibold text-amber-700">{w}</p>)}
+      <Alert className="border-success/48 bg-success/8 [&>svg]:text-success-ink"><CheckCircle2 className="h-4 w-4" /><AlertDescription>{refillMsg}</AlertDescription></Alert>
+      {refillWarnings.map((w) => <p key={w} className="text-[12.5px] font-semibold text-warning-ink">{w}</p>)}
     </>
   ) : null;
 
   const countsTable = (withAfter: boolean) => {
     const rows = preview?.tables ?? [];
     return (
-      <table className="w-full text-[12.5px]">
+      <table className="w-full text-[13px]">
         <thead>
-          <tr className="border-b border-border text-left text-[10.5px] uppercase tracking-[0.12em] text-muted-foreground">
-            <th className="py-1.5 font-bold">{t.table}</th>
-            <th className="py-1.5 text-right font-bold">{withAfter ? t.before : t.rows}</th>
-            {withAfter && <th className="py-1.5 text-right font-bold">{t.after}</th>}
+          <tr className="bg-muted text-left text-[12px] text-muted-foreground">
+            <th className="px-2.5 py-2 font-semibold">{t.table}</th>
+            <th className="px-2.5 py-2 text-right font-semibold">{withAfter ? t.before : t.rows}</th>
+            {withAfter && <th className="px-2.5 py-2 text-right font-semibold">{t.after}</th>}
           </tr>
         </thead>
         <tbody>
@@ -583,17 +583,17 @@ export default function EraseWizardDialog({
             const before = withAfter ? run?.countsBefore?.tables?.[r.key] : r.count;
             const after = run?.countsAfter?.tables?.[r.key];
             return (
-              <tr key={r.key} className="border-b border-border/50 last:border-0">
-                <td className="py-1.5">
+              <tr key={r.key} className="border-b border-dashed border-grey/20 last:border-0">
+                <td className="px-2.5 py-2">
                   <div className="font-semibold">{t.tableLabels[r.key] ?? r.key}</div>
                   {!r.erasable && !withAfter && (
                     <div className="text-[11px] text-muted-foreground">{t.reasons[r.reason ?? ""] ?? r.reason}</div>
                   )}
                 </td>
-                <td className="py-1.5 text-right font-mono">{before ?? t.unknown}</td>
+                <td className="px-2.5 py-2 text-right font-mono">{before ?? t.unknown}</td>
                 {withAfter && (
-                  <td className={cn("py-1.5 text-right font-mono",
-                    run?.tables.includes(r.key) && after === 0 && "text-emerald-600")}>{after ?? t.unknown}</td>
+                  <td className={cn("px-2.5 py-2 text-right font-mono",
+                    run?.tables.includes(r.key) && after === 0 && "text-success-ink")}>{after ?? t.unknown}</td>
                 )}
               </tr>
             );
@@ -606,7 +606,7 @@ export default function EraseWizardDialog({
   const extraLines = preview && protocol === "ZK_STANDALONE" ? (
     <div className="flex flex-col gap-0.5 text-[12px] text-muted-foreground">
       <span>{t.admins}{t.colon} <b className="text-foreground">{preview.extra.admins ?? t.unknown}</b></span>
-      <span>{t.faces}{t.colon} <b className={cn("text-foreground", (faces > 0 || facesUnknown) && "text-amber-600")}>{preview.extra.faces ?? t.unknown}</b></span>
+      <span>{t.faces}{t.colon} <b className={cn("text-foreground", (faces > 0 || facesUnknown) && "text-warning-ink")}>{preview.extra.faces ?? t.unknown}</b></span>
     </div>
   ) : null;
 
@@ -627,7 +627,7 @@ export default function EraseWizardDialog({
     body = (
       <div className="flex flex-col gap-3">
         <p className="text-[12px] text-muted-foreground">{t.readOnly}</p>
-        {restartNote && <Alert className="border-amber-500/40 bg-amber-500/[0.08]"><AlertDescription className="text-[12px]">{restartNote}</AlertDescription></Alert>}
+        {restartNote && <Alert className="border-warning/48 bg-warning/8 text-warning-ink"><AlertDescription className="text-[12px]">{restartNote}</AlertDescription></Alert>}
         {previewError && <Alert variant="destructive"><AlertDescription>{previewError}</AlertDescription></Alert>}
         {loading && !preview ? <Loader2 className="h-5 w-5 animate-spin text-primary" /> : countsTable(false)}
         {extraLines}
@@ -680,7 +680,7 @@ export default function EraseWizardDialog({
               {forgetForced && <div className="text-[11px] text-muted-foreground">{t.forgetForcedMb}</div>}
             </Choice>
             <div className="mt-1 text-[12.5px] font-bold">{t.refillTitle}</div>
-            {heldBefore && <p className="text-[12px] text-amber-700">{t.heldAlready}</p>}
+            {heldBefore && <p className="text-[12.5px] text-warning-ink">{t.heldAlready}</p>}
             <Choice name="refill" checked={refill === "now"} disabled={heldBefore} onChange={() => setRefill("now")}>{t.refillNow}</Choice>
             <Choice name="refill" checked={refill === "auto"} disabled={heldBefore} onChange={() => setRefill("auto")}>
               {t.refillAuto}<div className="text-[11px] text-muted-foreground">{t.refillAutoHelp}</div>
@@ -693,7 +693,7 @@ export default function EraseWizardDialog({
             {leftOutBox(false)}
             {needFaces && (
               <Choice type="checkbox" name="faces" checked={acceptFaces} onChange={() => setAcceptFaces((v) => !v)}>
-                <span className="text-amber-700">{facesUnknown ? t.acceptFacesUnknown : t.acceptFaces(faces)}</span>
+                <span className="text-warning-ink">{facesUnknown ? t.acceptFacesUnknown : t.acceptFaces(faces)}</span>
               </Choice>
             )}
           </>
@@ -708,7 +708,7 @@ export default function EraseWizardDialog({
     const refillLabel = refill === "now" ? t.refillNow : refill === "auto" ? t.refillAuto : t.refillHold;
     body = (
       <div className="flex flex-col gap-3">
-        <div className="rounded-xl border border-border p-3 text-[12.5px]">
+        <div className="rounded-xl bg-muted p-3 text-[13px]">
           <div className="mb-1 font-bold">{t.summary}</div>
           <div className="mb-1 font-semibold">
             {t.deviceLine(preview.device.name, preview.device.ip || t.unknown, preview.device.port || "4370",
@@ -723,7 +723,7 @@ export default function EraseWizardDialog({
         {lockoutLine}
         {leftOutBox(true)}
         {!backupOnly && (
-          <div className="flex flex-col gap-1.5 rounded-xl border border-destructive/40 bg-destructive/[0.04] p-2.5">
+          <div className="flex flex-col gap-1.5 rounded-xl border border-error/48 bg-error/8 p-3">
             <p className="text-[12px] font-semibold">{t.otherPcsTitle}</p>
             <Choice type="checkbox" name="other-pcs" checked={otherPcsClosed}
                     onChange={() => setOtherPcsClosed((v) => !v)}>
@@ -731,8 +731,8 @@ export default function EraseWizardDialog({
             </Choice>
           </div>
         )}
-        <Alert className="border-primary/30 bg-primary/[0.04]">
-          <ShieldAlert className="h-4 w-4 text-primary" />
+        <Alert className="border-error/48 bg-error/8 [&>svg]:text-error-ink">
+          <ShieldAlert className="h-4 w-4" />
           <AlertDescription className="text-[12px]">
             <div className="mb-1 font-bold">{t.rulesTitle}</div>
             <ul className="list-disc space-y-0.5 pl-4">
@@ -762,7 +762,7 @@ export default function EraseWizardDialog({
     body = (
       <div className="flex flex-col gap-3">
         <div className={cn("flex items-center gap-2 text-[14px] font-bold",
-          state === "DONE" ? "text-emerald-600" : state === "RUNNING" ? "text-foreground" : "text-destructive")}>
+          state === "DONE" ? "text-success-ink" : state === "RUNNING" ? "text-foreground" : "text-error-ink")}>
           <Icon className={cn("h-5 w-5", state === "RUNNING" && "animate-spin")} />{t.states[state] ?? state}
         </div>
         {run?.progress && (
@@ -771,8 +771,8 @@ export default function EraseWizardDialog({
         <ol className="flex max-h-[180px] flex-col gap-1 overflow-y-auto text-[12px]">
           {(run?.steps ?? []).map((s, i) => (
             <li key={`${s.step}-${i}`} className="flex items-start gap-2">
-              {s.ok ? <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-600" />
-                : <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />}
+              {s.ok ? <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-success-ink" />
+                : <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-error-ink" />}
               <span className="font-mono text-muted-foreground">{s.at.slice(11)}</span>
               <span>{t.stepLabels[s.step] ?? (s.step.startsWith("erase_") ? t.eraseOf(s.step.slice(6)) : s.step)}</span>
             </li>
@@ -801,14 +801,14 @@ export default function EraseWizardDialog({
           const { code, detail } = splitRunError(typeof note === "string" ? note : "");
           const said = code ? t.finishNotes[code] : undefined;
           return said ? (
-            <div className="flex flex-col gap-0.5 text-[12px] text-amber-700">
+            <div className="flex flex-col gap-0.5 text-[12.5px] text-warning-ink">
               <span className="font-semibold">{said}</span>
               <span className="text-[11px] opacity-80">{t.errorDetail}{t.colon} {code} — {detail}</span>
             </div>
           ) : null;
         })()}
         {run?.notRefilled && run.notRefilled.count > 0 && (
-          <p className="text-[12px] text-amber-700">{t.notRefilledKept(run.notRefilled.count)}</p>
+          <p className="text-[12.5px] text-warning-ink">{t.notRefilledKept(run.notRefilled.count)}</p>
         )}
         {run?.countsBefore && countsTable(true)}
         {run?.backup && (
@@ -827,7 +827,7 @@ export default function EraseWizardDialog({
 
   return (
     <Dialog open={open} onOpenChange={(o) => { if (!o && !busy) onClose(); }}>
-      <DialogContent className="max-h-[92vh] max-w-2xl overflow-y-auto">
+      <DialogContent className="max-h-[92vh] max-w-2xl overflow-y-auto rounded-2xl border-0 bg-card shadow-[var(--shadow-dialog)] sm:rounded-2xl">
         {header}
         {body}
       </DialogContent>
