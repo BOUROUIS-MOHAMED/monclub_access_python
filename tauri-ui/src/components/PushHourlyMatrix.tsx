@@ -1,7 +1,7 @@
 // Historique push — « Envois par heure »: one row per device, one square per local hour.
 // Every value comes from GET /push-history/hourly (push_batch_history, grouped by the
 // PC's local hour of created_at): batch counts per stored status and the stored pins_*.
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
 
 import { get } from "@/api/client";
@@ -71,16 +71,21 @@ export function PushHourlyMatrix({ refreshToken }: { refreshToken: number }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Only the latest request may write: a slow answer for a day the operator already left
+  // must not replace the day on screen.
+  const reqRef = useRef(0);
   const load = useCallback(async (d: string) => {
+    const req = ++reqRef.current;
     setLoading(true);
     setError(null);
+    setData((prev) => (prev && prev.date === d ? prev : null));
     try {
-      setData(await get<PushHourlyResponse>("/push-history/hourly", { date: d }));
+      const res = await get<PushHourlyResponse>("/push-history/hourly", { date: d });
+      if (req === reqRef.current) setData(res);
     } catch (err) {
-      setData(null);
-      setError(String(err));
+      if (req === reqRef.current) { setData(null); setError(String(err)); }
     } finally {
-      setLoading(false);
+      if (req === reqRef.current) setLoading(false);
     }
   }, []);
 

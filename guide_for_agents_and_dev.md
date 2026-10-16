@@ -4847,7 +4847,7 @@ handler here carries a member or a pin (so none belongs in §3.2f).
     repeating their cards, so counting rows would report false duplicates. The person is
     `main_account_id`; when a row has none, the `main_account_id` another row of the same `user_id`
     carries; else the `user_id` (tagged, so an account id and a user id never merge); else the
-    membership. `main_account_id` can be NULL on every row (§3.2d: a backend that does not send it) --
+    membership; else the row alone (never merged with another). `main_account_id` can be NULL on every row (§3.2d: a backend that does not send it) --
     then persons are user ids, and two user ids of one account would count as two persons. The answer
     also lists up to 50 duplicated cards with their persons' names (the page's tooltip).
   - « Passages à envoyer »: the door-history uploader's own filter (`list_pending_access_history_for_sync`:

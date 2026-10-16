@@ -118,3 +118,15 @@ def test_handler_and_route(db):
     api._handle_db_kpis(_Ctx())
     assert sent["status"] == 200 and sent["payload"]["ok"] is True
     assert ("GET", "/api/v2/db/kpis", "_handle_db_kpis") in ACCESS_LOCAL_ROUTE_SPECS
+
+
+def test_rows_that_name_no_person_are_never_merged(db):
+    with db.get_conn() as conn:
+        _member(conn, amid=None, uid=None, name="A", c1="444")
+        _member(conn, amid=None, uid=None, name="B", c1="444")
+        conn.commit()
+
+    k = db.local_db_kpis()
+
+    assert k["people"] == 2
+    assert k["cards"]["duplicated"] == 1

@@ -11040,7 +11040,8 @@ def local_db_kpis() -> Dict[str, Any]:
 
     Duplicate cards are counted per PERSON, not per row: a person has one sync_users row per
     membership, each repeating their cards. The person is ``main_account_id``, else -- when
-    no row of that ``user_id`` carries one -- the ``user_id``, else the membership. A card
+    no row of that ``user_id`` carries one -- the ``user_id``, else the membership, else the
+    row alone. A card
     counts as duplicated when two or more persons hold it, in either card column. A card
     value is trimmed; an empty value is no card.
 
@@ -11076,7 +11077,7 @@ def local_db_kpis() -> Dict[str, Any]:
             uid, mid = int(row["user_id"]), int(row["main_account_id"])
             account_by_user[uid] = min(mid, account_by_user.get(uid, mid))
 
-    def _person(row: Any) -> str:
+    def _person(row: Any, index: int) -> str:
         if row["main_account_id"] is not None:
             return f"a:{int(row['main_account_id'])}"
         if row["user_id"] is not None:
@@ -11084,12 +11085,14 @@ def local_db_kpis() -> Dict[str, Any]:
             if uid in account_by_user:
                 return f"a:{account_by_user[uid]}"
             return f"u:{uid}"
-        return f"m:{row['active_membership_id']}"
+        if row["active_membership_id"] is not None:
+            return f"m:{int(row['active_membership_id'])}"
+        return f"r:{index}"     # nothing names the person: this row alone, never merged
 
     people: Dict[str, Dict[str, Any]] = {}
     holders: Dict[str, set] = {}
-    for row in rows:
-        key = _person(row)
+    for index, row in enumerate(rows):
+        key = _person(row, index)
         person = people.setdefault(key, {
             "fullName": "", "userId": row["user_id"], "mainAccountId": None,
         })

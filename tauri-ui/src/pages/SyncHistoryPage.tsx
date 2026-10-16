@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Activity, CircleCheck, CircleX, Eye, ListChecks, Loader2, Play, RefreshCw, Router, ScrollText, TriangleAlert, Users,
@@ -96,16 +96,20 @@ export default function SyncHistoryPage() {
   const lastOk = useMemo(() => rows.find((r) => String(r.status || "").toUpperCase() === "SUCCESS") ?? null, [rows]);
   const lastFailed = useMemo(() => rows.find((r) => String(r.status || "").toUpperCase() === "FAILED") ?? null, [rows]);
 
+  // Only the last run clicked may fill the detail (a slow answer for an earlier click is dropped).
+  const detailReqRef = useRef(0);
   const openDetail = useCallback(async (id: number) => {
+    const req = ++detailReqRef.current;
     setDetailLoading(true);
     try {
       const res = await get<SyncRunDetailResponse>(`/sync-history/${id}`);
+      if (req !== detailReqRef.current) return;
       setSelectedRun(res.item);
       setRunBatches(Array.isArray(res.pushBatches) ? res.pushBatches : []);
     } catch (err) {
-      setError(String(err));
+      if (req === detailReqRef.current) setError(String(err));
     } finally {
-      setDetailLoading(false);
+      if (req === detailReqRef.current) setDetailLoading(false);
     }
   }, []);
 
