@@ -1,31 +1,23 @@
 import React, { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import { get, post } from "@/api/client";
 import { DataTable } from "@/components/ui/data-table";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Alert, AlertDescription } from "@/components/ui/alert";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
-} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { ActionButton } from "@/components/ui/action-button";
+import { Chip } from "@/components/ui/chip";
+import { LineTabs } from "@/components/ui/line-tabs";
+import { ListRow, Note, PageGrid, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
 import {
   Database,
   Download,
+  History,
   Loader2,
   RefreshCw,
   Lock,
   LockOpen,
-  Key,
   Eye,
   EyeOff,
-  X,
+  ScrollText,
   Timer,
   AlertCircle,
 } from "lucide-react";
@@ -68,6 +60,13 @@ function fmtMs(ms: number): string {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
+/** 50 593 792 → « 48,2 Mo » (dbSizeBytes from GET /db/tables). */
+function fmtSize(bytes: number | null): string {
+  if (bytes == null || !Number.isFinite(bytes) || bytes <= 0) return "";
+  const mo = bytes / (1024 * 1024);
+  return mo >= 1 ? `${mo.toFixed(1).replace(".", ",")} Mo` : `${Math.max(1, Math.round(bytes / 1024))} Ko`;
+}
+
 // ─── lock screen ──────────────────────────────────────────────────────────────
 
 function LockScreen({ onUnlock }: { onUnlock: () => void }) {
@@ -96,7 +95,7 @@ function LockScreen({ onUnlock }: { onUnlock: () => void }) {
       }
     } catch (e: any) {
       const msg = e?.name === "AbortError" || (e?.message ?? "").includes("timed out")
-        ? "Le serveur ne r\u00e9pond pas. V\u00e9rifiez votre connexion internet."
+        ? "Le serveur ne répond pas. Vérifiez votre connexion internet."
         : (e?.message ?? "Erreur d'authentification");
       setError(msg);
     } finally {
@@ -104,129 +103,82 @@ function LockScreen({ onUnlock }: { onUnlock: () => void }) {
     }
   }, [password, loading, onUnlock]);
 
-  // Access v3, screen 07 — the only screen in the refonte WITHOUT a rail: when
-  // there is exactly one thing to do, everything else disappears. The password
-  // is entered inline rather than in a dialog (design's explicit change); the
-  // auth call itself is untouched.
+  // Board S20: one card, one thing to do. The password is entered inline (no
+  // dialog); the auth call itself is untouched.
   return (
-    <>
-      <style>{`
-        @keyframes db-ring {
-          0%   { transform: scale(1);   opacity: .5; }
-          100% { transform: scale(2.2); opacity: 0;  }
-        }
-        .db-ring-1 { animation: db-ring 2.8s ease-out infinite; }
-        .db-ring-2 { animation: db-ring 2.8s ease-out infinite 1.4s; }
-      `}</style>
-
-      <div className="relative flex h-full min-h-0 select-none items-center justify-center overflow-hidden">
-        <div className="relative flex w-[420px] flex-col items-center text-center">
-
-          <div className="relative mb-[30px] flex h-[108px] w-[108px] items-center justify-center">
-            <span className="db-ring-1 absolute h-24 w-24 rounded-full bg-primary/10" />
-            <span className="db-ring-2 absolute h-24 w-24 rounded-full bg-primary/[0.08]" />
-            <div className="relative flex h-[88px] w-[88px] items-center justify-center rounded-full border-[1.5px] border-primary/20 bg-card text-primary shadow-[0_8px_20px_rgba(226,32,63,0.10)]">
-              <Lock className="h-[38px] w-[38px]" strokeWidth={1.6} />
-            </div>
-          </div>
-
-          <p className="mb-3.5 font-mono text-[10px] font-bold uppercase tracking-[0.38em] text-primary">
-            Accès restreint
-          </p>
-          <h2 className="mb-3 font-display text-[32px] font-extrabold leading-[1.1] tracking-[-0.03em] text-foreground">
-            Autorisation requise
-          </h2>
-          <p className="mb-[30px] max-w-[330px] text-[14.5px] leading-[1.6] text-muted-foreground">
+    <PageGrid>
+      <Panel className="col-span-12">
+        <div className="flex flex-col items-center px-5 pb-[30px] pt-9 text-center">
+          <span className="grid h-16 w-16 place-items-center rounded-full bg-primary/12 text-primary">
+            <Lock className="h-[30px] w-[30px]" />
+          </span>
+          <div className="mt-3.5 text-[11.5px] font-bold uppercase tracking-[0.08em] text-muted-foreground">Accès restreint</div>
+          <h2 className="mt-0.5 text-[19px] font-bold">Autorisation requise</h2>
+          <p className="mt-1 max-w-[380px] text-[13.5px] leading-normal text-muted-foreground">
             Cette section contient les données brutes du club. Saisissez le mot de passe
             administrateur pour l'ouvrir.
           </p>
 
-          <div className="flex w-[320px] flex-col gap-[11px]">
-            <div className="relative">
-              <Key className="pointer-events-none absolute left-[15px] top-1/2 h-[19px] w-[19px] -translate-y-1/2 text-muted-foreground" />
-              <Input
-                type={showPwd ? "text" : "password"}
-                value={password}
-                onChange={(e) => { setPassword(e.target.value); setError(null); }}
-                onKeyDown={(e) => { if (e.key === "Enter" && !loading) handleConfirm(); }}
-                disabled={loading}
-                autoFocus
-                placeholder="••••••••"
-                className={cn(
-                  "h-[46px] rounded-xl border-[1.5px] pl-[46px] pr-[42px] text-[15px] tracking-[0.1em]",
-                  error ? "border-primary" : "border-border focus-visible:border-primary",
-                )}
-              />
-              <button
-                type="button"
-                tabIndex={-1}
-                onClick={() => setShowPwd((v) => !v)}
-                className="absolute right-[15px] top-1/2 -translate-y-1/2 text-muted-foreground transition-colors hover:text-foreground"
-              >
-                {showPwd ? <EyeOff className="h-[18px] w-[18px]" /> : <Eye className="h-[18px] w-[18px]" />}
-              </button>
-            </div>
-
-            {error && (
-              <div className="flex items-start gap-[9px] rounded-xl border border-primary/20 bg-primary/[0.05] px-[13px] py-2.5 text-left">
-                <AlertCircle className="mt-px h-4 w-4 shrink-0 text-primary" />
-                <span className="text-[12px] leading-[1.5] text-primary">{error}</span>
-              </div>
+          <label htmlFor="localdb-pwd" className="mt-[18px] w-[320px] text-left text-[12.5px] font-semibold text-muted-foreground">
+            Mot de passe administrateur
+          </label>
+          <div
+            className={cn(
+              "mt-1.5 flex h-[42px] w-[320px] items-center gap-2 rounded-lg border px-3 focus-within:border-primary",
+              error ? "border-error" : "border-grey/32",
             )}
-
-            <Button
-              onClick={handleConfirm}
-              disabled={loading || !password.trim()}
-              className="h-[46px] w-full justify-center gap-2 rounded-full text-[14px] font-bold shadow-[0_8px_20px_rgba(226,32,63,0.22)]"
+          >
+            <Input
+              id="localdb-pwd"
+              type={showPwd ? "text" : "password"}
+              value={password}
+              onChange={(e) => { setPassword(e.target.value); setError(null); }}
+              onKeyDown={(e) => { if (e.key === "Enter" && !loading) handleConfirm(); }}
+              disabled={loading}
+              autoFocus
+              placeholder="••••••••"
+              className="h-9 flex-1 rounded-none border-0 bg-transparent px-0 text-[15px] tracking-[0.2em] shadow-none focus-visible:ring-0"
+            />
+            <button
+              type="button"
+              tabIndex={-1}
+              aria-label={showPwd ? "Masquer le mot de passe" : "Afficher le mot de passe"}
+              onClick={() => setShowPwd((v) => !v)}
+              className="grid place-items-center text-muted-foreground transition-colors hover:text-foreground"
             >
-              {loading ? <Loader2 className="h-[18px] w-[18px] animate-spin" /> : <LockOpen className="h-[18px] w-[18px]" />}
-              {loading ? "Vérification…" : "Déverrouiller"}
-            </Button>
+              {showPwd ? <EyeOff className="h-[18px] w-[18px]" /> : <Eye className="h-[18px] w-[18px]" />}
+            </button>
           </div>
 
-          {/* The duration below is SESSION_MS, not the design's placeholder copy. */}
-          <div className="mt-[26px] flex items-center gap-2">
-            <Timer className="h-[15px] w-[15px] text-muted-foreground" />
-            <span className="text-[11.5px] text-muted-foreground">
-              La session se reverrouille automatiquement après {Math.round(SESSION_MS / 60000)} minutes
+          {error && (
+            <Note tone="error" className="mt-2.5 flex w-[320px] items-start gap-2 text-left text-[12.5px]">
+              <AlertCircle className="mt-px h-4 w-4 shrink-0" />
+              <span>{error}</span>
+            </Note>
+          )}
+
+          <ActionButton
+            kind="dark"
+            className="mt-3.5 h-10 w-[320px]"
+            icon={loading ? Loader2 : LockOpen}
+            spin={loading}
+            onClick={handleConfirm}
+            disabled={loading || !password.trim()}
+          >
+            {loading ? "Vérification…" : "Déverrouiller"}
+          </ActionButton>
+
+          {/* The duration below is SESSION_MS — a fixed lease from the unlock, not inactivity. */}
+          <div className="mt-3 flex items-center gap-2 text-[12.5px] text-muted-foreground">
+            <Timer className="h-[15px] w-[15px] shrink-0" />
+            <span>
+              Vérifié en ligne par le serveur MonClub (Internet requis). La session se reverrouille
+              automatiquement {Math.round(SESSION_MS / 60000)} minutes après l'ouverture.
             </span>
           </div>
         </div>
-      </div>
-    </>
-  );
-}
-
-// ─── session badge ────────────────────────────────────────────────────────────
-
-function SessionBadge({ remaining, onLock }: { remaining: number; onLock: () => void }) {
-  return (
-    <div
-      className="flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-mono"
-      style={{
-        background: "rgba(30,144,255,0.07)",
-        border: "1px solid rgba(30,144,255,0.2)",
-        color: "rgba(30,144,255,0.85)",
-      }}
-    >
-      <span
-        className="w-1.5 h-1.5 rounded-full"
-        style={{
-          background: "#1e90ff",
-          boxShadow: "0 0 4px rgba(30,144,255,0.8)",
-          animation: "pulse 2s ease-in-out infinite",
-        }}
-      />
-      {fmtMs(remaining)}
-      <button
-        type="button"
-        onClick={onLock}
-        title="Verrouiller"
-        className="ml-0.5 opacity-40 hover:opacity-80 transition-opacity"
-      >
-        <X className="w-3 h-3" />
-      </button>
-    </div>
+      </Panel>
+    </PageGrid>
   );
 }
 
@@ -422,13 +374,18 @@ export default function LocalDbPage() {
   // [{name, rowCount}] for every table in the SQLite file, so no count is
   // estimated here. Loaded once per unlock.
   const [tableStats, setTableStats] = useState<{ name: string; rowCount: number }[]>([]);
+  const [dbSizeBytes, setDbSizeBytes] = useState<number | null>(null);
   useEffect(() => {
     if (!unlocked) return;
     let cancelled = false;
     void (async () => {
       try {
-        const res = await get<{ tables?: { name: string; rowCount: number }[] }>("/db/tables");
-        if (!cancelled) setTableStats(Array.isArray(res?.tables) ? res.tables : []);
+        const res = await get<{ tables?: { name: string; rowCount: number }[]; dbSizeBytes?: number }>("/db/tables");
+        if (!cancelled) {
+          setTableStats(Array.isArray(res?.tables) ? res.tables : []);
+          // Same response: the SQLite file size, shown in the header.
+          setDbSizeBytes(typeof res?.dbSizeBytes === "number" ? res.dbSizeBytes : null);
+        }
       } catch { /* rail falls back to the static TABLES list without counts */ }
     })();
     return () => { cancelled = true; };
@@ -448,257 +405,226 @@ export default function LocalDbPage() {
 
   const sessionPct = Math.max(0, Math.min(100, Math.round((remaining / SESSION_MS) * 100)));
 
+  const sizeLabel = fmtSize(dbSizeBytes);
+
   usePageChrome(() => ({
     fill: true,
     subtitle: unlocked ? (
-      <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-emerald-500/[0.055] px-2 text-[11px] font-bold text-emerald-700 dark:text-emerald-400">
-        <LockOpen className="h-3 w-3" />Déverrouillée · {fmtMs(remaining)}
+      <span className="inline-flex items-center gap-2">
+        <Chip tone="success" icon={LockOpen}>Déverrouillée</Chip>
+        <span>se reverrouille dans {fmtMs(remaining)}{sizeLabel ? ` · ${sizeLabel}` : ""}</span>
       </span>
     ) : (
-      <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-primary/[0.09] px-2 text-[11px] font-bold text-primary">
-        <Lock className="h-3 w-3" />Verrouillée
+      <span className="inline-flex items-center gap-2">
+        <Chip tone="grey" icon={Lock}>Verrouillée</Chip>
+        <span>SQLite de ce poste, lecture seule</span>
       </span>
     ),
     actions: unlocked ? (
       <>
-        <Button
-          variant="outline"
-          className="h-[30px] gap-1.5 rounded-[14px] px-[13px] text-[12px] font-semibold"
+        <ActionButton
+          kind="outline"
+          icon={Download}
           disabled={activeExport.rows.length === 0}
           onClick={() => exportToExcel(activeExport.rows, activeExport.name)}
         >
-          <Download className="h-[15px] w-[15px]" />Exporter en Excel
-        </Button>
-        <Button
-          variant="outline"
-          className="h-[30px] gap-1.5 rounded-[14px] px-[13px] text-[12px] font-semibold"
-          onClick={handleLock}
-        >
-          <Lock className="h-[15px] w-[15px]" />Verrouiller
-        </Button>
+          Exporter en Excel
+        </ActionButton>
+        <ActionButton kind="dark" icon={Lock} onClick={handleLock}>Verrouiller</ActionButton>
       </>
     ) : undefined,
     // Primitives only — see the note in UsersPage: a changing function
     // reference here re-runs the effect on every render and loops.
-  }), [unlocked, remaining, tab, activeExport.rows.length, activeExport.name]);
+  }), [unlocked, remaining, tab, activeExport.rows.length, activeExport.name, sizeLabel]);
 
   // ── render lock screen ──
   if (!unlocked) {
     return <LockScreen onUnlock={handleUnlock} />;
   }
 
+  const loadedBadge = (n: number, word: string) => (
+    <Chip tone="grey">{n.toLocaleString("fr-FR")} {word}</Chip>
+  );
+
   // ── render content ──
   return (
     <TooltipProvider>
-    <div className="flex h-full min-h-0 gap-4">
-      {/* ── Le sujet : la table, pleine hauteur ─────────────────────────── */}
-      <div className="flex min-w-0 flex-1 flex-col gap-[11px]">
-      <Tabs value={tab} onValueChange={setTab} className="flex min-h-0 flex-1 flex-col gap-[11px]">
-        <div className="flex flex-none items-center gap-[9px]">
-          <TabsList className="h-[34px] rounded-xl bg-muted p-[3px]">
-            <TabsTrigger value="sync" className="h-7 rounded-[9px] px-[13px] text-[12.5px] data-[state=active]:font-bold">Cache Sync</TabsTrigger>
-            <TabsTrigger value="history" className="h-7 rounded-[9px] px-[13px] text-[12.5px] data-[state=active]:font-bold">Historique accès</TabsTrigger>
-            <TabsTrigger value="raw" className="h-7 rounded-[9px] px-[13px] text-[12.5px] data-[state=active]:font-bold">Table brute</TabsTrigger>
-          </TabsList>
-          <span className="ml-auto inline-flex items-center gap-2 text-[11.5px] text-muted-foreground">
-            <Database className="h-[15px] w-[15px]" />
-            {activeExport.rows.length} ligne{activeExport.rows.length > 1 ? "s" : ""} chargée{activeExport.rows.length > 1 ? "s" : ""}
-          </span>
-        </div>
+    <div className="flex h-full min-h-0 flex-col gap-[18px]">
+      <LineTabs
+        className="-mt-1 flex-none"
+        value={tab}
+        onChange={setTab}
+        items={[
+          { value: "sync", label: "Cache sync", icon: Database },
+          { value: "history", label: "Historique accès", icon: History },
+          { value: "raw", label: "Table brute", icon: ScrollText },
+        ]}
+      />
 
-        {/* Sync cache tab */}
-        <TabsContent value="sync" className="mt-0 flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto rounded-3xl bg-card p-5 shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
-          <div className="flex items-center gap-2">
-            <Button size="sm" variant="outline" onClick={loadSync} disabled={syncLoading}>
-              {syncLoading
-                ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                : <RefreshCw className="h-3.5 w-3.5" />}
-              Charger
-            </Button>
-            {syncUsers.length > 0 && (
-              <Button size="sm" variant="outline" onClick={() => exportToExcel(syncUsers, "sync-users")}>
-                <Download className="h-3.5 w-3.5" /> Excel
-              </Button>
-            )}
-            {syncUsers.length > 0 && (
-              <Badge variant="secondary" className="text-xs">
-                {syncUsers.length} utilisateurs
-              </Badge>
-            )}
-          </div>
-          {syncError && (
-            <Alert variant="destructive">
-              <AlertDescription>{syncError}</AlertDescription>
-            </Alert>
-          )}
-          {syncUsers.length > 0 ? (
-            <DataTable
-              columns={syncColumns}
-              data={syncUsers}
-              searchKey="full_name"
-              searchPlaceholder="Rechercher un utilisateur…"
-              emptyMessage="Aucune donnée dans le cache sync."
-            />
-          ) : !syncLoading && (
-            <p className="text-sm text-muted-foreground py-8 text-center">
-              Cliquez sur « Charger » pour afficher le cache de synchronisation.
-            </p>
-          )}
-        </TabsContent>
-
-        {/* History tab */}
-        <TabsContent value="history" className="mt-0 flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto rounded-3xl bg-card p-5 shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
-          <div className="flex items-center gap-2">
-            <Button size="sm" variant="outline" onClick={loadHistory} disabled={historyLoading}>
-              {historyLoading
-                ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                : <RefreshCw className="h-3.5 w-3.5" />}
-              Charger
-            </Button>
-            {historyRows.length > 0 && (
-              <Button size="sm" variant="outline" onClick={() => exportToExcel(historyRows, "access-history")}>
-                <Download className="h-3.5 w-3.5" /> Excel
-              </Button>
-            )}
-            <Badge variant="secondary" className="text-xs">
-              {historyRows.length} entrées
-            </Badge>
-          </div>
-          {historyError && (
-            <Alert variant="destructive">
-              <AlertDescription>{historyError}</AlertDescription>
-            </Alert>
-          )}
-          {historyRows.length > 0 ? (
-            <DataTable
-              columns={historyColumns}
-              data={historyRows}
-              searchPlaceholder="Rechercher…"
-              emptyMessage="Aucun historique d'accès."
-            />
-          ) : !historyLoading && (
-            <p className="text-sm text-muted-foreground py-8 text-center">
-              Cliquez sur « Charger » pour afficher l'historique d'accès.
-            </p>
-          )}
-        </TabsContent>
-
-        {/* Raw table tab */}
-        <TabsContent value="raw" className="mt-0 flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto rounded-3xl bg-card p-5 shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
-          <div className="flex items-center gap-2 flex-wrap">
-            <Select
-              value={tableName}
-              onValueChange={(v: string) => {
-                setTableName(v);
-                setRawRows([]);
-                setRawCols([]);
-              }}
-            >
-              <SelectTrigger className="w-56">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {TABLES.map((t) => <SelectItem key={t} value={t}>{t}</SelectItem>)}
-              </SelectContent>
-            </Select>
-            <Button size="sm" variant="outline" onClick={() => loadRawTable()} disabled={rawLoading}>
-              {rawLoading
-                ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                : <RefreshCw className="h-3.5 w-3.5" />}
-              Charger
-            </Button>
-            {rawRows.length > 0 && (
-              <Button size="sm" variant="outline" onClick={() => exportToExcel(rawRows, tableName)}>
-                <Download className="h-3.5 w-3.5" /> Excel
-              </Button>
-            )}
-            <Badge variant="secondary" className="text-xs">
-              {rawRows.length} lignes
-            </Badge>
-          </div>
-          {rawError && (
-            <Alert variant="destructive">
-              <AlertDescription>{rawError}</AlertDescription>
-            </Alert>
-          )}
-          {rawRows.length > 0 ? (
-            <DataTable
-              columns={rawColumns}
-              data={rawRows}
-              searchPlaceholder="Rechercher…"
-              emptyMessage="Table vide."
-            />
-          ) : !rawLoading && (
-            <p className="text-sm text-muted-foreground py-8 text-center">
-              Sélectionnez une table et cliquez sur « Charger ».
-            </p>
-          )}
-        </TabsContent>
-      </Tabs>
-      </div>
-
-      {/* ── Le rail ─────────────────────────────────────────────────────── */}
-      <div className="flex w-[330px] flex-none flex-col gap-[11px]">
-        <div className="flex flex-none items-center gap-[9px]">
-          <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-primary/[0.08] px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em] text-primary">
-            <Timer className="h-3 w-3" />Session
-          </span>
-        </div>
-
-        {/* The countdown is the real sessionStorage lease (SESSION_MS), the same
-            value that re-locks the page when it reaches zero. */}
-        <div className="flex-none rounded-3xl bg-card px-5 py-[18px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
-          <div className="mb-[13px] flex items-center gap-[13px]">
-            <span className="flex h-[42px] w-[42px] shrink-0 items-center justify-center rounded-[18px] bg-emerald-500/[0.055] text-emerald-700 dark:text-emerald-400">
-              <LockOpen className="h-[21px] w-[21px]" />
-            </span>
-            <div className="min-w-0 flex-1">
-              <div className="num text-[20px] leading-none">{fmtMs(remaining)}</div>
-              <div className="mt-1 text-[11.5px] text-muted-foreground">avant reverrouillage</div>
-            </div>
-          </div>
-          <div className="mb-[13px] h-1.5 overflow-hidden rounded-full bg-muted">
-            <div className="h-full rounded-full bg-emerald-500 transition-[width] duration-1000" style={{ width: `${sessionPct}%` }} />
-          </div>
-          <Button
-            variant="outline"
-            className="h-8 w-full justify-center gap-1.5 rounded-[14px] text-[12px] font-semibold"
-            onClick={handleLock}
-          >
-            <Lock className="h-[15px] w-[15px]" />Verrouiller maintenant
-          </Button>
-        </div>
-
-        <div className="mt-[3px] flex flex-none items-center gap-[9px]">
-          <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-muted px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em] text-muted-foreground">
-            <Database className="h-3 w-3" />Tables
-          </span>
-          <span className="text-[11.5px] text-muted-foreground">{tableStats.length || TABLES.length}</span>
-        </div>
-        <div className="flex min-h-0 flex-1 flex-col gap-[3px] overflow-y-auto rounded-[18px] bg-card px-[18px] py-[11px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
-          {(tableStats.length ? tableStats.map((t) => t.name) : TABLES).map((name) => {
-            const active = tab === "raw" && tableName === name;
-            const c = countOf(name);
-            return (
-              <button
-                key={name}
-                onClick={() => { setTab("raw"); setTableName(name); void loadRawTable(name); }}
-                className={cn(
-                  "flex items-center justify-between gap-2.5 rounded-[10px] px-2.5 py-[7px] text-left transition-colors",
-                  active ? "bg-foreground" : "hover:bg-muted",
-                )}
+      <div className="grid min-h-0 flex-1 grid-cols-12 gap-[18px]">
+        {/* ── Le sujet : la table ─────────────────────────────────────────── */}
+        <Panel className="col-span-8 flex min-h-0 flex-col">
+          {tab === "sync" && (
+            <>
+              <PanelHeader
+                title="Cache de synchronisation"
+                sub={`sync_users${countOf("sync_users") != null ? ` · ${countOf("sync_users")!.toLocaleString("fr-FR")} lignes` : ""} (un abonnement par ligne)`}
+                className="flex-none"
               >
-                <span className={cn("truncate font-mono text-[12px]", active ? "font-semibold text-background" : "text-muted-foreground")}>
-                  {name}
-                </span>
-                {c != null && (
-                  <span className={cn("shrink-0 font-mono text-[11px]", active ? "text-background/70" : "text-muted-foreground")}>
-                    {c.toLocaleString("fr-FR")}
-                  </span>
+                {syncUsers.length > 0 && loadedBadge(syncUsers.length, "lignes chargées")}
+                <ActionButton kind="outline" size="md" icon={syncLoading ? Loader2 : RefreshCw} spin={syncLoading} onClick={loadSync} disabled={syncLoading}>
+                  Charger
+                </ActionButton>
+                {syncUsers.length > 0 && (
+                  <ActionButton kind="outline" size="md" icon={Download} onClick={() => exportToExcel(syncUsers, "sync-users")}>Excel</ActionButton>
                 )}
-              </button>
-            );
-          })}
+              </PanelHeader>
+              <div className="min-h-0 flex-1 overflow-y-auto px-[18px] pb-4 pt-3">
+                {syncError && <Note tone="error" className="mb-3">{syncError}</Note>}
+                {syncUsers.length > 0 ? (
+                  <DataTable
+                    columns={syncColumns}
+                    data={syncUsers}
+                    searchKey="full_name"
+                    searchPlaceholder="Rechercher un utilisateur…"
+                    emptyMessage="Aucune donnée dans le cache sync."
+                  />
+                ) : !syncLoading && (
+                  <p className="py-8 text-center text-[13.5px] text-muted-foreground">
+                    Cliquez sur « Charger » pour afficher le cache de synchronisation.
+                  </p>
+                )}
+              </div>
+            </>
+          )}
+
+          {tab === "history" && (
+            <>
+              <PanelHeader title="Historique accès" sub="access_history · passages enregistrés sur ce poste (500 derniers)" className="flex-none">
+                {loadedBadge(historyRows.length, "entrées")}
+                <ActionButton kind="outline" size="md" icon={historyLoading ? Loader2 : RefreshCw} spin={historyLoading} onClick={loadHistory} disabled={historyLoading}>
+                  Charger
+                </ActionButton>
+                {historyRows.length > 0 && (
+                  <ActionButton kind="outline" size="md" icon={Download} onClick={() => exportToExcel(historyRows, "access-history")}>Excel</ActionButton>
+                )}
+              </PanelHeader>
+              <div className="min-h-0 flex-1 overflow-y-auto px-[18px] pb-4 pt-3">
+                {historyError && <Note tone="error" className="mb-3">{historyError}</Note>}
+                {historyRows.length > 0 ? (
+                  <DataTable
+                    columns={historyColumns}
+                    data={historyRows}
+                    searchPlaceholder="Rechercher…"
+                    emptyMessage="Aucun historique d'accès."
+                  />
+                ) : !historyLoading && (
+                  <p className="py-8 text-center text-[13.5px] text-muted-foreground">
+                    Cliquez sur « Charger » pour afficher l'historique d'accès.
+                  </p>
+                )}
+              </div>
+            </>
+          )}
+
+          {tab === "raw" && (
+            <>
+              <PanelHeader title={tableName} sub="Lecture seule · 500 lignes max" className="flex-none">
+                {loadedBadge(rawRows.length, "lignes")}
+                <Select
+                  value={tableName}
+                  onValueChange={(v: string) => {
+                    setTableName(v);
+                    setRawRows([]);
+                    setRawCols([]);
+                  }}
+                >
+                  <SelectTrigger aria-label="Changer de table" className="h-8 w-56 rounded-lg border-grey/32 bg-card font-mono text-[13px] shadow-none">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {TABLES.map((t) => <SelectItem key={t} value={t} className="font-mono">{t}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+                <ActionButton kind="outline" size="md" icon={rawLoading ? Loader2 : RefreshCw} spin={rawLoading} onClick={() => loadRawTable()} disabled={rawLoading}>
+                  Charger
+                </ActionButton>
+                {rawRows.length > 0 && (
+                  <ActionButton kind="outline" size="md" icon={Download} onClick={() => exportToExcel(rawRows, tableName)}>Excel</ActionButton>
+                )}
+              </PanelHeader>
+              <div className="min-h-0 flex-1 overflow-y-auto px-[18px] pb-4 pt-3">
+                {rawError && <Note tone="error" className="mb-3">{rawError}</Note>}
+                {rawRows.length > 0 ? (
+                  <DataTable
+                    columns={rawColumns}
+                    data={rawRows}
+                    searchPlaceholder="Rechercher…"
+                    emptyMessage="Table vide."
+                  />
+                ) : !rawLoading && (
+                  <p className="py-8 text-center text-[13.5px] text-muted-foreground">
+                    Sélectionnez une table et cliquez sur « Charger ».
+                  </p>
+                )}
+              </div>
+            </>
+          )}
+        </Panel>
+
+        {/* ── Le rail ─────────────────────────────────────────────────────── */}
+        <div className="col-span-4 flex min-h-0 flex-col gap-[18px]">
+          {/* The countdown is the real sessionStorage lease (SESSION_MS), the same
+              value that re-locks the page when it reaches zero. */}
+          <Panel className="flex-none">
+            <PanelHeader title="Session" />
+            <PanelList>
+              <ListRow
+                icon={Timer}
+                tone="warning"
+                title={`${fmtMs(remaining)} avant reverrouillage`}
+                sub="Compte à rebours depuis l'ouverture"
+                bar={sessionPct}
+                barTone="warning"
+                actions={<ActionButton kind="outline" size="sm" icon={Lock} onClick={handleLock}>Verrouiller maintenant</ActionButton>}
+              />
+            </PanelList>
+          </Panel>
+
+          <Panel className="flex min-h-0 flex-1 flex-col">
+            <PanelHeader
+              title={`Tables · ${tableStats.length || TABLES.length}`}
+              sub="Toutes les tables SQLite de ce poste"
+              className="flex-none"
+            />
+            <div className="min-h-0 flex-1 overflow-y-auto px-[18px] pb-3.5 pt-2.5">
+              {(tableStats.length ? tableStats.map((t) => t.name) : TABLES).map((name) => {
+                const active = tab === "raw" && tableName === name;
+                const c = countOf(name);
+                return (
+                  <button
+                    key={name}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => { setTab("raw"); setTableName(name); void loadRawTable(name); }}
+                    className={cn(
+                      "flex w-full cursor-pointer items-center justify-between gap-2.5 rounded-lg px-2.5 py-[7px] text-left transition-colors",
+                      active ? "bg-primary/8 outline outline-1 outline-primary/32" : "hover:bg-muted",
+                    )}
+                  >
+                    <span className={cn("truncate font-mono text-[13px]", active ? "font-semibold text-foreground" : "text-foreground")}>
+                      {name}
+                    </span>
+                    {c != null && (
+                      <span className="shrink-0 font-mono text-[12.5px] font-bold text-foreground">
+                        {c.toLocaleString("fr-FR")}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </Panel>
         </div>
       </div>
 
