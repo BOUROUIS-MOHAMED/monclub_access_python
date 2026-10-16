@@ -477,14 +477,16 @@ export default function EnrollPage() {
   // The subject is the capture in progress, not a form. `scanProgress` is the
   // REAL 0–3 sample counter the SSE stream reports (data.sampleNum, and the
   // "sample N/3 captured" log line); `phase` is the authoritative step.
-  const phaseCopy: Record<string, { title: string; hint: string }> = {
+  // Keyed by EnrollPhase so a missing or misspelt phase is a type error.
+  const phaseCopy: Record<EnrollPhase, { title: string; hint: string }> = {
     idle: { title: "Prêt à enrôler", hint: "Choisissez un membre et un doigt, puis démarrez la capture." },
     connecting: { title: "Connexion…", hint: "Vérification des informations." },
     device_init: { title: "Ouverture du lecteur", hint: "Initialisation du scanner ZK9500." },
     wait_finger: { title: "Posez votre doigt", hint: "Appuyez fermement sur le scanner ZK9500." },
     lift_finger: { title: "Levez le doigt", hint: "Puis reposez-le pour l'échantillon suivant." },
     sample_rejected: { title: "Échantillon rejeté", hint: "Qualité insuffisante — reposez le doigt." },
-    pushing: { title: "Envoi à l'appareil…", hint: "L'empreinte est transmise au lecteur." },
+    processing: { title: "Traitement…", hint: "Fusion des échantillons en une empreinte." },
+    push: { title: "Sauvegarde…", hint: "Enregistrement de l'empreinte sur le serveur MonClub." },
     success: { title: "Empreinte enregistrée", hint: "La capture est terminée." },
     failed: { title: "Échec de la capture", hint: "Consultez le journal ci-dessous." },
     cancelled: { title: "Capture annulée", hint: "Vous pouvez relancer une capture." },
@@ -509,7 +511,9 @@ export default function EnrollPage() {
       ? `Capture en cours${selectedUser?.fullName ? ` · ${selectedUser.fullName}` : ""}`
       : done
         ? `Empreinte enregistrée${selectedUser?.fullName ? ` · ${selectedUser.fullName}` : ""}`
-        : `${fingerprints.length} empreinte${fingerprints.length > 1 ? "s" : ""} locale${fingerprints.length > 1 ? "s" : ""}`,
+        : selectedUser
+          ? `${selectedUser.fullName || "Ce membre"} · ${existingSlots.size} doigt${existingSlots.size > 1 ? "s" : ""} enregistré${existingSlots.size > 1 ? "s" : ""}`
+          : "Choisissez un membre et un doigt",
     actions: (
       <>
         <ActionButton kind="outline" icon={soundEnabled ? Volume2 : VolumeX} onClick={toggleSound}>
@@ -521,7 +525,7 @@ export default function EnrollPage() {
       </>
     ),
     // Primitives only — a changing function reference here loops the effect.
-  }), [captureActive, done, selectedUser?.fullName, fingerprints.length, soundEnabled, running]);
+  }), [captureActive, done, selectedUser?.fullName, existingSlots.size, !!selectedUser, soundEnabled, running]);
 
   const stateChip = captureActive
     ? { l: "EN COURS", tone: "primary" as const }
@@ -777,14 +781,39 @@ export default function EnrollPage() {
           </div>
         </Panel>
 
+        {/* The member's prints as the server knows them (local copy, /sync/cache/users).
+            The old « Déjà enregistrées » read the local `fingerprints` table, which nothing
+            writes any more (db.insert_fingerprint has no caller), so it was always empty. */}
         <Panel className="flex-none">
-          <PanelHeader title={`Déjà enregistrées · ${fingerprints.length}`} sub="Empreintes stockées sur ce PC">
+          <PanelHeader
+            title={`Déjà enregistrées · ${selectedUser ? existingSlots.size : "—"}`}
+            sub={selectedUser ? `${selectedUser.fullName || "Ce membre"} · copie locale du serveur` : "Choisissez un membre"}
+          />
+          <PanelList>
+            {!selectedUser ? (
+              <div className="py-2 text-[13px] text-muted-foreground">Aucun membre choisi.</div>
+            ) : (Array.isArray(selectedUser.fingerprints) ? selectedUser.fingerprints : []).length === 0 ? (
+              <div className="py-2 text-[13px] text-muted-foreground">Aucune empreinte enregistrée pour ce membre.</div>
+            ) : (selectedUser.fingerprints as any[]).map((f: any, i: number) => (
+              <ListRow
+                key={`${f?.fingerId}-${i}`}
+                icon={Fingerprint}
+                tone={f?.enabled === false ? "grey" : "success"}
+                title={`Doigt ${f?.fingerId}`}
+                sub={[f?.label, f?.enabled === false ? "désactivée" : "", f?.templateSize ? `${f.templateSize} o` : ""].filter(Boolean).join(" · ") || undefined}
+              />
+            ))}
+          </PanelList>
+        </Panel>
+
+        {/* Rows an older version stored in the local table: shown only if any exist, delete kept. */}
+        {fingerprints.length > 0 && (
+        <Panel className="flex-none">
+          <PanelHeader title={`Anciennes empreintes locales · ${fingerprints.length}`} sub="Stockées sur ce PC par une ancienne version">
             {fpLoading && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
           </PanelHeader>
           <PanelList>
-            {fingerprints.length === 0 ? (
-              <div className="py-2 text-[13px] text-muted-foreground">Aucune empreinte locale stockée.</div>
-            ) : fingerprints.map((fp: any) => (
+            {fingerprints.map((fp: any) => (
               <ListRow
                 key={fp.id}
                 icon={Fingerprint}
@@ -800,6 +829,7 @@ export default function EnrollPage() {
             ))}
           </PanelList>
         </Panel>
+        )}
       </div>
 
       <div className="hidden">

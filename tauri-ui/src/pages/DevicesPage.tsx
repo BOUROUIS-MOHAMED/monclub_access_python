@@ -634,7 +634,7 @@ export default function DevicesPage() {
                               </span>
                             </TooltipTrigger>
                             <TooltipContent>
-                              Commande d'ouverture non activée pour ce modèle (à valider sur le matériel).
+                              Commande d'ouverture non activée pour cet appareil (à valider sur le matériel).
                             </TooltipContent>
                           </Tooltip>
                         )}

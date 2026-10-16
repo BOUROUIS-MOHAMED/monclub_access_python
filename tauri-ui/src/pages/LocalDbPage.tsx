@@ -368,7 +368,7 @@ export default function LocalDbPage() {
   const TABLES = [
     "sync_users", "sync_devices", "sync_device_door_presets", "sync_memberships",
     "sync_infrastructures", "sync_gym_access_credentials",
-    "fingerprints", "access_history", "auth_tokens", "sync_cache_meta",
+    "fingerprints", "access_history",
   ];
 
   // Rail table list with row counts — GET /api/v2/db/tables already returns
@@ -544,7 +544,9 @@ export default function LocalDbPage() {
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {TABLES.map((t) => <SelectItem key={t} value={t} className="font-mono">{t}</SelectItem>)}
+                    {/* Once /db/tables answered, only list the curated tables that really exist. */}
+                    {(tableStats.length ? TABLES.filter((t) => tableStats.some((s) => s.name === t)) : TABLES)
+                      .map((t) => <SelectItem key={t} value={t} className="font-mono">{t}</SelectItem>)}
                   </SelectContent>
                 </Select>
                 <ActionButton kind="outline" size="md" icon={rawLoading ? Loader2 : RefreshCw} spin={rawLoading} onClick={() => loadRawTable()} disabled={rawLoading}>

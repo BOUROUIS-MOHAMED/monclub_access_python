@@ -1361,7 +1361,16 @@ export default function UsersPage() {
                     railFacts.deleting.length > 0 ? `${railFacts.deleting.length} suppression${railFacts.deleting.length > 1 ? "s" : ""}` : "",
                   ].filter(Boolean).join(" · ")}
                   actions={(
-                    <ActionButton kind="outline" size="sm" icon={RefreshCw} onClick={() => runAction(() => post("/offline-creations/process-due", {}), "Nouvel essai lancé.")}>
+                    <ActionButton
+                      kind="outline"
+                      size="sm"
+                      icon={RefreshCw}
+                      onClick={() => {
+                        // Offline creations and offline changes/deletions are two queues.
+                        if (railFacts.offlineNew.length > 0) void runAction(() => post("/offline-creations/process-due", {}), "Nouvel essai lancé.");
+                        if (railFacts.syncing.length + railFacts.deleting.length > 0) void runMutationAction(() => post("/mutations/process-due", {}), "Envoi lancé.");
+                      }}
+                    >
                       Envoyer maintenant
                     </ActionButton>
                   )}
