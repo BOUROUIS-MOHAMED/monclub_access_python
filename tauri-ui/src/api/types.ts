@@ -494,6 +494,17 @@ export interface MemberCardResponse {
   fingerprints: MemberCardFingerprint[];
   /** QR (TOTP) credentials granting this membership — state only, never the secret. */
   qrCredentials: { enabled: boolean; rotatedAt: string | null; updatedAt: string | null }[];
+  /** The sync_users_held hold (reason frozen | expired | not_started, gym date), null on the roster. */
+  hold: { reason: string | null; forDate: string | null; at: string | null } | null;
+  /** Protocol-2 freeze days; null when this PC cannot say (no/untrusted windows, no window). */
+  freeze: {
+    gymDate: string;
+    frozenToday: boolean;
+    /** offDays after the gym date — freeze start/end dates are not synced. */
+    nextFreezeDays: string[];
+    beyondHorizon: boolean;
+    horizonEnd: string | null;
+  } | null;
 }
 
 // GET /api/v2/members/{activeMembershipId}/history?limit= — door events THIS PC stored for the

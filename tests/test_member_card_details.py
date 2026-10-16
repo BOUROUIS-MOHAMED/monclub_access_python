@@ -9,6 +9,8 @@ GET /api/v2/members/{activeMembershipId}/card reads ONE membership when the card
   secret never leaves the database.
 * 7c -- GET /api/v2/members/{activeMembershipId}/history: the latest door events this PC stored
   for the person behind the membership, newest first, capped.
+* 7d -- freeze days from the protocol-2 window (§3.8) against the APPLIED gym date, never with
+  untrusted windows; members held off the roster stay reachable on the Utilisateurs roster.
 
 Every test patches ``app.core.db._DB_PATH`` to a temp file.
 """
@@ -300,6 +302,111 @@ class TestMemberHistory:
         ctx = _Ctx(params={"activeMembershipId": "77"})
         _handle_member_history(ctx)
         assert ctx.sent[0] == 404
+
+
+# --------------------------------------------------------------------------- 7d
+
+def _v2_state(db, *, trusted=1, applied="2026-10-16", horizon_end="2026-11-15"):
+    with db.get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO access_v2_state (id, trusted, server_today, horizon_end, applied_date) "
+            "VALUES (1, ?, ?, ?, ?)",
+            (trusted, applied, horizon_end, applied),
+        )
+        conn.commit()
+
+
+def _window(db, amid, off_days, *, beyond=0, frm="2026-01-01", until="2026-12-31"):
+    with db.get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO member_access_window (active_membership_id, access_from, access_until, "
+            "off_days_json, off_days_beyond_horizon) VALUES (?, ?, ?, ?, ?)",
+            (amid, frm, until, json.dumps(off_days), beyond),
+        )
+        conn.commit()
+
+
+class TestFreeze:
+    def test_frozen_today_needs_a_frozen_hold_for_the_applied_gym_date(self, db):
+        db.upsert_delta_users([_user(7, 700, card="1007")])
+        _v2_state(db)
+        _window(db, 7, ["2026-10-16", "2026-10-17", "2026-10-20", "2026-10-01"])
+        _hold(db, 7, reason="frozen", for_date="2026-10-16")
+
+        f = db.get_member_card_details(7)["freeze"]
+
+        assert f["frozenToday"] is True and f["gymDate"] == "2026-10-16"
+        assert f["nextFreezeDays"] == ["2026-10-17", "2026-10-20"]    # after the gym date only
+        assert f["horizonEnd"] == "2026-11-15" and f["beyondHorizon"] is False
+
+    def test_a_hold_from_an_earlier_date_does_not_say_today(self, db):
+        db.upsert_delta_users([_user(7, 700, card="1007")])
+        _v2_state(db, applied="2026-10-16")
+        _window(db, 7, ["2026-10-15"])
+        _hold(db, 7, reason="frozen", for_date="2026-10-15")
+
+        assert db.get_member_card_details(7)["freeze"]["frozenToday"] is False
+
+    def test_a_roster_member_with_coming_freeze_days(self, db):
+        db.upsert_delta_users([_user(1, 100, card="1001")])
+        _v2_state(db)
+        _window(db, 1, ["2026-10-30"], beyond=1)
+
+        d = db.get_member_card_details(1)
+        assert d["hold"] is None
+        assert d["freeze"] == {
+            "gymDate": "2026-10-16", "frozenToday": False, "nextFreezeDays": ["2026-10-30"],
+            "beyondHorizon": True, "horizonEnd": "2026-11-15",
+        }
+
+    def test_nothing_is_claimed_without_trusted_windows(self, db):
+        db.upsert_delta_users([_user(1, 100, card="1001"), _user(2, 200, card="1002")])
+        _window(db, 1, ["2026-10-30"])
+        assert db.get_member_card_details(1)["freeze"] is None          # no state row
+        _v2_state(db, trusted=0)
+        assert db.get_member_card_details(1)["freeze"] is None          # untrusted
+        _v2_state(db, trusted=1)
+        assert db.get_member_card_details(2)["freeze"] is None          # no window
+
+
+class TestHeldMembersOnTheRoster:
+    def test_a_held_member_is_listed_with_its_hold_and_without_templates(self, db):
+        db.upsert_delta_users([
+            _user(1, 100, card="1001"),
+            _user(7, 700, card="1007", fps=[_fp(0)]),
+        ])
+        _v2_state(db, applied="2026-10-16")
+        _hold(db, 7, reason="frozen", for_date="2026-10-16")
+
+        rows, total, counts = db.list_members_roster()
+
+        assert total == 2 and counts["all"] == 2
+        held = {r["activeMembershipId"]: r for r in rows}[7]
+        assert held["heldReason"] == "frozen" and held["heldToday"] is True
+        assert held["fingerprints"] == []
+        assert _TEMPLATE_DATA not in json.dumps(rows)
+        assert "heldReason" not in {r["activeMembershipId"]: r for r in rows}[1]
+
+    def test_an_older_hold_is_not_today_and_search_reaches_held_rows(self, db):
+        db.upsert_delta_users([_user(7, 700, card="1007")])
+        _v2_state(db, applied="2026-10-16")
+        _hold(db, 7, reason="expired", for_date="2026-10-14")
+
+        rows, total, _ = db.list_members_roster(q="member 700")
+        assert total == 1 and rows[0]["heldReason"] == "expired" and rows[0]["heldToday"] is False
+
+    def test_an_id_on_both_tables_is_listed_once(self, db):
+        db.upsert_delta_users([_user(7, 700, card="1007")])
+        cols = ", ".join(db._SYNC_USER_COLUMNS)
+        with db.get_conn() as conn:
+            conn.execute(
+                f"INSERT INTO sync_users_held ({cols}, held_reason, held_for_date, held_at) "
+                f"SELECT {cols}, 'frozen', '2026-10-16', 'x' FROM sync_users WHERE active_membership_id = 7"
+            )
+            conn.commit()
+
+        rows, total, _ = db.list_members_roster()
+        assert total == 1 and "heldReason" not in rows[0]
 
 
 class TestCardEndpoint:

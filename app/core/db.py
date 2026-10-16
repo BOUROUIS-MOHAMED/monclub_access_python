@@ -8098,6 +8098,13 @@ def list_members_roster(
     list_sync_users_page before adding a consumer that would read them.
     [TEST: tests/test_local_state_template_free.py]"""
     users, _total = list_sync_users_page(limit=0, offset=0, include_templates=False)
+    # Held rows (§3.8: off the turnstile roster for the gym date -- frozen, expired, not
+    # started) are still memberships of the server's list on this PC; without them a member
+    # frozen today vanished from Utilisateurs. Flagged with heldReason so none reads as a plain
+    # roster row. [TEST: tests/test_member_card_details.py::TestHeldMembersOnTheRoster]
+    users = list(users) + _list_held_users_for_roster({
+        _to_int_or_none(u.get("activeMembershipId")) for u in users
+    })
     title_idx = _membership_title_index()
     muts_by_target = _active_mutations_by_target()
     today = datetime.now().date()
@@ -8173,6 +8180,36 @@ def list_members_roster(
     return page_rows, filtered_total, counts
 
 
+def _list_held_users_for_roster(skip_ids: set) -> List[Dict[str, Any]]:
+    """sync_users_held rows as roster payloads, template-free (fingerprints_json is not
+    selected), each with ``heldReason`` / ``heldForDate`` and ``heldToday`` (held for the gym
+    date last applied by a flip). An id already on sync_users is skipped."""
+    try:
+        with get_conn() as conn:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(sync_users_held)").fetchall()]
+            keep = [c for c in cols if c != "fingerprints_json"]
+            if not keep:
+                return []
+            rows = [dict(r) for r in conn.execute(
+                "SELECT " + ", ".join(f'"{c}"' for c in keep) + " FROM sync_users_held"
+            ).fetchall()]
+            st = conn.execute("SELECT applied_date FROM access_v2_state WHERE id = 1").fetchone()
+    except Exception:
+        return []
+    applied = str(st[0]) if st is not None and st[0] else None
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        amid = _to_int_or_none(r.get("active_membership_id"))
+        if amid is not None and amid in skip_ids:
+            continue
+        u = _coerce_user_row_to_payload(r)
+        u["heldReason"] = r.get("held_reason")
+        u["heldForDate"] = r.get("held_for_date")
+        u["heldToday"] = bool(applied and r.get("held_for_date") == applied)
+        out.append(u)
+    return out
+
+
 def _member_row_for_card(conn: sqlite3.Connection, active_membership_id: int) -> tuple[Dict[str, Any] | None, Dict[str, Any] | None]:
     """(row, hold) for one membership: the sync_users row, else the sync_users_held row with
     its hold columns in ``hold``. Selects only the columns the member card reads -- one row's
@@ -8225,6 +8262,14 @@ def get_member_card_details(active_membership_id: int) -> Dict[str, Any] | None:
             "SELECT enabled, rotated_at, updated_at, granted_active_membership_ids_json "
             "FROM sync_gym_access_credentials"
         ).fetchall()]
+        state_row = conn.execute(
+            "SELECT trusted, applied_date, horizon_end FROM access_v2_state WHERE id = 1"
+        ).fetchone()
+        win_row = conn.execute(
+            "SELECT access_from, access_until, off_days_json, off_days_beyond_horizon "
+            "FROM member_access_window WHERE active_membership_id = ?",
+            (amid,),
+        ).fetchone()
 
     qr: List[Dict[str, Any]] = []
     for c in cred_rows:
@@ -8259,6 +8304,46 @@ def get_member_card_details(active_membership_id: int) -> Dict[str, Any] | None:
         "fingerprintCount": len(fps),
         "fingerprints": fps,
         "qrCredentials": qr,
+        "hold": hold,
+        "freeze": _member_freeze_facts(state_row, win_row, hold),
+    }
+
+
+def _member_freeze_facts(state_row: Any, win_row: Any, hold: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    """The freeze lines of the member card from the protocol-2 data (§3.8), or None when that
+    data cannot say: no access_v2_state row, untrusted windows (the flip moves nothing then, and
+    neither does this card claim anything), no applied gym date, or no stored window.
+
+    * ``frozenToday`` -- the row is held out of the roster for reason ``frozen`` FOR the applied
+      gym date (a hold set on an earlier date does not say "today").
+    * ``nextFreezeDays`` -- the window's ``offDays`` AFTER the gym date, sorted. Freeze periods
+      (start/end) are not synced: only these days are known, up to ``horizonEnd``;
+      ``beyondHorizon`` = the server said more exist past it.
+    """
+    from app.core import access_dates as _ad
+
+    if state_row is None or win_row is None:
+        return None
+    st = dict(state_row)
+    if not st.get("trusted"):
+        return None
+    gym = _ad.parse_iso_date(st.get("applied_date"))
+    if gym is None:
+        return None
+    w = _window_from_columns(win_row[0], win_row[1], win_row[2], win_row[3])
+    if w is None:
+        return None
+    frozen_today = bool(
+        hold is not None
+        and str(hold.get("reason") or "") == "frozen"
+        and _ad.parse_iso_date(hold.get("forDate")) == gym
+    )
+    return {
+        "gymDate": gym.isoformat(),
+        "frozenToday": frozen_today,
+        "nextFreezeDays": [d.isoformat() for d in sorted(w.off_days) if d > gym],
+        "beyondHorizon": bool(w.off_days_beyond_horizon),
+        "horizonEnd": st.get("horizon_end"),
     }
 
 

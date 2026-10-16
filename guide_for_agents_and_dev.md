@@ -65,7 +65,7 @@ This file is only useful while it is true. If you change any of the following, y
 | What a turnstile's heartbeat line reports as waiting (`device_sync.py::count_waiting_pins`, `ultra_engine.py::_count_waiting_pins` and the snapshot's `failed_pins`, `_sync_one_device`'s `_last_waiting_pins`, `realtime_agent.py::get_status_snapshot`'s `failedPins`, `pc_identity.py::build_heartbeat_payload`, `::_report_held_turnstiles` and its `held` key, `erase_wizard.py::held_waiting_count`, the wizard's `_set_waiting`) | §3.10 |
 | Who writes to `access.db` — the DbWriter, `_run_db_write_sync` (its lanes, `priority=`, the inline nested call, the 60 s wait), a write outside it, the tripwire's allowlist (`tests/test_db_single_writer.py::ALLOWED_DIRECT`), which writes are in the door lane (`db.py::insert_access_history`, `::save_agent_rtlog_state`), the AGENT history claim (`realtime_agent.py::DecisionService.run`'s `F-013` block) | §3.11 |
 | The member fee lines of the entry screen -- what is stored, how it reaches the popup, how the screen judges and draws it (`db.py::_member_fees_json`, `::_member_fees_list`, `::_ensure_column_forcing_refresh`, `sync_users.fees_json` in `_SYNC_USER_COLUMNS` and the five member writers, `sync_access_software_settings.fee_due_soon_days`, `settings_reader.py::normalize_global_settings`'s `fee_due_soon_days`, `access_types.py::NotificationRequest.fees`, `ultra_engine.py::_enqueue_notification(user_fees=)`, `ultra_pc_entry.py::member_popup_fields`, `realtime_agent.py::_popup_payload_from_request`, `tauri-ui/src/lib/feeAlerts.ts`, `PopupWindow.tsx` `AFeeLine` / `AFeeMark`) | §3.12 |
-| The Utilisateurs member card data and the mutation-queue names (`db.py::get_member_card_details`, `::_member_row_for_card`, `::list_member_access_history`, `local_access_api_v2.py::_handle_member_card`, `::_handle_member_history`, `tauri-ui/src/pages/UsersPage.tsx` `cardDetailLine`) | §3.14 |
+| The Utilisateurs member card data and the mutation-queue names (`db.py::get_member_card_details`, `::_member_row_for_card`, `::_member_freeze_facts`, `::_list_held_users_for_roster` and its call in `::list_members_roster`, `::list_member_access_history`, `local_access_api_v2.py::_handle_member_card`, `::_handle_member_history`, `tauri-ui/src/pages/UsersPage.tsx` `cardDetailLine`) | §3.14 |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -3878,7 +3878,7 @@ no `tzdata`, so `zoneinfo.ZoneInfo('Africa/Tunis')` raises; the Tunis offset is 
 | `access_v2_state` (one row) | the last `syncMeta`, `trusted`, the clock (`server_epoch`, `utc_offset_sec`, `skew_sec`, `floor_date`, `max_pc_epoch`, `clock_suspect`, `clock_reason`), `applied_date`, `grace_days`. NOT cleared by `clear_version_tokens` |
 | `member_access_window` | the window of every membership of today's set; replaced whole by each members section |
 | `sync_upcoming_users`, `sync_upcoming_credentials` | `upcoming[]` / `upcomingCredentials` exactly as last sent (the row's JSON; credentials stored disabled) |
-| `sync_users_held` | rows of today's set taken off the roster for a later gym date; the same 20 columns as `sync_users` (`_SYNC_USER_COLUMNS`) + reason/date |
+| `sync_users_held` | rows of today's set taken off the roster for a later gym date; the same 20 columns as `sync_users` (`_SYNC_USER_COLUMNS`) + reason/date. Also listed, flagged, on the Utilisateurs roster and member card (§3.14) |
 | `member_person_link` | membership → `userId` (+ `mainAccountId`), never deleted; written with `member_account_link` by every `sync_users` writer (no `mainAccountId` filter), back-filled at `init_db` — used by §3.4f |
 
 `windowsVersion` lives in `sync_version_tokens` (so logout and hard reset drop it and the request
@@ -4833,6 +4833,21 @@ the membership in `sync_users` nor `sync_users_held`. `[CODE]`
   listed; rows are pruned after the backend `history_retention_days` (`retentionDays` in the
   answer, from `settings_reader.get_backend_global_settings`) once uploaded (§3.5). `[TEST:
   tests/test_member_card_details.py::TestMemberHistory]`
+- **Freeze (« Gel ») and held members.** From the protocol-2 data of §3.8, never `datetime.now()`:
+  `_member_freeze_facts` returns None (the card says « non connu ») without an `access_v2_state`
+  row, with untrusted windows (the flip moves nothing then either), without an `applied_date` or
+  without a `member_access_window` row. Else `frozenToday` = the row is in `sync_users_held` with
+  `held_reason = 'frozen'` AND `held_for_date` = the applied gym date (an older hold does not say
+  "today"); `nextFreezeDays` = the window's `offDays` after the gym date; `horizonEnd` /
+  `beyondHorizon` bound what is known. Freeze start/end dates are not synced and are not shown —
+  only days. **The roster now lists held rows** (`list_members_roster` →
+  `_list_held_users_for_roster`, template-free like the roster read): a member frozen today used to
+  vanish from Utilisateurs. Each carries `heldReason` / `heldForDate` / `heldToday` and gets a flag
+  (« gelé aujourd'hui », « gelé », « pas encore commencé », « hors des tourniquets »); an id on both
+  tables is listed once (the `sync_users` row). Counts (« abonnements sur ce poste ») include them,
+  like `db.list_local_member_ids` (a held member is still in the server's list). Nothing on the door
+  path reads the roster. `[TEST: tests/test_member_card_details.py::TestFreeze,
+  ::TestHeldMembersOnTheRoster]`
 
 ---
 

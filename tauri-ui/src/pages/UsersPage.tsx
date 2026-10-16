@@ -90,6 +90,11 @@ type MemberRosterRow = {
   pendingMutations?: { localId: string; opKind: string; state: string; money: boolean }[];
   pendingDelete?: boolean;
   hasConflict?: boolean;
+  /** Set on rows of sync_users_held: off the turnstile roster for the gym date (frozen, expired, not_started). */
+  heldReason?: string | null;
+  heldForDate?: string | null;
+  /** Held for the gym date the PC last applied (not an older hold). */
+  heldToday?: boolean;
 };
 
 type MutationRow = {
@@ -323,9 +328,19 @@ function periodUsedPct(m: MemberRosterRow): number | null {
   return Math.max(0, Math.min(100, Math.round(pct)));
 }
 
-/** The one flag shown next to a member's name (same priority as before). */
+/** Flag of a row the PC took off the turnstiles for the gym date (sync_users_held). */
+function heldFlag(m: MemberRosterRow): { label: string; tone: Tone } | null {
+  if (!m.heldReason) return null;
+  if (m.heldReason === "frozen") return { label: m.heldToday ? "gelé aujourd'hui" : "gelé", tone: "info" };
+  if (m.heldReason === "not_started") return { label: "pas encore commencé", tone: "grey" };
+  return { label: "hors des tourniquets", tone: "grey" };
+}
+
+/** The one flag shown next to a member's name (same priority as before; a held row second). */
 function rowFlag(m: MemberRosterRow): { label: string; tone: Tone } | null {
   if (m.hasConflict) return { label: "conflit", tone: "error" };
+  const held = heldFlag(m);
+  if (held) return held;
   if (m.offlinePending) return { label: "créé hors ligne", tone: "info" };
   if (m.pendingDelete) return { label: "suppression…", tone: "warning" };
   if ((m.pendingMutations?.length ?? 0) > 0) return { label: "sync en attente", tone: "warning" };
@@ -1347,6 +1362,21 @@ export default function UsersPage() {
             if (d.fingerprintCount === 0) return { v: "aucune", muted: true };
             const ids = d.fingerprints.map((f) => (f.fingerId != null ? `#${f.fingerId}${f.enabled ? "" : " (désactivée)"}` : "?"));
             return { v: `${d.fingerprintCount} · ${ids.join(", ")}`, title: "Copie locale du serveur" };
+          })}
+          {cardDetailLine(Snowflake, "Gel", m, (d) => {
+            const f = d.freeze;
+            if (!f) {
+              return { v: "non connu", muted: true, title: "Les jours de gel viennent de la synchronisation (protocole 2) ; ce poste ne les a pas, ou ses données de dates ne sont pas fiables." };
+            }
+            const fmt = (iso: string) => frDate(iso).slice(0, 5);
+            const next = f.nextFreezeDays.slice(0, 4).map(fmt).join(", ") + (f.nextFreezeDays.length > 4 ? ` +${f.nextFreezeDays.length - 4}` : "");
+            const title = [
+              f.horizonEnd ? `Jours de gel connus jusqu'au ${frDate(f.horizonEnd)}${f.beyondHorizon ? " ; le serveur en signale d'autres après" : ""}.` : "",
+              "Les dates de début et de fin du gel ne sont pas synchronisées : seuls ces jours sont connus.",
+            ].filter(Boolean).join(" ");
+            if (f.frozenToday) return { v: next ? `gelé aujourd'hui · puis ${next}` : "gelé aujourd'hui", tone: "info", title };
+            if (next) return { v: `prochains jours : ${next}`, title };
+            return { v: f.beyondHorizon ? "aucun jour proche" : "aucun jour prévu", muted: true, title };
           })}
           {cardDetailLine(QrCode, "QR code (application)", m, (d) => {
             const on = d.qrCredentials.filter((c) => c.enabled);
