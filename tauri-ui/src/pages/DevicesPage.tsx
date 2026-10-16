@@ -536,7 +536,7 @@ export default function DevicesPage() {
     ? [PROTOCOL_LABEL[protocolOf(ctlDev)], ctlDev.model, ctlIp ? `${ctlIp}:${ctlDev.portNumber ?? ctlDev.port ?? 4370}` : ""]
       .filter(Boolean).join(" · ")
     : undefined;
-  const standaloneNote = "Sur un terminal autonome (ZKTeco), l'appareil refuse cette lecture : seuls les contrôleurs PullSDK l'acceptent.";
+  const standaloneNote = "Cette lecture n'est pas disponible sur un terminal autonome (ZKTeco) : seulement sur les contrôleurs PullSDK.";
 
   return (
     <div className="flex flex-col gap-[18px]">
@@ -756,7 +756,7 @@ export default function DevicesPage() {
             <PanelList>
               <ListRow icon={Router} title="Appareils déclarés" value={devices.length} />
               <ListRow icon={Wifi} tone="success" title="Connectés" value={`${fleet.connectedCount} / ${fleet.reachable}`} />
-              <ListRow icon={Cable} title="PullSDK" sub="contrôleurs C3" value={fleet.pullsdkCount} />
+              <ListRow icon={Cable} title="PullSDK" sub="centrales d'accès" value={fleet.pullsdkCount} />
               <ListRow icon={Server} title="ZKTeco autonome" sub="connexion gérée par le service" value={fleet.standaloneCount} />
               <ListRow
                 icon={CheckCircle2}
