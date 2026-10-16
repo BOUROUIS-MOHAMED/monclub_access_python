@@ -7,14 +7,17 @@
     "dev": "vite",
     "build": "tsc --noEmit -p . && vite build",
     "typecheck": "tsc --noEmit -p .",
-    "test": "node --experimental-strip-types --test src/lib/pcIdentityState.test.ts src/lib/releaseNotes.test.ts src/lib/watchdogStatus.test.ts src/lib/feeAlerts.test.ts",
+    "test": "node --experimental-strip-types --test src/lib/pcIdentityState.test.ts src/lib/releaseNotes.test.ts src/lib/watchdogStatus.test.ts src/lib/feeAlerts.test.ts src/lib/denyCopy.test.ts",
     "preview": "vite preview",
     "tauri": "tauri"
   },
   "dependencies": {
     "@emotion/react": "^11.13.0",
     "@emotion/styled": "^11.13.0",
+    "@fontsource/barlow": "^5.3.0",
+    "@fontsource/dm-sans": "^5.3.0",
     "@fontsource/hanken-grotesk": "^5.2.8",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
     "@fontsource/red-hat-display": "^5.3.0",
     "@fontsource/source-sans-3": "^5.3.0",
     "@mui/icons-material": "^6.4.0",

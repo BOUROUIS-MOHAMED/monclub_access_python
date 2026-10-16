@@ -14,6 +14,22 @@
 @import "@fontsource/source-sans-3/700.css";
 @import "@fontsource/source-sans-3/800.css";
 
+/* Access v5 type trio (owner decision: match the MonClub web dashboard) —
+ * DM Sans for the UI, Barlow for big numbers, IBM Plex Mono for codes, IPs and
+ * logs. Self-hosted the same way: gym PCs can be offline. The v3 pair above
+ * stays imported because the TV build still uses it (see the role block below). */
+@import "@fontsource/dm-sans/400.css";
+@import "@fontsource/dm-sans/500.css";
+@import "@fontsource/dm-sans/600.css";
+@import "@fontsource/dm-sans/700.css";
+@import "@fontsource/dm-sans/800.css";
+@import "@fontsource/barlow/600.css";
+@import "@fontsource/barlow/700.css";
+@import "@fontsource/barlow/800.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+@import "@fontsource/ibm-plex-mono/600.css";
+
 /*
  * Brand palette -- derived from src/theme/colors.ts
  * Colors are injected from src/theme/colors.ts at runtime.
@@ -49,6 +65,18 @@
   --color-sidebar-accent-foreground: hsl(var(--sidebar-accent-foreground));
   --color-sidebar-border: hsl(var(--sidebar-border));
   --color-sidebar-ring: hsl(var(--sidebar-ring));
+  /* Access v5 tones: `<tone>` = main shade, `<tone>-ink` = text on its soft tint */
+  --color-primary-ink: hsl(var(--primary-ink));
+  --color-success: hsl(var(--success));
+  --color-success-ink: hsl(var(--success-ink));
+  --color-warning: hsl(var(--warning));
+  --color-warning-ink: hsl(var(--warning-ink));
+  --color-error: hsl(var(--error));
+  --color-error-ink: hsl(var(--error-ink));
+  --color-info: hsl(var(--info));
+  --color-info-ink: hsl(var(--info-ink));
+  --color-grey: hsl(var(--grey));
+  --color-grey-ink: hsl(var(--grey-ink));
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -57,33 +85,52 @@
 
 :root {
   --radius: 0.625rem;
+  /* Access v5 type trio. `--font-display` (titles) is DM Sans like the UI;
+     `--font-num` (big numerals, `.num`) is Barlow. */
   --font-mono: "IBM Plex Mono", "Consolas", "Cascadia Code", monospace;
-  /* Access v3 type pair */
+  --font-display: "DM Sans", "Segoe UI Variable Display", system-ui, sans-serif;
+  --font-sans-ui: "DM Sans", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-num: "Barlow", "DM Sans", system-ui, sans-serif;
+  /* v5 card: radius 16 + the dashboard's two-layer shadow */
+  --shadow-card: 0 0 2px 0 rgba(145, 158, 171, 0.2), 0 12px 24px -4px rgba(145, 158, 171, 0.12);
+  --shadow-dialog: 0 24px 48px rgba(0, 0, 0, 0.24);
+}
+
+.dark {
+  --shadow-card: 0 0 2px 0 rgba(0, 0, 0, 0.2), 0 12px 24px -4px rgba(0, 0, 0, 0.24);
+  --shadow-dialog: 0 24px 48px rgba(0, 0, 0, 0.48);
+}
+
+/* The TV build shares this stylesheet: it keeps the v3 type pair exactly as it
+   rendered before v5 (IBM Plex Mono was not bundled then, so its mono stack
+   resolved to Consolas — pinned here so bundling Plex changes nothing on TV). */
+html[data-desktop-role="tv"] {
+  --font-mono: "Consolas", "Cascadia Code", monospace;
   --font-display: "Red Hat Display", "Segoe UI Variable Display", system-ui, sans-serif;
   --font-sans-ui: "Source Sans 3", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-num: "Red Hat Display", "Segoe UI Variable Display", system-ui, sans-serif;
 }
 
 @theme inline {
   --font-display: var(--font-display);
+  --font-num: var(--font-num);
 }
 
 @layer utilities {
-  /* Headings, page titles and every big numeral in the design use Red Hat
-     Display with tight tracking; body copy uses Source Sans 3. */
+  /* Titles use --font-display, big numerals (.num / font-num) use --font-num.
+     Both resolve per role in the :root / TV blocks above. */
   .font-display {
     font-family: var(--font-display);
   }
   .num {
-    font-family: var(--font-display);
+    font-family: var(--font-num);
     font-weight: 800;
     letter-spacing: -0.03em;
     font-variant-numeric: tabular-nums;
   }
 }
 
-.dark {
-  /* Color tokens are injected from src/theme/colors.ts at runtime */
-}
+/* Color tokens (light + .dark) are injected from src/theme/colors.ts at runtime */
 
 @layer base {
   html,
