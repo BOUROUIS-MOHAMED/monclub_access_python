@@ -9,7 +9,7 @@ import {
   AlertTriangle,
   User,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
+import { ActionButton } from "@/components/ui/action-button";
 import { cn } from "@/lib/utils";
 import LottiePhaseVisual from "./LottiePhaseVisual";
 
@@ -83,22 +83,22 @@ export default function EnrollOverlay({
       <div
         role="dialog"
         aria-modal="true"
-        className="mx-4 flex w-full max-w-sm flex-col items-center gap-5 rounded-3xl bg-card p-8 shadow-[0_20px_60px_-15px_rgba(0,0,0,0.45)]"
+        className="mx-4 flex w-full max-w-sm flex-col items-center gap-5 rounded-2xl bg-card p-8 text-card-foreground shadow-[var(--shadow-dialog)]"
       >
         {/* Member strip — the design keeps the same silhouette on every phase:
             initials, name, and the finger number in mono on the right. */}
         {(fullName || fingerId !== undefined) && (
-          <div className="flex w-full items-center gap-2 rounded-xl bg-muted px-[9px] py-1.5">
-            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-[18px] bg-primary/10 text-[10px] font-bold text-primary">
+          <div className="flex w-full items-center gap-2.5 rounded-xl bg-muted px-2.5 py-2">
+            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary/16 text-[12px] font-bold text-primary-ink">
               {fullName
                 ? (fullName.trim().split(/\s+/).map((w) => w[0]).slice(0, 2).join("") || "?").toUpperCase()
                 : <User className="h-3.5 w-3.5" />}
             </span>
             <div className="min-w-0 flex-1 text-left">
-              <div className="truncate text-[11.5px] font-semibold text-foreground">{fullName ?? "—"}</div>
+              <div className="truncate text-[13.5px] font-semibold text-foreground">{fullName ?? "—"}</div>
             </div>
             {fingerId !== undefined && (
-              <span className="shrink-0 font-mono text-[10.5px] text-muted-foreground">#{fingerId}</span>
+              <span className="shrink-0 font-mono text-[12.5px] text-muted-foreground">doigt #{fingerId}</span>
             )}
           </div>
         )}
@@ -111,7 +111,7 @@ export default function EnrollOverlay({
 
         {/* Timeout warning */}
         {timedOut && (
-          <p className="animate-pulse text-[11.5px] text-amber-600 dark:text-amber-400">
+          <p className="animate-pulse text-[13px] font-semibold text-warning-ink">
             Cette étape prend plus de temps que prévu…
           </p>
         )}
@@ -121,37 +121,24 @@ export default function EnrollOverlay({
 
         {/* Actions */}
         {canCancel && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={onCancel}
-            className="h-[30px] w-full justify-center rounded-[14px] text-[12px] font-semibold"
-          >
+          <ActionButton kind="outline" onClick={onCancel} className="w-full">
             Annuler
-          </Button>
+          </ActionButton>
         )}
         {phase === "failed" && (
           <div className="flex w-full flex-col gap-2">
             {retryAvailable && onRetryPush && (
-              <Button
-                onClick={onRetryPush}
-                className="h-[34px] w-full justify-center rounded-full text-[12.5px] font-bold shadow-[0_8px_20px_rgba(226,32,63,0.22)]"
-              >
+              <ActionButton kind="primary" onClick={onRetryPush} className="w-full">
                 Réessayer la sauvegarde
-              </Button>
+              </ActionButton>
             )}
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={onDismiss}
-              className="h-[30px] w-full justify-center rounded-[14px] text-[12px] font-semibold"
-            >
+            <ActionButton kind="outline" onClick={onDismiss} className="w-full">
               Fermer
-            </Button>
+            </ActionButton>
           </div>
         )}
         {phase === "success" && (
-          <p className="text-[11.5px] text-muted-foreground">Fermeture automatique…</p>
+          <p className="text-[12.5px] text-muted-foreground">Fermeture automatique…</p>
         )}
       </div>
     </div>,
@@ -175,15 +162,15 @@ function PhaseVisual({ phase }: { phase: EnrollPhase }) {
       return (
         <div className="relative flex items-center justify-center w-40 h-40">
           <span
-            className="absolute w-40 h-40 rounded-full bg-blue-500/20 animate-ping"
+            className="absolute w-40 h-40 rounded-full bg-primary/16 animate-ping"
             style={{ animationDuration: "1.8s" }}
           />
           <span
-            className="absolute w-28 h-28 rounded-full bg-blue-500/25 animate-ping"
+            className="absolute w-28 h-28 rounded-full bg-primary/24 animate-ping"
             style={{ animationDuration: "1.8s", animationDelay: "0.45s" }}
           />
-          <div className="relative z-10 w-20 h-20 rounded-full bg-blue-500/10 border-2 border-blue-500 flex items-center justify-center">
-            <Fingerprint className="w-10 h-10 text-blue-500" />
+          <div className="relative z-10 w-20 h-20 rounded-full bg-primary/8 border-2 border-primary flex items-center justify-center">
+            <Fingerprint className="w-10 h-10 text-primary" />
           </div>
         </div>
       );
@@ -191,9 +178,9 @@ function PhaseVisual({ phase }: { phase: EnrollPhase }) {
     case "lift_finger":
       return (
         <div className="relative flex items-center justify-center w-40 h-40">
-          <span className="absolute w-32 h-32 rounded-full bg-green-500/20 animate-ping" style={{ animationDuration: "1s" }} />
-          <div className="relative z-10 w-20 h-20 rounded-full bg-green-500/10 border-2 border-green-500 flex items-center justify-center animate-bounce">
-            <CheckCircle2 className="w-10 h-10 text-green-500" />
+          <span className="absolute w-32 h-32 rounded-full bg-success/16 animate-ping" style={{ animationDuration: "1s" }} />
+          <div className="relative z-10 w-20 h-20 rounded-full bg-success/8 border-2 border-success flex items-center justify-center animate-bounce">
+            <CheckCircle2 className="w-10 h-10 text-success-ink" />
           </div>
         </div>
       );
@@ -201,8 +188,8 @@ function PhaseVisual({ phase }: { phase: EnrollPhase }) {
     case "sample_rejected":
       return (
         <div className="relative flex items-center justify-center w-40 h-40">
-          <div className="w-20 h-20 rounded-full bg-orange-500/10 border-2 border-orange-500 flex items-center justify-center animate-pulse">
-            <AlertTriangle className="w-10 h-10 text-orange-500" />
+          <div className="w-20 h-20 rounded-full bg-warning/8 border-2 border-warning flex items-center justify-center animate-pulse">
+            <AlertTriangle className="w-10 h-10 text-warning-ink" />
           </div>
         </div>
       );
@@ -210,9 +197,9 @@ function PhaseVisual({ phase }: { phase: EnrollPhase }) {
     case "device_init":
       return (
         <div className="relative flex items-center justify-center w-40 h-40">
-          <span className="absolute w-32 h-32 rounded-full bg-blue-500/15 animate-ping" style={{ animationDuration: "2s" }} />
-          <div className="relative z-10 w-20 h-20 rounded-full bg-blue-500/10 border-2 border-blue-500 flex items-center justify-center animate-pulse">
-            <Fingerprint className="w-10 h-10 text-blue-500" />
+          <span className="absolute w-32 h-32 rounded-full bg-primary/16 animate-ping" style={{ animationDuration: "2s" }} />
+          <div className="relative z-10 w-20 h-20 rounded-full bg-primary/8 border-2 border-primary flex items-center justify-center animate-pulse">
+            <Fingerprint className="w-10 h-10 text-primary" />
           </div>
         </div>
       );
@@ -220,8 +207,8 @@ function PhaseVisual({ phase }: { phase: EnrollPhase }) {
     case "push":
       return (
         <div className="flex items-center justify-center w-40 h-40">
-          <div className="w-20 h-20 rounded-full bg-purple-500/10 border-2 border-purple-500 flex items-center justify-center">
-            <Upload className="w-10 h-10 text-purple-500 animate-bounce" />
+          <div className="w-20 h-20 rounded-full bg-info/8 border-2 border-info flex items-center justify-center">
+            <Upload className="w-10 h-10 text-info-ink animate-bounce" />
           </div>
         </div>
       );
@@ -229,9 +216,9 @@ function PhaseVisual({ phase }: { phase: EnrollPhase }) {
     case "success":
       return (
         <div className="relative flex items-center justify-center w-40 h-40">
-          <span className="absolute w-36 h-36 rounded-full bg-green-500/20 animate-ping" style={{ animationDuration: "2s" }} />
-          <div className="relative z-10 w-24 h-24 rounded-full bg-green-500/10 border-4 border-green-500 flex items-center justify-center">
-            <CheckCircle2 className="w-14 h-14 text-green-500" />
+          <span className="absolute w-36 h-36 rounded-full bg-success/16 animate-ping" style={{ animationDuration: "2s" }} />
+          <div className="relative z-10 w-24 h-24 rounded-full bg-success/8 border-4 border-success flex items-center justify-center">
+            <CheckCircle2 className="w-14 h-14 text-success-ink" />
           </div>
         </div>
       );
@@ -239,8 +226,8 @@ function PhaseVisual({ phase }: { phase: EnrollPhase }) {
     case "failed":
       return (
         <div className="flex items-center justify-center w-40 h-40">
-          <div className="w-20 h-20 rounded-full bg-red-500/10 border-2 border-red-500 flex items-center justify-center">
-            <XCircle className="w-10 h-10 text-red-500" />
+          <div className="w-20 h-20 rounded-full bg-error/8 border-2 border-error flex items-center justify-center">
+            <XCircle className="w-10 h-10 text-error-ink" />
           </div>
         </div>
       );
@@ -249,7 +236,7 @@ function PhaseVisual({ phase }: { phase: EnrollPhase }) {
     default:
       return (
         <div className="flex items-center justify-center w-40 h-40">
-          <div className="w-20 h-20 rounded-full bg-primary/10 border-2 border-primary flex items-center justify-center">
+          <div className="w-20 h-20 rounded-full bg-primary/8 border-2 border-primary flex items-center justify-center">
             <Loader2 className="w-10 h-10 text-primary animate-spin" />
           </div>
         </div>
@@ -277,10 +264,10 @@ const PHASE_COPY: Record<EnrollPhase, { title: string; instruction: string }> = 
 };
 
 const TITLE_COLOR: Partial<Record<EnrollPhase, string>> = {
-  success:         "text-green-600 dark:text-green-400",
-  failed:          "text-red-600 dark:text-red-400",
-  lift_finger:     "text-green-600 dark:text-green-400",
-  sample_rejected: "text-orange-600 dark:text-orange-400",
+  success:         "text-success-ink",
+  failed:          "text-error-ink",
+  lift_finger:     "text-success-ink",
+  sample_rejected: "text-warning-ink",
 };
 
 function PhaseText({
@@ -296,11 +283,11 @@ function PhaseText({
 
   return (
     <div className="text-center space-y-1 max-w-xs">
-      <p className={cn("text-lg font-semibold", TITLE_COLOR[phase] ?? "")}>
+      <p className={cn("text-[20px] font-bold", TITLE_COLOR[phase] ?? "")}>
         {title}
       </p>
       {effectiveInstruction && (
-        <p className="text-sm text-muted-foreground">{effectiveInstruction}</p>
+        <p className="text-[14px] text-muted-foreground">{effectiveInstruction}</p>
       )}
     </div>
   );
@@ -317,12 +304,12 @@ function ScanDots({ progress }: { progress: number }) {
           className={cn(
             "w-3 h-3 rounded-full border-2 transition-all duration-500",
             i <= progress
-              ? "bg-green-500 border-green-500 scale-110"
+              ? "bg-success border-success scale-110"
               : "bg-transparent border-border",
           )}
         />
       ))}
-      <span className="text-xs text-muted-foreground ml-1">{progress}/3</span>
+      <span className="ml-1 text-[12.5px] text-muted-foreground">échantillon {progress} sur 3</span>
     </div>
   );
 }
