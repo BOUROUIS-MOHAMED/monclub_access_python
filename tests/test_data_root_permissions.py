@@ -20,6 +20,7 @@ import shared.data_root_permissions as drp
 
 REPO = Path(__file__).resolve().parents[1]
 WINDOWS = os.name == "nt"
+_REAL_REPAIR = drp.repair_data_root_acl  # conftest swaps it for a tripwire; this file tests it
 
 
 @pytest.fixture(autouse=True)
@@ -29,6 +30,7 @@ def _no_real_dialog(monkeypatch):
         raise AssertionError("a test reached the real MessageBoxW")
 
     monkeypatch.setattr(drp, "show_error_dialog", _refuse)
+    monkeypatch.setattr(drp, "repair_data_root_acl", _REAL_REPAIR)  # every icacls call is mocked here
 
 
 def _icacls(*args: str) -> None:

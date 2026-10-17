@@ -78,6 +78,24 @@ def _reapply_suite_db_path_after_reload(_suite_db_path):
 
 
 @pytest.fixture(autouse=True)
+def _never_a_real_data_root_dialog_or_icacls(monkeypatch):
+    # shared/data_root_permissions.py: a test that reaches access/tv main() must never block the
+    # run on a real MessageBoxW, nor run icacls on this PC (its real ProgramData root may be the
+    # read-only one, 2026-10-17). Tests that need these replace them themselves.
+    import shared.data_root_permissions as drp
+
+    def _no_dialog(title, text):
+        raise AssertionError("a test reached the real data-root MessageBoxW: " + title)
+
+    def _no_icacls(*a, **k):
+        raise AssertionError("a test reached the real icacls repair")
+
+    monkeypatch.setattr(drp, "show_error_dialog", _no_dialog)
+    monkeypatch.setattr(drp, "repair_data_root_acl", _no_icacls)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _fresh_zkem_replay_memory():
     # Process-wide per-turnstile memory (app/core/zkem_rtlog_filter.py): one test's events
     # must never read as another test's replays.

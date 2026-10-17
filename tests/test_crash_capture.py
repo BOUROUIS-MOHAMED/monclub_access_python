@@ -167,6 +167,8 @@ def test_access_main_installs_the_capture_after_the_single_instance_guard(monkey
                         lambda **k: order.append("guard") or _Guard())
     monkeypatch.setattr(crash_capture, "install", lambda *a, **k: order.append("install") or True)
     monkeypatch.setattr(access.bootstrap, "run_access_app", lambda: order.append("run"))
+    import shared.data_root_permissions as drp  # the startup probe would read this PC's real root
+    monkeypatch.setattr(drp, "check_data_root_at_startup", lambda **k: True)
 
     access_main.main()
 
@@ -180,6 +182,8 @@ _MAIN_WITH_FAILING_APP = """
             pass
     shared.dev_dependency_sync.ensure_local_requirements_synced = lambda **k: None
     shared.single_instance.acquire_single_instance_guard = lambda **k: _Guard()
+    import shared.data_root_permissions
+    shared.data_root_permissions.check_data_root_at_startup = lambda **k: True
     crash_capture.default_state_dir = lambda: STATE
     def _boom():
         raise RuntimeError("member Jane Example 555-0100")  # data that must not be uploaded
