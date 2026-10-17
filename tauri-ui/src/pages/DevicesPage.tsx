@@ -556,13 +556,10 @@ export default function DevicesPage() {
   // knows: an erase hold (or holds not read yet), the erase wizard open on this device,
   // or a user push running on it. null = free to read.
   const infoDeviceId = infoDialog?.deviceId ?? null;
-  // A turnstile accepts ONE connection at a time (owner, 10-16) and the ULTRA worker of
-  // this PC already holds it; /devices/{id}/info opens its own connection
-  // (local_access_api_v2.py::_handle_device_info -> _connect_device), so it is never
-  // started by itself while a worker holds the device.
+  // A worker-held turnstile is read too: /devices/{id}/info runs on the ULTRA worker's own
+  // connection (local_access_api_v2.py::_handle_device_info -> _run_on_device_sdk), never a
+  // second one -- one parameter read and six row counts, no table read (guide §3.1a).
   const countsBlockedReason: string | null = infoDeviceId == null ? null
-    : status?.ultra?.devices?.[String(infoDeviceId)]
-      ? "Le tourniquet n'accepte qu'une connexion à la fois, déjà tenue par ce PC : pas de lecture en direct automatique."
     : holdsRead === "pending" ? "Lecture des retenues d'effacement en cours…"
     : holdsRead === "failed" ? "Les retenues d'effacement n'ont pas pu être lues : pas de lecture en direct automatique."
     : holdsUnknown ?"Les retenues d'effacement n'ont pas pu être lues : aucune lecture en direct tant qu'elles ne le sont pas."
@@ -688,13 +685,15 @@ export default function DevicesPage() {
               const faulty = state === "noaddress" || state === "inactive";
               // « Non connecté » is a fault only where this PC runs a worker for the device.
               const hasWorker = status?.ultra?.devices?.[String(did)] != null;
+              // A manual PullSDK session this page opened, or the one the server reports open.
+              const manualOpen = connectedIds.has(did) || (!!status?.pullsdk?.connected && status.pullsdk.deviceId === did);
               const tone: Tone = state === "idle" && !hasWorker ? "grey" : STATE_TONE[state];
               const sub = [PROTOCOL_LABEL[protocol], d.model, d.zone].filter(Boolean).join(" · ");
               return (
                 <FlexRow key={did} minHeight={60}>
                   <FlexCell
                     flex={2.1}
-                    title={protocol === "ZK_STANDALONE" ? "Connexion gérée en continu par le service — pas de session manuelle." : undefined}
+                    title={protocol === "ZK_STANDALONE" || hasWorker ? "Connexion gérée en continu par le service — pas de session manuelle." : undefined}
                   >
                     <ToneIcon icon={faulty ? WifiOff : Router} tone={state === "connected" ? "primary" : tone} size={34} />
                     <CellText
@@ -764,8 +763,12 @@ export default function DevicesPage() {
                     {/* Manual connect exists only for PullSDK panels. A ZK_STANDALONE
                         terminal is driven by its own COM event sink, which the live
                         worker already owns -- offering "Connect" here would open a
-                        second session and could only ever fail. */}
-                    {!faulty && protocol === "ZK_PULLSDK" && (
+                        second session and could only ever fail. The same holds for a
+                        PullSDK panel this PC's ULTRA worker holds: one connection per
+                        turnstile, so the server refuses a manual session (409
+                        HELD_BY_ULTRA_WORKER) -- offered only to close one already open. */}
+                    {!faulty && protocol === "ZK_PULLSDK"
+                      && !(hasWorker && !manualOpen) && (
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <ActionButton

@@ -3991,6 +3991,82 @@ def _connect_device(ctx: _Ctx, device_id: int) -> Tuple[Any, Optional[str]]:
         return None, str(e)
 
 
+def _ultra_worker_holding(ctx: _Ctx, device_id: int) -> Any:
+    """The running ULTRA worker of this PC for ``device_id``, or None -- the same test
+    ``_run_on_device_sdk`` uses to send a call through the worker's held connection."""
+    ultra_eng = getattr(ctx.app, "_ultra_engine", None)
+    if ultra_eng and getattr(ultra_eng, "running", False):
+        return ultra_eng._workers.get(device_id)
+    return None
+
+
+_HELD_BY_WORKER_FR = "La connexion à ce tourniquet est tenue par le service ULTRA de ce PC"
+
+
+def _pullsdk_handle(sdk: Any) -> Tuple[Any, bool]:
+    """(low-level ``PullSDK``, on_worker) for a fn run by ``_run_on_device_sdk``.
+
+    The one-shot path hands fn the ``PullSDK`` from ``_connect_device``. The ULTRA path
+    hands it the worker's driver, a ``PullSDKDevice``, which does NOT expose the table
+    calls these handlers use (get_device_data_count / get_device_data_rows /
+    set_device_data / delete_device_data): its wrappers swallow failures (-1 / []). Its
+    held low-level handle does -- the worker's own member and full syncs push through
+    that same handle on the same thread (ultra_engine.py, ``getattr(self._sdk, "_sdk")``).
+    fn runs on the worker thread, between polls, so nothing else uses it meanwhile.
+    """
+    from app.sdk.pullsdk import PullSDKDevice
+    if isinstance(sdk, PullSDKDevice):
+        raw = getattr(sdk, "_sdk", None)
+        if raw is None:
+            raise RuntimeError("device not connected")
+        return raw, True
+    if not hasattr(sdk, "get_device_data_rows"):
+        raise RuntimeError(f"{type(sdk).__name__} is not driven over PullSDK")
+    return sdk, False
+
+
+# A table read through the ULTRA worker runs on its thread: rtlog polling and queued door
+# opens wait until it returns (guide §3.1a, "one connection per turnstile"). GetDeviceData has
+# no row limit -- ``maxRows`` is applied after the whole table is read, through a 1-8 MB buffer
+# ladder -- so the only bound is to count first and refuse a table above this many rows.
+# Chosen, not measured: three times the largest roster on record (914 members, pullsdk_guide),
+# so every member table reads; the door log (``transaction``) is the table it stops.
+_LIVE_TABLE_READ_MAX_ROWS = 3000
+
+
+def _read_table_capped(raw: Any, *, table: str, fields: str, filter_expr: str,
+                       on_worker: bool) -> Dict[str, Any]:
+    """Rows of one table, or {"tooLarge": True, ...} on the worker above the cap (or when
+    its size cannot be read). Off the worker nothing waits on the read: no cap."""
+    if on_worker:
+        n = int(raw.get_device_data_count(table=table, filter_expr=filter_expr))
+        if n < 0 or n > _LIVE_TABLE_READ_MAX_ROWS:
+            return {"tooLarge": True, "count": n if n >= 0 else None}
+    rows = raw.get_device_data_rows(table=table, fields=fields, filter_expr=filter_expr, options="")
+    return {"tooLarge": False, "rows": rows}
+
+
+def _send_table_too_large(ctx: _Ctx, table: str, count: Optional[int]) -> None:
+    cap = _LIVE_TABLE_READ_MAX_ROWS
+    if count is None:
+        why = f"le nombre de lignes de la table {table} n'a pas pu être lu"
+    else:
+        why = f"la table {table} compte {count} lignes (limite {cap})"
+    ctx.send_json(409, {
+        "ok": False, "code": "TABLE_TOO_LARGE_FOR_LIVE_READ", "table": table,
+        "count": count, "maxRows": cap,
+        "error": f"Lecture refusée : {why}. Le tourniquet est en service et sa lecture "
+                 f"bloquerait les passages pendant ce temps.",
+    })
+
+
+def _send_run_failure(ctx: _Ctx, r: Dict[str, Any]) -> None:
+    payload: Dict[str, Any] = {"ok": False, "error": r["error"]}
+    if "downForSec" in r:
+        payload["downForSec"] = r["downForSec"]
+    ctx.send_json(r["status"], payload)
+
+
 def _handle_device_connect(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
     _logger.info("[LocalAPI] device_connect: deviceId=%s", did)
@@ -4008,6 +4084,15 @@ def _handle_device_connect(ctx: _Ctx) -> None:
         ctx.send_json(409, {
             "ok": False, "unsupported": True, "protocol": proto,
             "error": f"protocol {proto} has no manual PullSDK session",
+        })
+        return
+    if _ultra_worker_holding(ctx, did) is not None:
+        # One connection per turnstile (guide §3.1a): this PC's ULTRA worker holds it, so a
+        # manual session would be a second one. Same deliberate-refusal shape as above.
+        _logger.info("[LocalAPI] device_connect refused: deviceId=%s held by the ULTRA worker", did)
+        ctx.send_json(409, {
+            "ok": False, "code": "HELD_BY_ULTRA_WORKER",
+            "error": _HELD_BY_WORKER_FR + " : pas de session manuelle en plus.",
         })
         return
     sdk, err = _connect_device(ctx, did)
@@ -4031,8 +4116,17 @@ def _handle_device_disconnect(ctx: _Ctx) -> None:
     with _device_sdk_lock:
         sdk = _device_sdk_pool.pop(did, None)
     if sdk:
+        # A manual session is always closed, worker or not: refusing would leave it open.
         try: sdk.disconnect()
         except Exception: pass
+    elif _ultra_worker_holding(ctx, did) is not None:
+        # Nothing manual to close. Answering 200 here read as "déconnecté" while the worker
+        # still held the turnstile; the worker's connection is never closed from here.
+        ctx.send_json(409, {
+            "ok": False, "code": "HELD_BY_ULTRA_WORKER",
+            "error": _HELD_BY_WORKER_FR + " : aucune session manuelle à fermer.",
+        })
+        return
     ctx.send_json(200, {"ok": True})
 
 
@@ -4040,25 +4134,24 @@ def _handle_device_info(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
     if _unsupported_for_protocol(ctx, did, "la lecture des paramètres appareil"):
         return
-    sdk, err = _connect_device(ctx, did)
-    if err:
-        ctx.send_json(500, {"ok": False, "error": err})
-        return
-    try:
+    items = ctx.q("items", default=(
+        "~DeviceName,~SerialNumber,FirmVer,MachineType,"
+        "LockCount,ReaderCount,AuxInCount,AuxOutCount,"
+        "IPAddress,NetMask,GATEIPAddress,MAC,"
+        "~MaxUserCount,~MaxAttLogCount,~MaxUserFingerCount,"
+        "AntiPassback,InterLock,DeviceID,"
+        "Door1Drivertime,Door2Drivertime,Door3Drivertime,Door4Drivertime,"
+        "Door1SensorType,Door2SensorType,Door3SensorType,Door4SensorType,"
+        "Door1VerifyType,Door2VerifyType,Door3VerifyType,Door4VerifyType"
+    ))
+
+    # One GetDeviceParam and six GetDeviceDataCount calls -- no table read.
+    def _read(sdk):
+        h, _on_worker = _pullsdk_handle(sdk)
         params = {}
         raw = ""
-        items = ctx.q("items", default=(
-            "~DeviceName,~SerialNumber,FirmVer,MachineType,"
-            "LockCount,ReaderCount,AuxInCount,AuxOutCount,"
-            "IPAddress,NetMask,GATEIPAddress,MAC,"
-            "~MaxUserCount,~MaxAttLogCount,~MaxUserFingerCount,"
-            "AntiPassback,InterLock,DeviceID,"
-            "Door1Drivertime,Door2Drivertime,Door3Drivertime,Door4Drivertime,"
-            "Door1SensorType,Door2SensorType,Door3SensorType,Door4SensorType,"
-            "Door1VerifyType,Door2VerifyType,Door3VerifyType,Door4VerifyType"
-        ))
-        if sdk.supports_get_device_param():
-            raw = sdk.get_device_param(items=items, initial_size=65536)
+        if h.supports_get_device_param():
+            raw = h.get_device_param(items=items, initial_size=65536) or ""
             for part in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
                 for seg in part.split(","):
                     seg = seg.strip()
@@ -4068,17 +4161,18 @@ def _handle_device_info(ctx: _Ctx) -> None:
         counts = {}
         for t in ["user", "userauthorize", "transaction", "templatev10", "timezone", "holiday"]:
             try:
-                c = sdk.get_device_data_count(table=t)
+                c = h.get_device_data_count(table=t)
                 if c >= 0:
                     counts[t] = c
             except Exception:
                 pass
-        ctx.send_json(200, {"ok": True, "params": params, "counts": counts, "raw": raw})
-    except Exception as e:
-        ctx.send_json(500, {"ok": False, "error": str(e)})
-    finally:
-        try: sdk.disconnect()
-        except Exception: pass
+        return {"params": params, "counts": counts, "raw": raw}
+
+    r = _run_on_device_sdk(ctx, did, _read, label="device_info", timeout=15.0)
+    if not r["ok"]:
+        _send_run_failure(ctx, r)
+        return
+    ctx.send_json(200, {"ok": True, **(r["result"] or {})})
 
 
 def _handle_device_table(ctx: _Ctx) -> None:
@@ -4090,21 +4184,25 @@ def _handle_device_table(ctx: _Ctx) -> None:
 
     if _unsupported_for_protocol(ctx, did, "la lecture des tables PullSDK"):
         return
-    sdk, err = _connect_device(ctx, did)
-    if err:
-        ctx.send_json(500, {"ok": False, "error": err})
+
+    def _read(sdk):
+        h, on_worker = _pullsdk_handle(sdk)
+        return _read_table_capped(h, table=table_name, fields=fields, filter_expr=flt,
+                                  on_worker=on_worker)
+
+    r = _run_on_device_sdk(ctx, did, _read, label=f"table_read:{table_name}", timeout=15.0)
+    if not r["ok"]:
+        _send_run_failure(ctx, r)
         return
-    try:
-        rows = sdk.get_device_data_rows(table=table_name, fields=fields, filter_expr=flt, options="")
-        count = len(rows)
-        if max_rows > 0:
-            rows = rows[:max_rows]
-        ctx.send_json(200, {"ok": True, "table": table_name, "rows": rows, "count": count})
-    except Exception as e:
-        ctx.send_json(500, {"ok": False, "error": str(e)})
-    finally:
-        try: sdk.disconnect()
-        except Exception: pass
+    res = r["result"] or {}
+    if res.get("tooLarge"):
+        _send_table_too_large(ctx, table_name, res.get("count"))
+        return
+    rows = res.get("rows") or []
+    count = len(rows)
+    if max_rows > 0:
+        rows = rows[:max_rows]
+    ctx.send_json(200, {"ok": True, "table": table_name, "rows": rows, "count": count})
 
 
 _door_open_last: Dict[int, float] = {}  # M-003: per-device rate limit for door open
@@ -4640,9 +4738,11 @@ def _run_on_device_sdk(ctx: _Ctx, did: int, fn, *, label: str, timeout: float = 
     """Run ``fn(sdk)`` against a device and return {ok,result,error,mode,status}.
 
     Single place for the connection rule: ULTRA devices go through the worker's
-    held socket via the command queue (NEVER a 2nd Connect — handle-leak safe);
-    DEVICE-mode/unmanaged devices get a one-shot connection. Keeps the control
-    handlers (settings/reentry/clock) consistent.
+    held socket via the command queue (NEVER a 2nd Connect — one connection per
+    turnstile, handle-leak safe, guide §3.1c); DEVICE-mode/unmanaged devices get a
+    one-shot connection. Used by settings/reentry/clock, /info, /table, /users and
+    /users/push|delete. fn runs on the worker thread and blocks its loop (rtlog,
+    doors) while it runs: keep it short.
     """
     ultra_eng = getattr(ctx.app, "_ultra_engine", None)
     if ultra_eng and getattr(ultra_eng, "running", False):
@@ -4936,8 +5036,9 @@ def _handle_erase_holds(ctx: _Ctx) -> None:
 
 
 def _refuse_held_or_frozen(ctx: _Ctx, did: int) -> bool:
-    """A direct user write (a second PullSDK session) to a turnstile an erase holds, or one
-    being handed over, is refused before any connect (guide §3.2h). True = refused (sent)."""
+    """A direct user write (on the ULTRA worker's connection, or a one-shot session when no
+    worker holds the turnstile) to a turnstile an erase holds, or one being handed over, is
+    refused before anything is queued or connected (guide §3.2h). True = refused (sent)."""
     from app.core import device_hold
     from app.core.v2 import lease_gate
     if device_hold.is_held(did):
@@ -4949,6 +5050,23 @@ def _refuse_held_or_frozen(ctx: _Ctx, did: int) -> bool:
                             "error": "this turnstile is being handed over to another PC"})
         return True
     return False
+
+
+# A direct user write that the worker had started when the wait ran out (guide §3.1a): it may
+# have landed. Never answered as a clean failure.
+def _send_write_unknown(ctx: _Ctx, maybe_done: str) -> None:
+    ctx.send_json(500, {
+        "ok": False, "outcome": "unknown", "detail": "sent, no answer",
+        "error": f"commande envoyée à l'appareil, sans réponse à temps — {maybe_done} : "
+                 f"vérifier sur l'appareil",
+    })
+
+
+# The worker runs a direct user write as ONE request_run_sdk call: a user row, its door rights,
+# its templates (each template probes up to 10 table/format combinations, _push_templates, which
+# has no door yield). Doors and rtlog wait for it. Chosen, not measured: the caller waits this
+# long for the worker to take it, then as long again for its answer (request_run_sdk).
+_USER_WRITE_TIMEOUT_SEC = 10.0
 
 
 def _handle_device_users_push(ctx: _Ctx) -> None:
@@ -4971,178 +5089,204 @@ def _handle_device_users_push(ctx: _Ctx) -> None:
         return
     if _refuse_held_or_frozen(ctx, did):
         return
-    sdk, err = _connect_device(ctx, did)
-    if err:
-        ctx.send_json(500, {"ok": False, "error": err})
-        return
     # Not a MonClub push attempt (the content is the operator's), but it changes what the
     # turnstile holds for this pin: its last push result becomes unknown BEFORE the first write,
-    # durably (contract revision 4.1 §1.1). No record, no write.
+    # durably (contract revision 4.1 §1.1). No record, no write. Done here, before the call is
+    # queued: a call the worker then skips leaves "unknown", the safe state.
     try:
         from app.core.db import reset_push_results_for_pins
         reset_push_results_for_pins(device_id=did, pins=[pin])
     except Exception as e:
-        try: sdk.disconnect()
-        except Exception: pass
         ctx.send_json(500, {"ok": False, "error": f"the push could not be recorded first: {e}"})
         return
 
-    try:
-        # Push user
-        pairs = [f"Pin={pin}"]
-        if name: pairs.append(f"Name={name}")
-        if card_no: pairs.append(f"CardNo={card_no}")
-        user_data = "\t".join(pairs) + "\r\n"
-        sdk.set_device_data(table="user", data=user_data, options="")
+    # The request and the device/profile/scheme reads are prepared here, on the request
+    # thread. _push (on the worker thread under ULTRA) runs the device writes, and
+    # _push_templates' own firmware-profile / finger-status records, as in the worker's syncs.
+    #
+    # Templates -- DELEGATED to the same DeviceSyncEngine._push_templates the
+    # full and ULTRA sync paths use.
+    #
+    # This handler used to be a second, weaker implementation of the same job: ONE
+    # table and ONE body format (vs the shared method's 10 probed combinations plus
+    # the firmware-profile fast path), no deviceCapabilities bias, no pre-delete,
+    # Size=0 sent verbatim, and `ok: true` returned even when it pushed nothing.
+    # A member could be "pushed" here and still not open the door.
+    from app.core.device_sync import (
+        DeviceSyncEngine,
+        _decoded_template_len,
+        _template_wire,
+    )
+    from app.core.settings_reader import parse_fingerprint_template_version
+    from app.core.db import get_sync_device_payload
 
-        # Push authorize — AuthorizeDoorId is a BITMASK (door1=1, door2=2, door3=4, door4=8).
-        # Push ONE record with the combined bitmask for all doors.
-        auth_result = "OK"
-        bitmask = 0
+    try:
+        from types import SimpleNamespace
+        # As the worker builds its own (ultra_engine.py): a config-less app still pushes.
+        engine = DeviceSyncEngine(cfg=getattr(ctx.app, "cfg", None) or SimpleNamespace(), logger=_logger)
+    except Exception as e:
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+        return
+
+    # Same table-order bias the main sync applies.
+    template_version_override = None
+    try:
+        template_version_override = parse_fingerprint_template_version(
+            (get_sync_device_payload(did) or {}).get("deviceCapabilities")
+        )
+    except Exception:
+        pass
+
+    # Conditional pre-delete, matching the main sync: only a device whose firmware
+    # profile recorded delete_then_insert/one_by_one (an observed silent-upsert
+    # failure) needs old rows cleared first. The default is a no-op -- exactly what
+    # this handler did before.
+    pre_delete = False
+    try:
+        profile = engine._get_firmware_profile(did)
+        pre_delete = profile.insert_strategy in ("delete_then_insert", "one_by_one")
+    except Exception:
+        pass
+
+    # This is the one template path that does NOT flow through
+    # _collect_templates_for_pin, so it is where a HEX templateData can still
+    # arrive (straight off an HTTP body). Normalise it here too, or the device is
+    # written a template it can never match.
+    tpl_errors: List[str] = []
+    wire_templates: List[Dict[str, Any]] = []
+    for t in (templates or []):
+        if not isinstance(t, dict):
+            continue
+        td = _safe_str(t.get("templateData"), "").strip()
+        if not td:
+            continue
+        try:
+            td, _nbytes = _template_wire(td, t.get("templateEncoding"))
+        except Exception as ex:
+            tpl_errors.append(
+                f"FingerID={t.get('fingerId')!r}: templateEncoding=HEX but "
+                f"templateData is not decodable hex ({ex})"
+            )
+            continue
+        # _push_templates falls back to Size=0 for a missing templateSize,
+        # because its normal caller (_collect_templates_for_pin) has already
+        # normalised it. This handler is the untrusted-input boundary, so it
+        # does that job here -- Size must be the DECODED byte count, never the
+        # encoded text length and never 0.
+        ts = _safe_int(t.get("templateSize"), 0)
+        if ts <= 0:
+            ts = _nbytes if _nbytes is not None else _decoded_template_len(td)
+        wire_templates.append({**t, "templateData": td, "templateSize": ts})
+
+    # fingerId is deliberately NOT coerced here. _push_templates skips and REPORTS
+    # an unusable fingerId; coercing a missing one to slot 0 would write a
+    # biometric to a finger the caller never named.
+    # The operator names the pin directly; it is recorded under the scheme the device
+    # runs, so the upstream push report names mainAccountId for an ACCOUNT device and
+    # activeMembershipId for a MEMBERSHIP one (guide §3.2b).
+    from app.core.device_sync import device_pin_scheme
+
+    try:
+        raw_pin_source = device_pin_scheme(get_sync_device_payload(did) or {})
+    except Exception:
+        # The device's scheme cannot be read, so which id this pin IS is unknown. NULL
+        # would read back as MEMBERSHIP and report an account pin against the person whose
+        # membership has that number; UNKNOWN is stored and never reported (the report
+        # skips any source but ACCOUNT/MEMBERSHIP). Review #10.
+        _logger.warning(
+            "[API] users/push device=%s pin=%s: device pin scheme unreadable -- the push "
+            "outcome is recorded as UNKNOWN and not reported upstream", did, pin,
+        )
+        raw_pin_source = "UNKNOWN"
+
+    pairs = [f"Pin={pin}"]
+    if name: pairs.append(f"Name={name}")
+    if card_no: pairs.append(f"CardNo={card_no}")
+    user_data = "\t".join(pairs) + "\r\n"
+    # AuthorizeDoorId is a BITMASK (door1=1, door2=2, door3=4, door4=8).
+    # Push ONE record with the combined bitmask for all doors.
+    bitmask = 0
+    try:
         for door in door_ids:
             bitmask |= 1 << (int(door) - 1)
+    except Exception as e:
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+        return
+    auth_data = f"Pin={pin}\tAuthorizeTimezoneId=1\tAuthorizeDoorId={bitmask}\r\n"
+
+    def _push(sdk):
+        h, _on_worker = _pullsdk_handle(sdk)
+        # The pre-delete clears this pin's templates AND its userauthorize row, so it runs
+        # FIRST, as in the main sync (device_sync.py: the strategy pre-delete precedes every
+        # insert). It used to run after the userauthorize write and silently removed the door
+        # rights just written, while the answer said authResult "OK".
+        if pre_delete:
+            try:
+                engine._delete_auth_and_templates_best_effort(
+                    sdk=h, pin=pin, fingerprint_enabled=True,
+                )
+            except Exception:
+                pass
+        h.set_device_data(table="user", data=user_data, options="")
+        auth_result = "OK"
         try:
-            auth_data = f"Pin={pin}\tAuthorizeTimezoneId=1\tAuthorizeDoorId={bitmask}\r\n"
-            sdk.set_device_data(table="userauthorize", data=auth_data, options="")
+            h.set_device_data(table="userauthorize", data=auth_data, options="")
         except Exception as ex:
             auth_result = str(ex)
-
-        # Push templates -- DELEGATED to the same DeviceSyncEngine._push_templates the
-        # full and ULTRA sync paths use.
-        #
-        # This handler used to be a second, weaker implementation of the same job: ONE
-        # table and ONE body format (vs the shared method's 10 probed combinations plus
-        # the firmware-profile fast path), no deviceCapabilities bias, no pre-delete,
-        # Size=0 sent verbatim, and `ok: true` returned even when it pushed nothing.
-        # A member could be "pushed" here and still not open the door.
-        from app.core.device_sync import (
-            DeviceSyncEngine,
-            _decoded_template_len,
-            _template_wire,
-        )
-        from app.core.settings_reader import parse_fingerprint_template_version
-        from app.core.db import get_sync_device_payload
-
-        engine = DeviceSyncEngine(cfg=ctx.app.cfg, logger=_logger)
-
-        # Same table-order bias the main sync applies.
-        template_version_override = None
-        try:
-            template_version_override = parse_fingerprint_template_version(
-                (get_sync_device_payload(did) or {}).get("deviceCapabilities")
-            )
-        except Exception:
-            pass
-
-        # Conditional pre-delete, matching the main sync: only a device whose firmware
-        # profile recorded delete_then_insert/one_by_one (an observed silent-upsert
-        # failure) needs old rows cleared first. The default is a no-op -- exactly what
-        # this handler did before.
-        try:
-            profile = engine._get_firmware_profile(did)
-            if profile.insert_strategy in ("delete_then_insert", "one_by_one"):
-                engine._delete_auth_and_templates_best_effort(
-                    sdk=sdk, pin=pin, fingerprint_enabled=True,
-                )
-        except Exception:
-            pass
-
-        # This is the one template path that does NOT flow through
-        # _collect_templates_for_pin, so it is where a HEX templateData can still
-        # arrive (straight off an HTTP body). Normalise it here too, or the device is
-        # written a template it can never match.
-        tpl_errors: List[str] = []
-        wire_templates: List[Dict[str, Any]] = []
-        for t in (templates or []):
-            if not isinstance(t, dict):
-                continue
-            td = _safe_str(t.get("templateData"), "").strip()
-            if not td:
-                continue
-            try:
-                td, _nbytes = _template_wire(td, t.get("templateEncoding"))
-            except Exception as ex:
-                tpl_errors.append(
-                    f"FingerID={t.get('fingerId')!r}: templateEncoding=HEX but "
-                    f"templateData is not decodable hex ({ex})"
-                )
-                continue
-            # _push_templates falls back to Size=0 for a missing templateSize,
-            # because its normal caller (_collect_templates_for_pin) has already
-            # normalised it. This handler is the untrusted-input boundary, so it
-            # does that job here -- Size must be the DECODED byte count, never the
-            # encoded text length and never 0.
-            ts = _safe_int(t.get("templateSize"), 0)
-            if ts <= 0:
-                ts = _nbytes if _nbytes is not None else _decoded_template_len(td)
-            wire_templates.append({**t, "templateData": td, "templateSize": ts})
-
-        # fingerId is deliberately NOT coerced here. _push_templates skips and REPORTS
-        # an unusable fingerId; coercing a missing one to slot 0 would write a
-        # biometric to a finger the caller never named.
-        # The operator names the pin directly; it is recorded under the scheme the device
-        # runs, so the upstream push report names mainAccountId for an ACCOUNT device and
-        # activeMembershipId for a MEMBERSHIP one (guide §3.2b).
-        from app.core.device_sync import device_pin_scheme
-
-        try:
-            raw_pin_source = device_pin_scheme(get_sync_device_payload(did) or {})
-        except Exception:
-            # The device's scheme cannot be read, so which id this pin IS is unknown. NULL
-            # would read back as MEMBERSHIP and report an account pin against the person whose
-            # membership has that number; UNKNOWN is stored and never reported (the report
-            # skips any source but ACCOUNT/MEMBERSHIP). Review #10.
-            _logger.warning(
-                "[API] users/push device=%s pin=%s: device pin scheme unreadable -- the push "
-                "outcome is recorded as UNKNOWN and not reported upstream", did, pin,
-            )
-            raw_pin_source = "UNKNOWN"
         pushed, push_errs = engine._push_templates(
-            sdk, pin=pin, templates=wire_templates, device_id=did,
+            h, pin=pin, templates=wire_templates, device_id=did,
             template_version_override=template_version_override,
             pin_source=raw_pin_source,
         )
-        tpl_errors.extend(push_errs)
+        return {"authResult": auth_result, "pushed": pushed, "errors": list(push_errs)}
 
-        # `ok` now means what it says. Reporting true on a failed template push is the
-        # same defect F0 fixed on the sync paths.
-        ok = (auth_result == "OK") and not tpl_errors
-        ctx.send_json(200, {
-            "ok": ok,
-            "authResult": auth_result,
-            "templateResult": f"{pushed}/{len(templates)} pushed",
-            "errors": tpl_errors,
-        })
-    except Exception as e:
-        ctx.send_json(500, {"ok": False, "error": str(e)})
-    finally:
-        try: sdk.disconnect()
-        except Exception: pass
+    r = _run_on_device_sdk(ctx, did, _push, label="users_push", timeout=_USER_WRITE_TIMEOUT_SEC)
+    if not r["ok"]:
+        if r["error"] == "sent, no answer":
+            _logger.warning("[API] users/push device=%s pin=%s SENT, NO ANSWER", did, pin)
+            _send_write_unknown(ctx, "l'utilisateur a peut-être été écrit")
+        else:
+            _send_run_failure(ctx, r)
+        return
+    res = r["result"] or {}
+    tpl_errors.extend(res.get("errors") or [])
+    # `ok` now means what it says. Reporting true on a failed template push is the
+    # same defect F0 fixed on the sync paths.
+    ok = (res.get("authResult") == "OK") and not tpl_errors
+    ctx.send_json(200, {
+        "ok": ok,
+        "authResult": res.get("authResult"),
+        "templateResult": f"{res.get('pushed', 0)}/{len(templates)} pushed",
+        "errors": tpl_errors,
+    })
 
 
 def _handle_device_users_list(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
     if _unsupported_for_protocol(ctx, did, "la liste des utilisateurs appareil"):
         return
-    sdk, err = _connect_device(ctx, did)
-    if err:
-        ctx.send_json(500, {"ok": False, "error": err})
+
+    def _read(sdk):
+        h, on_worker = _pullsdk_handle(sdk)
+        return _read_table_capped(h, table="user", fields="Pin;Name;CardNo", filter_expr="",
+                                  on_worker=on_worker)
+
+    r = _run_on_device_sdk(ctx, did, _read, label="users_list", timeout=15.0)
+    if not r["ok"]:
+        _send_run_failure(ctx, r)
         return
-    try:
-        rows = sdk.get_device_data_rows(table="user", fields="Pin;Name;CardNo", filter_expr="", options="")
-        users = []
-        for r in rows:
-            users.append({
-                "pin": _safe_str(r.get("Pin") or r.get("pin"), ""),
-                "name": _safe_str(r.get("Name") or r.get("name"), ""),
-                "cardNo": _safe_str(r.get("CardNo") or r.get("cardno"), ""),
-            })
-        ctx.send_json(200, {"ok": True, "users": users})
-    except Exception as e:
-        ctx.send_json(500, {"ok": False, "error": str(e)})
-    finally:
-        try: sdk.disconnect()
-        except Exception: pass
+    res = r["result"] or {}
+    if res.get("tooLarge"):
+        _send_table_too_large(ctx, "user", res.get("count"))
+        return
+    users = []
+    for row in res.get("rows") or []:
+        users.append({
+            "pin": _safe_str(row.get("Pin") or row.get("pin"), ""),
+            "name": _safe_str(row.get("Name") or row.get("name"), ""),
+            "cardNo": _safe_str(row.get("CardNo") or row.get("cardno"), ""),
+        })
+    ctx.send_json(200, {"ok": True, "users": users})
 
 
 def _handle_device_users_delete(ctx: _Ctx) -> None:
@@ -5157,24 +5301,28 @@ def _handle_device_users_delete(ctx: _Ctx) -> None:
         return
     if _refuse_held_or_frozen(ctx, did):
         return
-    sdk, err = _connect_device(ctx, did)
-    if err:
-        ctx.send_json(500, {"ok": False, "error": err})
-        return
-    try:
-        cond = f"Pin={pin}"
+    cond = f"Pin={pin}"
+
+    # Four DeleteDeviceData calls; a refused one is skipped, as before.
+    def _delete(sdk):
+        h, _on_worker = _pullsdk_handle(sdk)
         for table in ["templatev10", "template", "userauthorize", "user"]:
             try:
-                if sdk.supports_delete_device_data():
-                    sdk.delete_device_data(table=table, data=cond, options="")
+                if h.supports_delete_device_data():
+                    h.delete_device_data(table=table, data=cond, options="")
             except Exception:
                 pass
-        ctx.send_json(200, {"ok": True})
-    except Exception as e:
-        ctx.send_json(500, {"ok": False, "error": str(e)})
-    finally:
-        try: sdk.disconnect()
-        except Exception: pass
+        return True
+
+    r = _run_on_device_sdk(ctx, did, _delete, label="users_delete", timeout=_USER_WRITE_TIMEOUT_SEC)
+    if not r["ok"]:
+        if r["error"] == "sent, no answer":
+            _logger.warning("[API] users/delete device=%s pin=%s SENT, NO ANSWER", did, pin)
+            _send_write_unknown(ctx, "l'utilisateur a peut-être été supprimé")
+        else:
+            _send_run_failure(ctx, r)
+        return
+    ctx.send_json(200, {"ok": True})
 
 
 def _handle_device_door_presets_list(ctx: _Ctx) -> None:

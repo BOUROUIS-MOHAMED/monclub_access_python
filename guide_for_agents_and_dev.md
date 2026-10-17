@@ -49,6 +49,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The crash evidence of a process that ends without "App shutting down" (`app/core/crash_capture.py`; `access/main.py::main`'s `install`, after the single-instance guard; `logger.py::setup_logging`'s `report_previous`) | `docs/crash_evidence.md` |
 | The write-ahead push intent — when it is written, what resolves it, the read-back promotion, the daily maintenance slot (`db.py::record_push_intents` and siblings, `_run_db_write_sync(durable=)`, `ultra_engine.py::_record_push_intents`, `::_push_with_chunk_recording`, `::_promote_intents_by_readback`, `::_drain_daily_maintenance`, `device_sync.py::_settle_pullsdk_intents`, `::_prove_pullsdk_intent`) | §3.4a |
 | The ULTRA operator queues — door-open and control-panel SDK calls — their deadline or their claim (`ultra_engine.py::request_door_open`, `::_drain_commands`, `::request_run_sdk`, `::_drain_sdk_commands`, `::_CommandClaim`; the `sent, no answer` text in `local_access_api_v2.py::_door_open_error_fr` and its `500_sent_no_answer` branch in `::_handle_device_door_open`; `zk_standalone.py::last_open_door_result`; the 503 group in `local_access_api_v2.py::_run_on_device_sdk`) | §3.1a, §7 (`ACUnlock` on the MB2000), §10.2a, field cheatsheet §6, and zkemkeeper_guide §4 (Door) |
+| Any local-API handler that talks to a turnstile — which connection it uses, the table-read cap, the manual-session refusal (`local_access_api_v2.py::_run_on_device_sdk`, `::_pullsdk_handle`, `::_read_table_capped`, `_LIVE_TABLE_READ_MAX_ROWS`, `_USER_WRITE_TIMEOUT_SEC`, `::_ultra_worker_holding`, `::_handle_device_info`, `::_handle_device_table`, `::_handle_device_users_list`, `::_handle_device_users_push`, `::_handle_device_users_delete`, `::_handle_device_connect`, `::_handle_device_disconnect`; `DevicesPage.tsx` `countsBlockedReason` and the row's connect toggle) | §3.1c |
 | What runs between the chunks of a standalone push, the per-pass cap, superseded pins (`ultra_engine.py::_standalone_push_yield`, `::_note_push_superseded`, `::_prioritise_for_cap`, `_FULL_SYNC_MAX_PINS_PER_PASS`; `zk_standalone.py::push_roster(between_chunks=)` and the `push_roster` STA op's event pump) | §3.4e, and zkemkeeper_guide §5 |
 | The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice; the heartbeat's `qrRosterCheck`, `pc_identity.py::_qr_roster_check_report`) | §3.1b, §10.2a |
 | What the credential diff compares, or how it compares grants (`db.py::_sync_gym_access_credentials_rows`, `::_sync_credential_grants_changed`) | §3.1b |
@@ -454,8 +455,11 @@ structures (`_pending_member_syncs`, the revoke-id sets, `_pending_full_sync_req
 deliberately re-queued — they have no deadline and must not get one (§3.4).
 
 **The control panel's SDK-call queue is decided the same way (2026-09-19).**
-`UltraDeviceWorker.request_run_sdk` is the only producer of `_sdk_cmd_queue`, and its only
-caller is `local_access_api_v2.py::_run_on_device_sdk`, used by the DevicesPage control panel:
+`UltraDeviceWorker.request_run_sdk` is the only producer of `_sdk_cmd_queue`. Its callers
+(re-checked 2026-10-16) are `local_access_api_v2.py::_run_on_device_sdk` — every local-API
+device call since §3.1c, see there for the full list —, `erase_wizard.py` (§3.2h),
+`removal_executors.py` and `v2/handlers.py` (`v2_audit`). Before §3.1c `_run_on_device_sdk`
+served only the DevicesPage control panel:
 `GET /api/v2/devices/{id}/settings` (budget 15 s), `POST …/reentry` (5 s: `SetDeviceParam`
 `Door{n}Intertime`, then a read-back), `GET …/clock` (15 s) and `POST …/clock/sync` (25 s).
 `[CODE: access/local_api_routes.py; the four handlers]` `_drain_sdk_commands` skipped an
@@ -1001,6 +1005,156 @@ off the list the card index is built from. `[CODE]`
 - Removed members still count as `not_in_roster` only until their credential is removed by a
   sync; the counts measure the gap, not a steady state.
 `[UNVERIFIED]` How often any of these happens on a real gym — that is the trial's job.
+
+### 3.1c One connection per turnstile — the local API never opens a second one (2026-10-16)
+
+**The rule.** Owner, 2026-10-16: a turnstile accepts only one connection at a time, and on
+ULTRA (every gym) this PC's `UltraDeviceWorker` holds it permanently.
+`[UNVERIFIED — owner recollection; no public source found]` A web search the same day
+(PullSDK user guide, pyzkaccess, zkaccess-c3, ZKTeco support pages) found nothing that confirms
+or rules it out, and nothing in the repo measures it. The code already followed the rule on
+other grounds: the worker holds one persistent connection because every plcommpro
+Connect/Disconnect leaks a handle (pullsdk_guide, `[COMMENT]`), and the engine-level sync pauses
+the worker before it connects ("risk: dual TCP connection on C3-200", `[COMMENT:
+ultra_engine.py::_sync_device]`). A field test on a spare panel — never a live gym — would
+settle it: open a manual session while a worker holds the panel and record what each side sees.
+
+**Before** `[CODE: master 941fffa]`: `/devices/{id}/connect`, `/info`, `/table/{name}`, `/users`,
+`/users/push` and `/users/delete` each opened a one-shot `PullSDK` connection through
+`_connect_device`, even while this PC's worker held the panel. Release 1.4.35 (`b0a7c3b`) did
+the same, but only on an operator click (« Lire », « Récupérer »). Access v5 card U made the
+Contenu tab read `/info` by itself, and 941fffa then blocked that read on worker-held devices.
+Note: the git tag `access_1.4.35` points at `a6be482`, the 1.4.33 commit, not at `b0a7c3b`.
+
+**Now** — the path each route takes when this PC's ULTRA worker holds the device `[CODE]`:
+
+| Route | Handler | With a worker | Budget |
+|---|---|---|---|
+| `GET …/info` | `_handle_device_info` | `request_run_sdk`: one `GetDeviceParam`, six `GetDeviceDataCount`, no table read | 15 s |
+| `GET …/table/{name}` | `_handle_device_table` | `request_run_sdk`, count first, capped (below) | 15 s |
+| `GET …/users` | `_handle_device_users_list` | `request_run_sdk`, `user` table, capped | 15 s |
+| `POST …/users/push` | `_handle_device_users_push` | guards, reset, then `request_run_sdk` (below) | 10 s |
+| `POST …/users/delete` | `_handle_device_users_delete` | guards, then `request_run_sdk` | 10 s |
+| `GET …/settings`, `POST …/reentry`, `GET …/clock`, `POST …/clock/sync` | unchanged | `request_run_sdk` (§3.1a) | 15 / 5 / 15 / 25 s |
+| `POST …/door/open` | unchanged | the door queue (§3.1a) | 2 s |
+| `POST …/connect` | `_handle_device_connect` | 409 `HELD_BY_ULTRA_WORKER` | — |
+| `POST …/disconnect` | `_handle_device_disconnect` | closes a pooled manual session if one exists (200); else 409 `HELD_BY_ULTRA_WORKER` | — |
+
+All of these go through `_run_on_device_sdk`, which keeps its statuses: 503 when nothing was
+sent (`timeout`, `device not connected`, `expired (not executed)`, `device unreachable`), 500
+otherwise. A budget is how long the caller waits for the worker to take the call, then as long
+again for its answer (§3.1a). Without a worker — DEVICE mode, an unmanaged device, the engine
+not running — every route keeps its one-shot session. A turnstile another PC drives has no worker
+here either, but these routes never reach it: `LEASE_GATED_HANDLERS` answers 409 `notDriver`
+first, from the same `lease_gate` test that keeps it out of `UltraEngine`'s workers.
+`[CODE: access/local_api_routes.py::gated_handler; lease_gate.py::device_allowed, ::filter_devices]` One difference there: a failed connect now
+answers 503, where these handlers answered 500. The response bodies are unchanged.
+
+**Which handle.** For a PullSDK panel the worker's driver is a `PullSDKDevice`
+(`device_driver.py::get_driver`). It does not expose `get_device_data_count`,
+`get_device_data_rows`, `set_device_data` or `delete_device_data`. Its wrappers
+(`get_table_count`, `read_table_rows`, `delete_table_rows`) answer -1 / `[]` on any failure, which
+would turn a failed read into an empty table. `[CODE: pullsdk.py::PullSDKDevice]`
+`_pullsdk_handle` uses the driver's held low-level `PullSDK` (`drv._sdk`) instead. The worker's
+own member and full syncs push through that same handle on the same thread
+(`ultra_engine.py`, `raw_sdk = getattr(self._sdk, "_sdk", None)`, two sites). `[CODE]` fn runs
+on the worker thread inside `_drain_sdk_commands`, so no other worker call uses the handle while
+it runs. Like those syncs, it does not take `PullSDKDevice._sdk_lock`. A driver with no handle
+answers `device not connected` (503, nothing sent); a driver that is not a `PullSDKDevice` and
+has no table calls (a standalone terminal behind a failed protocol lookup) raises, so the
+handler answers 500.
+
+**The cost, and the table-read cap.** A call made through `request_run_sdk` runs on the worker
+thread, and its loop waits until the call returns: rtlog polling, QR/RFID rescues and queued door
+opens. `[CODE: ultra_engine.py::run — _drain_sdk_commands is one step of the loop]` `/info`
+makes seven short calls. A table read is the long one. `GetDeviceData` has no row limit, and
+`maxRows` (the page asks for 250) is applied only after the whole table has been read, through
+the 1 → 8 MB buffer ladder (up to four calls). `[CODE: pullsdk.py::get_device_data_text]`
+On the worker, `_read_table_capped` therefore calls `GetDeviceDataCount(table, filter)` first.
+It refuses with **409 `TABLE_TOO_LARGE_FOR_LIVE_READ`** (`table`, `count`, `maxRows` and a
+French `error`) when the count is above **`_LIVE_TABLE_READ_MAX_ROWS` = 3000**, or when the count
+cannot be read (a negative answer; `count` is then `null`). The table is then not read at all.
+
+3000 is chosen, not measured. It is about three times the largest roster on record (914
+members on the OXYGENE_FIT payload, pullsdk_guide), so the member tables (`user`,
+`userauthorize`, usually `templatev10`) can be read. The door log (`transaction`) is the table
+it stops. How long a 3000-row read takes on a C3 is `[UNKNOWN]`: no field log searched on
+2026-10-16 carries the `get_device_data_rows … ms` debug line. When no worker holds the panel,
+nothing waits on the read and no cap applies. On a firmware whose `GetDeviceDataCount` refuses
+a table, « Récupérer » cannot read that table on a worker-held panel. Which firmware and tables
+are affected is `[UNVERIFIED]` (pullsdk_guide, Contenu counts).
+
+**Writes.** `/users/push` keeps its guards, in order:
+1. the protocol check (409);
+2. the erase hold and hand-over check, `_refuse_held_or_frozen` (409);
+3. resetting the pin's push result to unknown (contract 4.1 §1.1).
+
+The reset runs on the request thread before the call is queued. If the worker then skips the
+call (503), the result stays "unknown", which is the safe state. If the reset fails, the answer
+is 500 and nothing is queued or connected (before, a session was already open). The reads of
+the device payload, firmware profile and pin scheme, and the template normalisation, stay on the
+request thread. The device writes run on the worker: the optional pre-delete, the user row,
+`userauthorize`, then `_push_templates` (the pre-delete moved first on 2026-10-16, below). `_push_templates` also writes the
+database on that thread (`save_firmware_profile`, `reset_firmware_template_combo`,
+`clear_firmware_profile`, `_record_finger_push_status`), as it does inside the worker's own
+syncs. It has no door yield (`_maybe_yield_doors` runs only in the batch paths), so doors and
+rtlog wait for the whole push. `/users/delete` runs its four `DeleteDeviceData` calls the same way. `[CODE]`
+
+`sent, no answer` means the worker had started the write when both waits ran out. It answers
+**500 with `outcome: "unknown"`** and `detail: "sent, no answer"`, plus a French `error`: the
+user may have been written (or deleted), check the device. It is never reported as a clean
+failure. `[CODE: ::_send_write_unknown]` The 10 s + 10 s budget is chosen, not measured. The
+Tauri UI does not call these three `/users` routes: `tauri-ui/src` has no such call. `[CODE]`
+
+**Manual session.** `/connect` on a worker-held PullSDK device answers 409
+`HELD_BY_ULTRA_WORKER` with « La connexion à ce tourniquet est tenue par le service ULTRA de ce
+PC : pas de session manuelle en plus. » That is the same refusal shape as the ZK_STANDALONE
+branch above it. `/disconnect` always closes a pooled manual session, because refusing would
+leave a second connection open. With none open and a worker holding the device, it answers 409.
+Before, it answered 200, and the page toasted « Appareil N déconnecté » while the worker still
+held the turnstile.
+
+On DevicesPage, the row's connect toggle shows on a worker-held device only while a manual
+session is open (`manualOpen`: one this page opened, `connectedIds`, or the one the
+server reports, `status.pullsdk`). The row tooltip says the service holds the connection. A 409
+reaches the toast as « Connexion échouée: ApiError: La connexion à ce tourniquet… ».
+`[CODE: DevicesPage.tsx]`
+
+**Contenu counts.** The block that 941fffa added (`countsBlockedReason` on a worker-held
+device) is removed. `/info` now runs on the worker, and the counts are read once per dialog
+opening, as card U built it. The erase-hold, wizard-open and user-push blocks stay. `[CODE]`
+
+`[TEST: test_one_connection_local_api.py]` Every test there fails if `_connect_device` or
+`PullSDK.connect` is called, and one drives `/info` through the real `UltraDeviceWorker` queue.
+
+**Other call sites that open their own connection** (found 2026-10-16, not changed) `[CODE]`:
+- `ultra_engine.py::_sync_device`, the engine-level fallback push. It is reached only when the
+  live-worker enqueue failed. It calls `pause_for_sync(timeout=20.0)`, then
+  `DeviceSyncEngine.run_one_device_blocking`, which runs `device_sync.py`'s `PullSDK(...)` connect.
+  It connects even when the pause was not acknowledged.
+- The direct-connect fallback in `_handle_device_door_open`. It is reached only when there is no
+  worker for the device, or after a failed AGENT open (§3.1a).
+- `card_scanner.py`: `ZkemkeeperScanner.connect` to the configured scanner IP (`/scanner/*`,
+  `/scan/*`). The local routes (`local_api_routes.py::scanner_gated_handler`) and the remote
+  `CARD_SCAN` command (`v2/handlers.py`, `SCANNER_IS_A_TURNSTILE`) refuse only the IP of a
+  turnstile ANOTHER PC drives (`device_ips.py::ip_is_undriven_turnstile`). A scanner set on the
+  IP of a turnstile this PC's worker holds is not refused.
+- `UltraEngine.start` marks the engine running before its workers exist, and `stop` clears
+  `_workers` even for a worker that "did not stop in time". In those windows `_run_on_device_sdk`
+  sees no worker and opens a one-shot session.
+- `device_attendance.py` (`get_driver`, its own connection) runs only for
+  `access_data_mode == "DEVICE"` devices. `realtime_agent.py` is AGENT mode's own driver.
+
+**Fixed while moving `/users/push` (owner, 2026-10-16)** `[CODE]`: the push wrote
+`userauthorize`, THEN ran the firmware-profile pre-delete
+(`device_sync.py::_delete_auth_and_templates_best_effort`), which deletes that pin's templates
+and its `userauthorize` row. On a panel whose profile is `delete_then_insert` or `one_by_one` the
+door rights just written were removed, yet the answer said `authResult: "OK"`. Same order on
+941fffa and in 1.4.35. The pre-delete now runs first, as in the main sync, where the strategy
+pre-delete precedes every insert (`device_sync.py`, "P0-bulk: strategy-driven pre-delete"). A
+panel with the default `upsert` profile deletes nothing, as before. `[TEST:
+test_one_connection_local_api.py::test_users_push_pre_delete_runs_before_the_door_rights_are_written,
+::test_users_push_default_profile_deletes_nothing]`
 
 ### 3.2 The roster rule — the most operationally important fact in this file
 
@@ -2585,7 +2739,7 @@ check, the member push, the maintenance slot), `DeviceSyncEngine._sync_one_devic
 the scheduler fallback lands there) and before its batch, `sync_member_on_connected_sdk` (deferred), the
 remote `DEVICE_RECONCILE` (`FAILED DEVICE_ON_HOLD`), and the local API's direct PullSDK user writes
 (`users/push`, `users/delete`: 409 `DEVICE_ON_HOLD`, or `HANDOVER_IN_PROGRESS` during a handover, before any
-connect — no page calls them). One immutable-set lookup, no lock, no database. The door, the clock and the
+call is queued on the ULTRA worker or connected — §3.1c; no page calls them). One immutable-set lookup, no lock, no database. The door, the clock and the
 re-entry settings are not member writes and are not held. `[TEST: test_device_hold.py,
 test_erase_wizard.py::TestDirectWritesRefuseAHeldTurnstile]` **A failed load at start-up holds EVERY
 turnstile** (fail closed, review round 1: `is_held` answers True for any id while `load_failed()`), logged
@@ -2671,8 +2825,8 @@ the verified backup and the verified erase. `[CODE]`
   keeps what is still on it (after a fingerprints-only erase, an `INCOMPLETE` run, or "hold") until Refill. There
   is no timeout on a hold; the Devices page shows "Remplir" on its row, and since lane 1b the heartbeat says `held`.
   A hold from a run that never deleted is released at the next start (above). Owner question, lane report.
-- `users/push` and `users/delete` check the hold before a PullSDK connect of a few seconds; a hold set in
-  between is not seen. No page calls them.
+- `users/push` and `users/delete` check the hold before their call is queued on the ULTRA worker (or, with no
+  worker, before a PullSDK connect of a few seconds); a hold set in between is not seen (§3.1c). No page calls them.
 - `fingerprint_push_status` rows (the PullSDK per-finger push outcomes) are not touched by "forget".
 - While held, the heartbeat line says `held: true` and counts the whole refill roster waiting (§3.10); after the
   release the worker's figure is that roster until the refill pass counts again.
@@ -4296,7 +4450,9 @@ Stored in `device_push_result` (`db.py::record_push_results`, `::list_push_resul
   from the request body, with no intent and no sync state. It is not a MonClub attempt and never produces
   `true`; but it changes what the turnstile holds, so right before its first device write it makes that pin's
   result unknown, durably, stamped with the moment (`db.py::reset_push_results_for_pins`) — a reset that cannot be
-  recorded means no write (500). A held or handed-over turnstile is refused before any connect (§3.2h). `[CODE]`
+  recorded means no write (500). Since 2026-10-16 the reset runs before the write is queued on the ULTRA worker
+  (or connected, with no worker), so a write the worker skips leaves "unknown" (§3.1c). A held or handed-over
+  turnstile is refused before any of that (§3.2h). `[CODE]`
   `[TEST: test_v2_last_push.py::TestTheAdminUsersPushRoute]`
 - **Upload.** The three fields are part of "has this row changed": `v2_ownership_uploaded` gains
   `last_push_ok / last_push_src_at / last_push_error / last_push_sent_at`, the change key being the LOCAL record
