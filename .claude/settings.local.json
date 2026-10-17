@@ -299,7 +299,8 @@
       "Bash(python -)",
       "Bash(grep -n \"_STATUS_FIELDS\" app/sdk/zk_standalone.py; sed -n '/_STATUS_FIELDS: Dict/,/^    }/p' app/sdk/zk_standalone.py | head -30; echo \"=== ReadRTLog line ===\"; grep -n \"ReadRTLog\\\\|GetRTLog\\\\|GetSysOption\\\\|Connect_Net\\\\|RegEvent\\(\\\\|SetCommPassword\" app/sdk/zk_standalone.py)",
       "Bash(python /tmp/pl.py app/ui/app.py 580 600)",
-      "Bash(python /tmp/pl.py app/ui/app.py 2100 2175)"
+      "Bash(python /tmp/pl.py app/ui/app.py 2100 2175)",
+      "PowerShell(git -C D:/Monclub/monclub_access_python worktree add -b claude/access-one-connection D:/Monclub/monclub_access_python/.worktrees/access-one-connection 941fffa)"
     ]
   }
 }
