@@ -5527,6 +5527,13 @@ symptom of the `SSR_DeleteEnrollData` hang. `[FIELD]` Kept consistent here so th
 Since P3a-2 both are checked BEFORE writing (§3.4d) — as a new rail for the shared-terminal
 scenario (a store another system fills), not as a re-diagnosis of that incident.
 
+### The elevated data-root ACL repair has not run on a broken PC `[UNVERIFIED]`
+
+Section 11.10a: the repair is covered only by mocked tests and a scratch-folder icacls check. Three questions are open:
+does one elevated launch on a PC in the 2026-10-17 state really let the next normal or watchdog launch write `access.db`?
+Does Inno's `[Dirs] Permissions` reach files already in the folder? Does a fresh install work on a PC whose Users may not
+create folders in ProgramData? Prove the first one on the owner's PC (still broken on 2026-10-17 until the manual icacls fix runs).
+
 ---
 
 ## 8. Deployment facts that are not code facts
@@ -6432,6 +6439,65 @@ Residuals: a PC uninstalled while still on 1.4.x runs the old log (deletes all d
 detection reads the uninstalling user's HKCU only; an Access installed in the legacy root
 `{localappdata}\MonClub Access` shares that folder with the fallback data root. `[CODE]`
 `[UninstallDelete]` also removes `previous`, `current.failed`, `state`, `downloads` under `{app}`.
+
+### 11.10a Data root permissions — the read-only database after an elevated launch (2026-10-17)
+
+**Field case** `[FIELD: owner's PC, 2026-10-17]`: Access died at start-up with
+`sqlite3.OperationalError: attempt to write a readonly database` in `init_db` (first write = the
+F-015 `DELETE FROM sync_devices ...`), in this version and older ones. `C:\ProgramData\MonClub Access`
+had been created by an ELEVATED launch: the root only inherits ProgramData's ACL (`BUILTIN\Users:(RX)`
+plus create-new-files on folders), and `access\access.db`, `-wal`, `-shm`, `config.json`,
+`pc_identity.dat` were admin-created with only `BUILTIN\Users:(I)(RX)`. Every normal launch
+(installer `PrivilegesRequired=lowest`, watchdog task `RunLevel Limited`) could read but not write
+them. "Run as administrator" works only for that launch, and is what creates the trap.
+On that PC, non-elevated, `os.access(p, W_OK)` returned **True** for all five files while a read+write
+open was refused. On Windows `os.access` reads only the read-only attribute, so it cannot detect this.
+`_pick_data_root` (`mkdir(exist_ok=True)`) succeeds on such a root too.
+
+What the code does (`shared/data_root_permissions.py`, called from `access/main.py` after the
+single-instance guard and BEFORE `crash_capture.install()`, logging and `init_db`, and from
+`tv/main.py` before `run_tv_app()`) `[CODE; TEST: tests/test_data_root_permissions.py]`:
+
+- **Elevated launch** (`IsUserAnAdmin`), data root = the `%ProgramData%` candidate, and
+  `MONCLUB_ACCESS_DATA_ROOT` not set: if the root does not pass `BUILTIN\Users` Modify on to
+  sub-folders and files `(OI)(CI)`, or any of the probed files lacks Users Modify (pywin32
+  `win32security` DACL read; unknown counts as "needed"), it runs
+  `%SystemRoot%\System32\icacls.exe <root> /grant *S-1-5-32-545:(OI)(CI)M /T /C /Q`
+  (the SID, because the group is "Utilisateurs" on French Windows; no console window; output never
+  parsed). One elevated launch heals the PC for Access and TV alike (TV's `tv\` is in the same
+  root). A `%LOCALAPPDATA%` root is never touched: the user's own SID already has Full there.
+  Without `/T`, a grant on a folder was seen to reach an existing inheriting child file
+  (`(I)(M)`) `[FIELD: scratch folder, 2026-10-17]`. `/T` is kept so that files with their own ACL
+  are covered too. The elevated repair itself has not run on a real broken PC yet:
+  **`[UNVERIFIED]`**, because only mocked tests cover it.
+- **Every launch** then opens `access.db`, `-wal`, `-shm` and `access\config.json` (TV: `tv.db`
+  and its `-wal`/`-shm`, plus `tv\config.json`) with `CreateFileW(GENERIC_READ|GENERIC_WRITE,
+  OPEN_EXISTING)`. It writes nothing. Only error 5 (access denied) counts. A missing file or a
+  sharing violation is ignored. If any file is refused, the app logs a line to stderr (= `%TEMP%\MonClubAccess.log` in the
+  windowed build), releases the single-instance guard, and shows a blocking French/English
+  `MessageBoxW`: run once as administrator, or the exact `icacls` command. It then exits with
+  code 2, never a traceback. While the box is open the process is alive, so the watchdog
+  (process-presence check, §12) does not relaunch it. A `readonly database` error that still
+  escapes from `run_access_app()` / `run_tv_app()` gets the same dialog.
+- **No fallback to `%LOCALAPPDATA%`** (decision): it would silently open an EMPTY database on a
+  live gym PC. That means no sign-in, a new PC identity, no offline-creations queue, and no
+  `device_write_hold` row, so the next pass would refill a held turnstile under whatever scheme the
+  server sends (see "An uninstall deletes the hold" above). A clear error is safer.
+- **Installers** (`MonClubAccess.iss`, `MonClubTV.iss` `[Dirs]`):
+  `{commonappdata}\MonClub Access; Permissions: users-modify; Flags: uninsneveruninstall;
+  Check: DataRootDirWanted`.
+  - Inno skips the permissions silently when Setup's user may not change them (Inno help, [Dirs]),
+    so `lowest` installs and updates still work. They take effect when Setup creates the folder,
+    or when Setup is elevated.
+  - `DataRootDirWanted` holds the entry back when ProgramData has no root yet but a database sits in
+    the `{localappdata}` fallback root. Creating the root there would switch the app to an empty
+    ProgramData database.
+  - Whether Inno re-applies the grant to files already in an existing folder is `[UNVERIFIED]`;
+    the app's elevated repair covers that case.
+  - A fresh install on a PC where Users may not create folders in ProgramData was not tried
+    `[UNVERIFIED]`.
+- Manual fix for a PC already in this state (elevated prompt):
+  `icacls "C:\ProgramData\MonClub Access" /grant *S-1-5-32-545:(OI)(CI)M /T`.
 
 ### 11.11 Build, sign, publish (D3, D20, D30, D31)
 

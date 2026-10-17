@@ -89,6 +89,17 @@ Name: "startmenuicon"; Description: "Create a &Start Menu shortcut"; GroupDescri
 Name: "desktopicon"; Description: "Create a &Desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Dirs]
+; The DATA root (app/core/utils.py::_candidate_data_roots, ProgramData first), SHARED by Access
+; and TV: BUILTIN\Users get Modify on it, inherited by everything below. Without it, a root an
+; ELEVATED launch created holds admin-owned files Users can only read, and every normal or
+; watchdog launch dies on "attempt to write a readonly database" (owner's PC, 2026-10-17).
+; Setup runs at PrivilegesRequired=lowest: it can set these permissions on a root it creates
+; (or one its user owns), and on any root when Setup itself is elevated; otherwise Inno skips
+; them silently (Inno help, [Dirs] Permissions) and the app's own repair on an elevated launch
+; does it (shared/data_root_permissions.py). Whether Inno re-applies them to files already in
+; the folder is [UNVERIFIED]. uninsneveruninstall: the data root is removed by
+; CurUninstallStepChanged (D26), never by this entry. Check: see DataRootDirWanted.
+Name: "{commonappdata}\MonClub Access"; Permissions: users-modify; Flags: uninsneveruninstall; Check: DataRootDirWanted
 Name: "{app}\current"
 Name: "{app}\downloads"
 Name: "{app}\logs"
@@ -245,6 +256,19 @@ begin
   Result := ExistingInstallDetected and
     (Trim(ExistingInstallVersion) <> '') and
     (Lowercase(Trim(ExistingInstallVersion)) = Lowercase('{#AppVersion}'));
+end;
+
+function DataRootDirWanted(): Boolean;
+begin
+  // The [Dirs] data-root entry: only when that root exists already, or when no database sits in
+  // the {localappdata} fallback root. The app takes ProgramData first as soon as it can create
+  // it there (_pick_data_root), so creating it on a PC whose live data fell back to
+  // {localappdata} would make the next start open an EMPTY database. Files, not the folder:
+  // {localappdata}\MonClub Access is also the LEGACY install root (LegacyInstallRoot).
+  Result := DirExists(ExpandConstant('{commonappdata}\MonClub Access')) or
+    ((not FileExists(ExpandConstant('{localappdata}\MonClub Access\access\access.db'))) and
+     (not FileExists(ExpandConstant('{localappdata}\MonClub Access\data\app.db'))) and
+     (not FileExists(ExpandConstant('{localappdata}\MonClub Access\tv\tv.db'))));
 end;
 
 function GetInstallRootDefault(Param: string): string;

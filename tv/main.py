@@ -29,9 +29,33 @@ def main() -> None:
         raise
     except Exception as exc:
         print(f"Install journal check failed: {exc}", file=sys.stderr)
+    # TV's tv\ lives in the data root SHARED with Access: same read-only trap, same repair.
+    from shared.data_root_permissions import (
+        check_data_root_at_startup,
+        is_readonly_database_error,
+        report_unwritable,
+    )
+    from app.core.utils import DATA_ROOT, TV_CONFIG_PATH
+    from tv.storage import current_tv_runtime_db_path
+
+    db_path = current_tv_runtime_db_path()
+    if not check_data_root_at_startup(
+        app_name="MonClub TV",
+        data_root=DATA_ROOT,
+        db_path=db_path,
+        extra_files=(TV_CONFIG_PATH,),
+    ):
+        raise SystemExit(2)
+
     from tv.bootstrap import run_tv_app
 
-    run_tv_app()
+    try:
+        run_tv_app()
+    except BaseException as exc:
+        if is_readonly_database_error(exc):
+            report_unwritable("MonClub TV", DATA_ROOT, [db_path])
+            raise SystemExit(2) from None
+        raise
 
 
 if __name__ == "__main__":

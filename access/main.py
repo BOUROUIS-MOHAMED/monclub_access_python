@@ -56,6 +56,27 @@ def main() -> None:
     except Exception as exc:
         print(f"Install journal check failed: {exc}", file=sys.stderr)
 
+    # Before anything writes under the data root (crash capture, logging, init_db): an elevated
+    # launch repairs a ProgramData root an earlier elevated launch left read-only for normal
+    # launches; a launch that still cannot write gets a dialog saying what to do, not a traceback.
+    from shared.data_root_permissions import (
+        check_data_root_at_startup,
+        is_readonly_database_error,
+        report_unwritable,
+    )
+    from app.core.utils import ACCESS_CONFIG_PATH, DATA_ROOT
+    from access.storage import current_access_runtime_db_path
+
+    db_path = current_access_runtime_db_path()
+    if not check_data_root_at_startup(
+        app_name="MonClub Access",
+        data_root=DATA_ROOT,
+        db_path=db_path,
+        extra_files=(ACCESS_CONFIG_PATH,),
+        before_dialog=guard.release,
+    ):
+        raise SystemExit(2)
+
     # Only the instance that holds the guard: a second start must not wipe the running
     # instance's crash evidence. Moves faulthandler from stderr to its own file.
     from app.core import crash_capture
@@ -68,6 +89,10 @@ def main() -> None:
         run_access_app()
     except BaseException as exc:
         crash_capture.record_fatal(exc)  # kept for the next start, even through atexit
+        if is_readonly_database_error(exc):
+            # The startup probe passed but SQLite still could not write: same dialog, no traceback.
+            report_unwritable("MonClub Access", DATA_ROOT, [db_path], before_dialog=guard.release)
+            raise SystemExit(2) from None
         raise
     finally:
         try:
