@@ -4329,13 +4329,17 @@ realtime and member history share « Hors horaires de votre formule ». `[CODE:
 access_dates.qr_off_hours_refused, access_verification.verify_totp, PopupWindow.A_DENY]`
 `[TEST: tests/test_off_hours_qr.py]`
 
-DEVICE-mode PullSDK panels receive no targeted hours command: the next ordinary sync
-applies their stale removals. Releases survive a process restart in manual mode as well;
-no operator sync is needed to resume targeted delivery. `[CODE: db.off_hours_in_play,
-off_hours_push.dispatch_off_hours]` Real hardware, actual DEVICE-mode gyms and
-operator-visible skip noise across multiple devices remain unverified. `[CODE:
-off_hours_push.still_on_devices, UltraEngine.request_sync_now]` `[UNVERIFIED: hardware,
-fleet use and operator noise; no device or real app run for A1]`
+Non-ULTRA devices are **unsupported for off-hours**: both holds and releases reach them
+only at the next full sync, not on the minute tick. `still_on_devices` skips every
+non-ULTRA device and the targeted dispatcher reaches ULTRA workers only. `[CODE:
+off_hours_push.still_on_devices, UltraEngine.request_sync_now]`
+`[UNVERIFIED: the assumption that no gym runs DEVICE mode has not been checked]`
+
+ULTRA releases survive a process restart in manual mode as well; no operator sync is
+needed to resume targeted delivery. `[CODE: db.off_hours_in_play,
+off_hours_push.dispatch_off_hours]` Real hardware and operator-visible skip noise across
+multiple devices remain unverified. `[UNVERIFIED: hardware and operator noise; no device
+or real app run for A1]`
 
 ### 3.9 Driver leases, remote commands, the notice socket (P3b-2, 2026-09-26)
 
