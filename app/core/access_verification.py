@@ -205,7 +205,7 @@ DATE_NOT_TODAY = "not_today"
 # A matched credential refused on the member list or on the allowed days. The wall-clock
 # retry in verify_totp_resilient exists for clock skew (no match / expired); these
 # verdicts are final.
-_MATCHED_REFUSALS = frozenset({"DENY_NOT_IN_LOCAL_ROSTER", "DENY_NOT_ALLOWED_TODAY"})
+_MATCHED_REFUSALS = frozenset({"DENY_NOT_IN_LOCAL_ROSTER", "DENY_NOT_ALLOWED_TODAY", "OFF_HOURS"})
 
 # Process-wide counts of roster verdicts, one per scan. verify_totp stays pure (the
 # resilient wrapper can call it twice per scan, and tests call it freely); the two
@@ -868,6 +868,26 @@ def verify_totp(
         else:
             roster_check = ROSTER_NOT_IN
         roster_mode = totp_roster_check_mode(settings)
+
+        from app.core.access_dates import qr_off_hours_refused, _grant_ids as _grant_ids_for_hours
+        _snap = access_days_index if (used_index and access_days_index is not None) else access_days
+        _hours_reason = None
+        if qr_off_hours_refused(_snap, grants=grants, users_by_am=users_by_am, now_epoch=now):
+            _hours_reason = "OFF_HOURS"
+        elif _snap is not None and any(
+                getattr(_snap.windows.get(am), "off_hours", ()) for am in _grant_ids_for_hours(grants)):
+            # Preserve the date reason for an expired/frozen plan carrying hours, even
+            # when the held row is absent from an enforced roster. No-hours order is unchanged.
+            if qr_date_verdict(_snap, grants=grants, users_by_am=users_by_am,
+                               account_on_roster=(roster_check == ROSTER_IN_BY_ACCOUNT),
+                               roster_current=(roster_current or not used_index)) == DATE_NOT_TODAY:
+                _hours_reason = "DENY_NOT_ALLOWED_TODAY"
+        if _hours_reason:
+            return {"allowed": False, "reason": _hours_reason, "scanMode": "QR_TOTP",
+                    "accountId": account_id, "credId": cred_id, "matchedCounter": matched_ctr,
+                    "ageSeconds": age, "activeMembershipId": chosen_am_id, "rosterCheck": roster_check,
+                    "rosterCheckMode": roster_mode, "tookMs": (time.perf_counter() - t0) * 1000.0,
+                    "user": user}
 
         if roster_check == ROSTER_NOT_IN and roster_mode == ROSTER_MODE_ENFORCE:
             return {

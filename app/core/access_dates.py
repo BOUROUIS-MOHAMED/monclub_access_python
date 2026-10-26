@@ -559,3 +559,21 @@ def effective_credentials(
             out.append(promoted)
             enabled_accounts.add(acc)
     return out
+
+
+def qr_off_hours_refused(snapshot, *, grants, users_by_am, now_epoch) -> bool:
+    """Refuse only when every date-valid granted membership is closed; uncertainty opens."""
+    try:
+        if (snapshot is None or not snapshot.active or snapshot.utc_offset_sec is None
+                or snapshot.clock_suspect):
+            return False
+        candidates = [am for am in _grant_ids(grants)
+                      if snapshot.deliverable(am) is True or am in users_by_am]
+        if not candidates:
+            return False
+        day, minute = off_hours.local_week_minute(now_epoch, snapshot.utc_offset_sec)
+        return all(am in snapshot.windows and bool(snapshot.windows[am].off_hours)
+                   and off_hours.closed(snapshot.windows[am].off_hours, day, minute)
+                   for am in candidates)
+    except Exception:
+        return False
