@@ -918,6 +918,10 @@ Every matched QR result carries `dateCheck`:
 | `not_today` | every grant is provably not deliverable today BY ITS WINDOW | **refused `DENY_NOT_ALLOWED_TODAY`, in BOTH roster modes** |
 | `unchecked` | no trusted windows (`access_days` None, `trusted=0`, no applied date), or a grant with no stored window and no row on the list — the PC knows no date for it; whether it opens is the roster check's question (trial counts it, enforce refuses it) | allowed as before |
 
+After matching, plan hours can separately refuse a date-valid QR with `OFF_HOURS` in both
+roster modes, including the five-minute turnstile reopening lead; see “Off-hours hold
+(1.4.38)” below. `[CODE: access_verification.verify_totp]` `[TEST: tests/test_off_hours_qr.py]`
+
 The first version also called a grant with no window and no row on a current list `not_today`: that
 turned trial mode into enforce for exactly the members the trial counts — e.g. a renewal whose stored
 credential grants are stale and whose row has no `mainAccountId` (review round 2, reproduced against
@@ -4233,6 +4237,69 @@ none; the flat battery logged `CLOCK_SUSPECT reason=behind` and the fix `CLOCK_O
 failed. `[TEST: same harness, 2026-09-19]` Re-run on the final branch head `5094150` after six
 review rounds (2026-09-26): 58 checks, 0 failed. `[TEST: same harness]`
 
+### Off-hours hold (1.4.38)
+
+`offHours` is optional on protocol-2 membership windows (`day`, `startMinute`,
+`durationMinutes`); `windowsVersion` already digests it. It is stored as `off_hours_json`
+on `member_access_window` / `sync_upcoming_users`. Bad entries are ignored without
+invalidating dates. `[CODE: access_dates.parse_window, db._window_columns]`
+
+`db.apply_off_hours` copies complete rows, fingerprints included, between `sync_users`
+and `sync_users_held` with reason `off_hours`. `off_hours_hold` preserves intent across
+full/delta roster saves; logout and fast patches forget it. Date flips exclude off-hours
+rows; release evaluates dates again and transfers expired/frozen/not-started rows to the
+date hold instead of restoring them. `[CODE: db.apply_off_hours, db._forget_protocol2_membership]`
+`[TEST: tests/test_off_hours_db.py]`
+
+Startup and every save-triggered date pass apply hours before dispatch. A separate
+60 s tick does one read-only presence query when no hours or intent exist; it makes no
+date write then. With hours it uses the stored gym UTC offset, holds at the start and
+releases five minutes before the end, including midnight/week wrap. Scheduling precision
+is up to 60 s, plus device apply latency. `[CODE: MainApp._off_hours_tick, off_hours.held]`
+`[UNVERIFIED: real sleep/resume timing and device latency; owner measured about three minutes
+for 300 members, not re-measured here]`
+
+The ULTRA hours request uses only held/released membership ids, also in manual sync mode.
+Workers keep replaceable off-hours commands, drain one at a time over their existing single
+connection, re-check the local row, and retry a failed command after 60 s. A release replaces
+a queued hold and follows an active hold. A worker-side failure never escalates this request
+to a full pass; unavailable workers leave app pending ids for the next tick. Ownership,
+device plan filters, ACCOUNT collapse and leases still apply. An open eligible membership
+keeps the person's ACCOUNT pin. `[CODE: off_hours_push.dispatch_off_hours,
+UltraDeviceWorker.request_off_hours, ::_drain_off_hours_commands, ::request_full_sync]`
+`[TEST: tests/test_off_hours_app_wiring.py, tests/test_off_hours_removal_bound.py]`
+
+Full standalone revoke and PullSDK stale steps split exactly the known held pins from
+unplanned removals. Only unplanned removals count towards the ceiling, against desired
+roster plus planned removals; only the unplanned set can match a Confirm-removal approval.
+Planned-only removals still obey leases. A failed held-pin lookup grants no exemption.
+An all-held owned roster can be removed without treating it as an accidental empty build.
+`[CODE: off_hours.held_pins_for_device, push_safety.check_bulk_removal]`
+`[TEST: tests/test_off_hours_removal_bound.py]`
+
+No trust, missing offset, suspect clock or unreadable window inputs releases off-hours
+rows and creates no new hold. An unreadable presence check schedules the release pass;
+input exceptions do not make the date dispatcher fail. A wholly inaccessible database
+cannot be repaired or replayed until it can be read/written again. `[CODE: db.apply_off_hours,
+db.off_hours_in_play, MainApp._apply_off_hours_db]` `[TEST: tests/test_off_hours_db.py]`
+
+QR uses the exact closure, with no five-minute lead, and refuses with `OFF_HOURS` in trial
+and enforce modes when all date-valid grants are closed. Unknown/no-hours grants remain
+open; untrusted snapshots, missing offset, suspect clock and exceptions add no hours
+refusal. Date-invalid memberships retain the date reason; existing no-hours order stays
+unchanged. Resilient verification does not retry a matched `OFF_HOURS`. Popup, dashboard,
+realtime and member history share « Hors horaires de votre formule ». `[CODE:
+access_dates.qr_off_hours_refused, access_verification.verify_totp, PopupWindow.A_DENY]`
+`[TEST: tests/test_off_hours_qr.py]`
+
+DEVICE-mode PullSDK panels receive no targeted hours command: the next ordinary sync
+applies their stale removals. A process restart after local release but before delivery
+loses the in-memory release command; normal startup full sync repairs it, while manual
+mode needs the operator's next “Sync data”. Real hardware, actual DEVICE-mode gyms and
+operator-visible skip noise across multiple devices remain unverified. `[CODE:
+off_hours_push.still_on_devices, UltraEngine.request_sync_now]` `[UNVERIFIED: hardware,
+fleet use and operator noise; no device or real app run for A1]`
+
 ### 3.9 Driver leases, remote commands, the notice socket (P3b-2, 2026-09-26)
 
 **The contract** is backend `main` `c7d4b532` (read-only here; plans `docs/plans/2026-09-18-p2b-realtime-commands.md`,
@@ -5957,6 +6024,8 @@ test_totp_roster_check.py::test_record_counts_one_scan_and_logs_no_member_identi
 |---|---|---|
 | `DATE_FLIP` | `app.py::_apply_date_flips` | `source gym_date applied_before held restored promoted moved starters reasons trusted skipped ultra dur_ms` — one per flip that moved rows, and always one at start-up (with `skipped=no_state|untrusted|no_gym_date` when nothing could move). `reasons` = `hold reason:count,…`; `ultra` = a running ULTRA engine was asked for a full pass (§3.8) |
 | `DATE_FLIP_FAILED` (warn) | `app.py::_apply_date_flips` | `source err` — the flip raised; nothing was applied, the next trigger retries |
+| `OFF_HOURS` | `app.py::_apply_off_hours_db` | `source held released retry dur_ms` — off-hours rows or intent moved; targeted dispatch follows `[CODE]` |
+| `OFF_HOURS_FAILED` (warn) | `app.py::_apply_off_hours_db`, `::_dispatch_off_hours` | `source err` — a pass or enqueue failed; no full-sync fallback `[CODE]` |
 | `CLOCK_SUSPECT` (warn) | `app.py::_apply_date_flips` | `reason gym_date pc_date` — the clock verdict turned suspect (`reason=behind|ahead`, §3.8) |
 | `CLOCK_OK` | `app.py::_apply_date_flips` | `gym_date` — the verdict turned back to normal |
 | `SYNC_V2_REJECTED` (warn) | `db.py::_apply_protocol2_save` | `reason` — a malformed protocol-2 part; the windows stop being trusted until the next good v2 answer (§3.8) |

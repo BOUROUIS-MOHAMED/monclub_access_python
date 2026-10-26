@@ -445,11 +445,14 @@ def _state(applied, trusted=1):
 
 
 def _window(am, frm, until):
-    _exec("INSERT INTO member_access_window VALUES (?, ?, ?, '[]', 0)", (am, frm, until))
+    _exec("INSERT INTO member_access_window (active_membership_id, access_from, access_until, "
+          "off_days_json, off_days_beyond_horizon) VALUES (?, ?, ?, '[]', 0)", (am, frm, until))
 
 
 def _upcoming(am, frm, qr_account):
-    _exec("INSERT INTO sync_upcoming_users VALUES (?, '{}', ?, '2026-10-19', '[]', 0, ?)",
+    _exec("INSERT INTO sync_upcoming_users (active_membership_id, payload_json, access_from, access_until, "
+          "off_days_json, off_days_beyond_horizon, qr_account_id) "
+          "VALUES (?, '{}', ?, '2026-10-19', '[]', 0, ?)",
           (am, frm, qr_account))
 
 

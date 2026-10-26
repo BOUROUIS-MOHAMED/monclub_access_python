@@ -72,3 +72,9 @@ def test_resilient_does_not_retry_and_card_decision_preserves_reason():
     assert verify.call_count == 1 and result["reason"] == "OFF_HOURS"
     verdict = decide_qr(totp_result=result, settings={}, users_by_am={}, staff_ids=(), guard=None, now=1)
     assert not verdict.allowed and verdict.reason == "OFF_HOURS"
+
+
+def test_listed_but_expired_membership_keeps_date_priority():
+    snap = snapshot()
+    snap = replace(snap, windows={1: replace(snap.windows[1], access_until=date(2026, 10, 25))})
+    assert check(snap=snap, mode="enforce", users={1: _user(1)})["reason"] == "DENY_NOT_ALLOWED_TODAY"

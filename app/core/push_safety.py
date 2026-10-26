@@ -121,9 +121,9 @@ def check_bulk_removal(
             pass
         logger.warning(
             "REMOVAL_DEFERRED device=%s path=%s: %d pin(s) kept -- %s (driver lease); "
-            "retried once the turnstile's record is trusted.", device_id, path, n, blocked,
+            "retried once the turnstile's record is trusted.", device_id, path, physical_count, blocked,
         )
-        return RemovalVerdict(False, n, roster, ceiling, blocked)
+        return RemovalVerdict(False, physical_count, roster, ceiling, blocked)
     if n <= 0:
         _problems.registry.removal_allowed(device_id, path)
         return RemovalVerdict(True, 0, roster, ceiling, "")

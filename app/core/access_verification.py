@@ -872,9 +872,7 @@ def verify_totp(
         from app.core.access_dates import qr_off_hours_refused, _grant_ids as _grant_ids_for_hours
         _snap = access_days_index if (used_index and access_days_index is not None) else access_days
         _hours_reason = None
-        if qr_off_hours_refused(_snap, grants=grants, users_by_am=users_by_am, now_epoch=now):
-            _hours_reason = "OFF_HOURS"
-        elif _snap is not None and any(
+        if _snap is not None and any(
                 getattr(_snap.windows.get(am), "off_hours", ()) for am in _grant_ids_for_hours(grants)):
             # Preserve the date reason for an expired/frozen plan carrying hours, even
             # when the held row is absent from an enforced roster. No-hours order is unchanged.
@@ -882,6 +880,8 @@ def verify_totp(
                                account_on_roster=(roster_check == ROSTER_IN_BY_ACCOUNT),
                                roster_current=(roster_current or not used_index)) == DATE_NOT_TODAY:
                 _hours_reason = "DENY_NOT_ALLOWED_TODAY"
+            elif qr_off_hours_refused(_snap, grants=grants, users_by_am=users_by_am, now_epoch=now):
+                _hours_reason = "OFF_HOURS"
         if _hours_reason:
             return {"allowed": False, "reason": _hours_reason, "scanMode": "QR_TOTP",
                     "accountId": account_id, "credId": cred_id, "matchedCounter": matched_ctr,

@@ -1420,6 +1420,66 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             self._wake_evt.set()
         return True
 
+    def request_off_hours(self, *, held_ids, released_ids) -> bool:
+        """Replace pending planned work without claiming authoritative revocation ownership."""
+        with self._member_sync_lock:
+            pending = getattr(self, "_off_hours_commands", None)
+            if pending is None:
+                pending = self._off_hours_commands = {}
+            for am in released_ids:
+                pending[int(am)] = (False, 0.0)
+            for am in held_ids:
+                pending[int(am)] = (True, 0.0)
+        self._wake_evt.set()
+        return True
+
+    def _drain_off_hours_commands(self) -> int:
+        if self._sdk is None or not self._connected:
+            return 0
+        with self._member_sync_lock:
+            pending = getattr(self, "_off_hours_commands", {})
+            ready = next(((am, command) for am, command in pending.items()
+                          if command[1] <= time.monotonic()), None)
+            if ready is None:
+                return 0
+            am, (hold, _) = ready
+            del pending[am]
+        ok = False
+        try:
+            from app.core import db
+            # A queued hold must never outlive the local decision (release, fast patch,
+            # logout). A queued release must not restore a row now held by dates.
+            if hold:
+                wanted = any(int(r["activeMembershipId"]) == am for r in db.list_off_hours_held_rows())
+            else:
+                wanted = bool(db.list_sync_users_by_active_membership_ids({am}))
+            if not wanted:
+                ok = True
+            else:
+                self._off_hours_executing_thread = threading.get_ident()
+                if getattr(self._sdk, "owns_event_source", False):
+                    ok = (self._run_standalone_member_revoke(am) if hold
+                          else bool(self._run_standalone_member_sync(am)))
+                else:
+                    from app.core.device_sync import DeviceSyncEngine
+                    raw = getattr(self._sdk, "_sdk", None)
+                    if raw is not None:
+                        engine = DeviceSyncEngine(cfg=self._cfg or SimpleNamespace(), logger=logger)
+                        engine._door_yield_cb = self._sync_yield_to_doors
+                        engine._rtlog_yield_cb = self._sync_yield_to_rtlog
+                        ok = engine.sync_member_on_connected_sdk(sdk=raw, device=self._device,
+                            member_id=am, source="off_hours", revocation=hold)
+                        ok = bool(ok or (hold and _revoke_skipped_not_owned(engine)))
+        except Exception:
+            logger.warning("%s off-hours member command failed: %s", self._prefix, am, exc_info=True)
+        finally:
+            self._off_hours_executing_thread = None
+        if not ok:
+            with self._member_sync_lock:
+                # A newer opposite command wins while this one was executing.
+                self._off_hours_commands.setdefault(am, (hold, time.monotonic() + 60))
+        return 1
+
     def request_member_revoke(self, member_id: int) -> bool:
         normalized_member_id = int(member_id)
         with self._member_sync_lock:
@@ -1626,6 +1686,8 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         full_reconcile: bool = False,
         sync_run_ids: set[int] | None = None,
     ) -> bool:
+        if getattr(self, "_off_hours_executing_thread", None) == threading.get_ident():
+            return False
         normalized_reason = str(reason or "manual").strip() or "manual"
         normalized_full_reconcile = bool(full_reconcile)
         # The sync runs (sync_run_history ids) whose request this is: metadata only, carried
@@ -2023,6 +2085,9 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             # the rescues keep running until then.
             return 0
 
+        off_drained = self._drain_off_hours_commands()
+        if off_drained:
+            return off_drained
         drained = 0
         while drained < limit:
             if (getattr(self._sdk, "owns_event_source", False)
@@ -4475,7 +4540,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         except Exception:
             logger.debug("%s could not flag pin %s for retry", self._prefix, pin, exc_info=True)
 
-    def _run_standalone_member_sync(self, member_id: int) -> None:
+    def _run_standalone_member_sync(self, member_id: int) -> bool | None:
         """Targeted single-member push for a push driver. Failure logs + telemetry
         (no endless re-queue — the periodic full sync is the safety net)."""
         _tel.set_state(self._tel_wid, "member_sync", f"member={member_id}")
@@ -4590,6 +4655,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                 # grace window: mark these pins as just-pushed so a MIRROR full sync
                 # racing this enroll/change can't delete them before the roster catches up.
                 self._note_recent_pushes(u.get("pin") for u in users)
+            return bool(result.get("ok") and not cap_withheld)
         except Exception as exc:
             logger.warning("%s standalone member sync failed: member_id=%s err=%s",
                            self._prefix, member_id, exc)
@@ -8756,7 +8822,10 @@ class UltraEngine:
                 # reconcile is about the ones the terminal still holds and the roster
                 # no longer names. Targeted member syncs can never see those, so an
                 # operator's reconcile always takes the full-sync route.
-                if normalized_changed_ids is None or normalized_full_reconcile:
+                if reason == "off_hours":
+                    commands_handled = bool(worker.request_off_hours(
+                        held_ids=normalized_revoked_ids, released_ids=normalized_changed_ids or set()))
+                elif normalized_changed_ids is None or normalized_full_reconcile:
                     commands_handled = (
                         _worker_full_sync_accepted_or_pending(
                             worker,

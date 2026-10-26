@@ -2071,7 +2071,7 @@ def apply_local_date_flips(*, pc_now_epoch: float, grace_days: int, source: str)
     if out.get("moved"):
         bump_local_state_generation()
         invalidate_sync_cache()
-    elif out.get("trusted") and out.get("gym_date") != out.get("applied_before"):
+    elif out.get("clock_changed") or (out.get("trusted") and out.get("gym_date") != out.get("applied_before")):
         # The applied day moved with no row: the QR date snapshot (cached per generation,
         # access_verification.current_access_days) must still see the new day. (Untrusted,
         # the snapshot checks nothing, so its day does not matter.)
@@ -2080,7 +2080,7 @@ def apply_local_date_flips(*, pc_now_epoch: float, grace_days: int, source: str)
     return out
 
 
-def apply_off_hours(*, pc_now_epoch: float, source: str) -> Dict[str, Any]:
+def apply_off_hours(*, pc_now_epoch: float, source: str, force_release: bool = False) -> Dict[str, Any]:
     """Apply closures in one writer job; a failed input read releases off-hours holds."""
     from app.core import access_dates as ad, off_hours as oh
 
@@ -2153,17 +2153,22 @@ def apply_off_hours(*, pc_now_epoch: float, source: str) -> Dict[str, Any]:
                 to_date.add(am)
         if restored:
             _refresh_member_account_links(cur)
-        cur.executemany("DELETE FROM off_hours_hold WHERE active_membership_id = ?",
-                        [(am,) for am in (intent | off_ids) - plan.target])
-        cur.executemany("INSERT OR IGNORE INTO off_hours_hold (active_membership_id, held_at) VALUES (?, ?)",
-                        [(am, now_iso()) for am in plan.target - intent])
+        try:
+            cur.executemany("DELETE FROM off_hours_hold WHERE active_membership_id = ?",
+                            [(am,) for am in (intent | off_ids) - plan.target])
+            cur.executemany("INSERT OR IGNORE INTO off_hours_hold (active_membership_id, held_at) VALUES (?, ?)",
+                            [(am, now_iso()) for am in plan.target - intent])
+        except sqlite3.OperationalError:
+            if plan.active:
+                raise
+            # A missing intent table must not roll back the fail-open restores.
         return {"active": plan.active, "newly_held": sorted(plan.target - intent),
                 "released": sorted(released), "released_to_date": sorted(to_date),
                 "retry": sorted(plan.target & intent), "moved": moved,
                 "intent_changed": intent != set(plan.target), "skipped": skipped}
 
     try:
-        out = _run_db_write_sync("apply_off_hours", _write)
+        out = _run_db_write_sync("apply_off_hours", lambda c, p: _write(c, p, force_release))
     except Exception:
         # The failed transaction rolls back. Do not leave an existing hold on an input error.
         out = _run_db_write_sync("release_off_hours", lambda c, p: _write(c, p, True))

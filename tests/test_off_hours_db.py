@@ -4,7 +4,7 @@ from datetime import datetime
 import pytest
 
 from app.core import db as dbmod
-from test_protocol2_save_and_flip import db, _q, _exec, _ids, _user_row, MEMBERS_ONLY
+from tests.test_protocol2_save_and_flip import db, _q, _exec, _ids, _user_row, MEMBERS_ONLY
 
 HOURS = [{"day": "MON", "startMinute": 1320, "durationMinutes": 480}]
 
@@ -103,14 +103,16 @@ def test_full_and_delta_saves_rehold_using_existing_intent(db):
 @pytest.mark.parametrize("sql", ["UPDATE access_v2_state SET trusted=0",
                                       "UPDATE access_v2_state SET clock_suspect=1",
                                       "UPDATE access_v2_state SET utc_offset_sec=NULL",
-                                      "DROP TABLE member_access_window"])
+                                      "DROP TABLE member_access_window", "DROP TABLE off_hours_hold"])
 def test_uncertain_input_releases_every_off_hours_hold(db, sql):
     seed(db)
     hold(db)
     _exec(sql)
     out = hold(db)
     assert not out["active"] and out["released"] == [1]
-    assert _ids("sync_users") == {1} and not _ids("off_hours_hold")
+    assert _ids("sync_users") == {1} and not _ids("sync_users_held")
+    if "off_hours_hold" not in sql:
+        assert not _ids("off_hours_hold")
 
 
 def test_fast_patch_forgets_hours_and_intent(db):
@@ -118,3 +120,11 @@ def test_fast_patch_forgets_hours_and_intent(db):
     hold(db)
     db._run_db_write_sync("test", lambda c, p: db._forget_protocol2_membership(c.cursor(), 1))
     assert not _ids("off_hours_hold") and not _ids("sync_users_held")
+
+
+def test_explicit_fail_open_releases_despite_a_closed_window(db):
+    seed(db)
+    hold(db)
+    out = db.apply_off_hours(pc_now_epoch=epoch("2026-10-26T23:00:00"), source="read_error", force_release=True)
+    assert out["released"] == [1] and not out["active"]
+    assert _ids("sync_users") == {1} and not _ids("off_hours_hold")

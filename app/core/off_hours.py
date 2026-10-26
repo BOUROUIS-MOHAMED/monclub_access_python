@@ -109,10 +109,19 @@ def held_pins_for_device(device) -> set[str]:
             return set()
         scheme = device_pin_scheme(device)
         pins = {derive_member_pin(r, scheme)[0] for r in rows}
-        live = {derive_member_pin(r, scheme)[0] for r in db.list_sync_users()}
+        live = live_pins_for_device(device, db.list_sync_users())
         return {p for p in pins - live if p and p.isdigit()}
     except Exception:
         return set()
+
+
+def live_pins_for_device(device, rows):
+    from app.core.device_sync import derive_member_pin, device_pin_scheme
+    # Same plan eligibility and pin derivation as _filter_users_for_device.
+    allowed = {int(x) for x in (device.get("allowedMemberships") or [])}
+    scheme = device_pin_scheme(device)
+    return {derive_member_pin(r, scheme)[0] for r in rows
+            if not allowed or (r.get("membershipId") is not None and int(r["membershipId"]) in allowed)}
 
 
 def split_removals(pins, held_pins):
