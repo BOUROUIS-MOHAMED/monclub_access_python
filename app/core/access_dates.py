@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
+from app.core import off_hours
+
 # A PC clock reading more than this BEHIND the latest trustworthy time it has seen (the last
 # server time, or the highest PC time seen since) is suspect. Policy: absorbs ordinary NTP
 # corrections and the PC/server skew of a normal clock; a flat CMOS battery is years behind.
@@ -57,6 +59,7 @@ class AccessWindow:
     access_until: date
     off_days: frozenset = frozenset()
     off_days_beyond_horizon: bool = False
+    off_hours: tuple = ()
 
 
 def parse_window(obj: Mapping[str, Any]) -> Optional[AccessWindow]:
@@ -82,7 +85,8 @@ def parse_window(obj: Mapping[str, Any]) -> Optional[AccessWindow]:
         if d is None:
             return None
         off.add(d)
-    return AccessWindow(frm, until, frozenset(off), obj.get("offDaysBeyondHorizon") is True)
+    return AccessWindow(frm, until, frozenset(off), obj.get("offDaysBeyondHorizon") is True,
+                        off_hours.parse_windows(obj.get("offHours")))
 
 
 def window_status(
@@ -434,6 +438,8 @@ class AccessDaysSnapshot:
     # activeMembershipId -> userId (member_person_link) of the windowed memberships: the person
     # second chance of qr_date_verdict (review R4).
     person_of: Mapping[int, int] = field(default_factory=dict)
+    utc_offset_sec: Optional[int] = None
+    clock_suspect: bool = False
 
     @property
     def active(self) -> bool:

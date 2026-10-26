@@ -1314,7 +1314,8 @@ def _create_protocol2_tables(conn: sqlite3.Connection) -> None:
             access_from             TEXT    NOT NULL,
             access_until            TEXT    NOT NULL,
             off_days_json           TEXT    NOT NULL DEFAULT '[]',
-            off_days_beyond_horizon INTEGER NOT NULL DEFAULT 0
+            off_days_beyond_horizon INTEGER NOT NULL DEFAULT 0,
+            off_hours_json TEXT
         );
         """
     )
@@ -1327,7 +1328,8 @@ def _create_protocol2_tables(conn: sqlite3.Connection) -> None:
             access_until            TEXT    NOT NULL,
             off_days_json           TEXT    NOT NULL DEFAULT '[]',
             off_days_beyond_horizon INTEGER NOT NULL DEFAULT 0,
-            qr_account_id           INTEGER
+            qr_account_id           INTEGER,
+            off_hours_json          TEXT
         );
         """
     )
@@ -1375,6 +1377,10 @@ def _create_protocol2_tables(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    _ensure_column(conn, "member_access_window", "off_hours_json", "off_hours_json TEXT")
+    _ensure_column(conn, "sync_upcoming_users", "off_hours_json", "off_hours_json TEXT")
+    conn.execute("CREATE TABLE IF NOT EXISTS off_hours_hold "
+                 "(active_membership_id INTEGER PRIMARY KEY, held_at TEXT NOT NULL)")
     # Member fees F3c: _SYNC_USER_COLUMNS gained fees_json and a hold or a restore copies column
     # for column, so the held copy carries it too (guide §3.12).
     _ensure_column(conn, "sync_users_held", "fees_json", "fees_json TEXT")
@@ -1429,14 +1435,16 @@ def clock_state_from_row(row: Mapping[str, Any]):
     )
 
 
-def _window_from_columns(access_from, access_until, off_days_json, beyond):
+def _window_from_columns(access_from, access_until, off_days_json, beyond, off_hours_json=None):
     from app.core import access_dates as _ad
+    from app.core import off_hours as _oh
     try:
         off = json.loads(off_days_json or "[]")
     except Exception:
         return None
     return _ad.parse_window({"accessFrom": access_from, "accessUntil": access_until,
-                             "offDays": off, "offDaysBeyondHorizon": bool(beyond)})
+                             "offDays": off, "offDaysBeyondHorizon": bool(beyond),
+                             "offHours": json.loads(_oh.encode_windows(_oh.decode_windows(off_hours_json)) or "[]")})
 
 
 def _read_protocol2_windows(conn: Any) -> tuple[Dict[int, Any], Dict[int, Any], Dict[int, int]]:
@@ -1444,18 +1452,18 @@ def _read_protocol2_windows(conn: Any) -> tuple[Dict[int, Any], Dict[int, Any], 
     today: Dict[int, Any] = {}
     for r in conn.execute(
         "SELECT active_membership_id, access_from, access_until, off_days_json, "
-        "off_days_beyond_horizon FROM member_access_window"
+        "off_days_beyond_horizon, off_hours_json FROM member_access_window"
     ).fetchall():
-        w = _window_from_columns(r[1], r[2], r[3], r[4])
+        w = _window_from_columns(r[1], r[2], r[3], r[4], r[5])
         if w is not None:
             today[int(r[0])] = w
     upcoming: Dict[int, Any] = {}
     qr: Dict[int, int] = {}
     for r in conn.execute(
         "SELECT active_membership_id, access_from, access_until, off_days_json, "
-        "off_days_beyond_horizon, qr_account_id FROM sync_upcoming_users"
+        "off_days_beyond_horizon, qr_account_id, off_hours_json FROM sync_upcoming_users"
     ).fetchall():
-        w = _window_from_columns(r[1], r[2], r[3], r[4])
+        w = _window_from_columns(r[1], r[2], r[3], r[4], r[6])
         if w is not None:
             upcoming[int(r[0])] = w
             if r[5] is not None:
@@ -1508,6 +1516,8 @@ def load_access_days_snapshot():
         windows=windows,
         upcoming_qr_account=qr,
         person_of=person_of,
+        utc_offset_sec=clock_state_from_row(state).utc_offset_sec,
+        clock_suspect=bool(state.get("clock_suspect")),
     )
 
 
@@ -1601,12 +1611,14 @@ def _client_received_epoch(data: Any) -> float:
 
 
 def _window_columns(w: Any) -> tuple:
-    """(access_from, access_until, off_days_json, off_days_beyond_horizon) of an AccessWindow."""
+    """Date columns followed by the optional weekly closures of an AccessWindow."""
+    from app.core import off_hours as _oh
     return (
         w.access_from.isoformat(),
         w.access_until.isoformat(),
         json.dumps(sorted(d.isoformat() for d in w.off_days)),
         1 if w.off_days_beyond_horizon else 0,
+        _oh.encode_windows(w.off_hours),
     )
 
 
@@ -1638,8 +1650,8 @@ def _replace_member_access_windows(cur: Any, windows: Mapping[int, Any]) -> None
             """
             INSERT INTO member_access_window (
                 active_membership_id, access_from, access_until, off_days_json,
-                off_days_beyond_horizon
-            ) VALUES (?, ?, ?, ?, ?)
+                off_days_beyond_horizon, off_hours_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             [(int(am),) + _window_columns(w) for am, w in windows.items()],
         )
@@ -1671,8 +1683,8 @@ def _replace_sync_upcoming(cur: Any, p: Any) -> None:
             """
             INSERT INTO sync_upcoming_users (
                 active_membership_id, payload_json, access_from, access_until,
-                off_days_json, off_days_beyond_horizon, qr_account_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                off_days_json, off_days_beyond_horizon, off_hours_json, qr_account_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -1982,7 +1994,7 @@ def apply_local_date_flips(*, pc_now_epoch: float, grace_days: int, source: str)
             "SELECT active_membership_id FROM sync_users WHERE active_membership_id IS NOT NULL"
         ).fetchall()]
         held_ids = [int(r[0]) for r in cur.execute(
-            "SELECT active_membership_id FROM sync_users_held"
+            "SELECT active_membership_id FROM sync_users_held WHERE COALESCE(held_reason,'') <> 'off_hours'"
         ).fetchall()]
         today_windows, upcoming_windows, _qr = _read_protocol2_windows(conn)
         plan = _ad.plan_flip(
@@ -2066,6 +2078,120 @@ def apply_local_date_flips(*, pc_now_epoch: float, grace_days: int, source: str)
         # [TEST: tests/test_p3b1_integration_fixes.py::test_a_flip_that_only_advances_the_date_bumps_the_generation]
         bump_local_state_generation()
     return out
+
+
+def apply_off_hours(*, pc_now_epoch: float, source: str) -> Dict[str, Any]:
+    """Apply closures in one writer job; a failed input read releases off-hours holds."""
+    from app.core import access_dates as ad, off_hours as oh
+
+    def _write(conn, profile, force_release=False):
+        profile["off_hours_source"] = source
+        cur = conn.cursor()
+        held_rows = {int(r[0]): r[1] for r in cur.execute(
+            "SELECT active_membership_id, held_reason FROM sync_users_held").fetchall()}
+        on_roster = {int(r[0]) for r in cur.execute(
+            "SELECT active_membership_id FROM sync_users WHERE active_membership_id IS NOT NULL").fetchall()}
+        state, windows, intent = {}, {}, set()
+        skipped = "failed_input" if force_release else None
+        try:
+            intent = {int(r[0]) for r in cur.execute("SELECT active_membership_id FROM off_hours_hold")}
+            if not force_release:
+                row = cur.execute("SELECT * FROM access_v2_state WHERE id=1").fetchone()
+                state = dict(row) if row else {}
+                today, upcoming, _ = _read_protocol2_windows(conn)
+                windows = {**upcoming, **today}
+                # Re-evaluate the clock even when called independently of the date pass.
+                suspect = ad.evaluate_gym_date(clock_state_from_row(state), float(pc_now_epoch)).suspect
+                force_release = bool(suspect)
+        except Exception:
+            force_release = True
+            skipped = "failed_input"
+        off_ids = {am for am, reason in held_rows.items() if reason == "off_hours"}
+        plan = oh.plan_off_hours(
+            now_epoch=pc_now_epoch, utc_offset_sec=state.get("utc_offset_sec"),
+            trusted=bool(state.get("trusted")) and not force_release,
+            clock_suspect=bool(state.get("clock_suspect")),
+            windows_by_am={am: w.off_hours for am, w in windows.items()},
+            known_ids=on_roster | set(held_rows), intent_ids=intent | off_ids)
+        cols = ", ".join(_SYNC_USER_COLUMNS)
+        moved = 0
+        for am in plan.target & on_roster:
+            cur.execute(
+                f"INSERT OR REPLACE INTO sync_users_held ({cols}, held_reason, held_for_date, held_at) "
+                f"SELECT {cols}, 'off_hours', ?, ? FROM sync_users WHERE active_membership_id = ?",
+                (state.get("applied_date"), now_iso(), am))
+            cur.execute("DELETE FROM sync_users WHERE active_membership_id = ?", (am,))
+            moved += 1
+        released, to_date = set(plan.released), set()
+        applied = ad.parse_iso_date(state.get("applied_date"))
+        restored = False
+        for am in off_ids - plan.target:
+            status = "ok"
+            # Uncertain inputs must release, irrespective of a stale date window.
+            if plan.active and applied is not None and am in windows:
+                status = ad.window_status(windows[am], applied,
+                    horizon_end=ad.parse_iso_date(state.get("horizon_end")),
+                    server_today=ad.parse_iso_date(state.get("server_today")),
+                    grace_days=state.get("grace_days") or 0)
+            if status in ad.DELIVERABLE_STATUSES:
+                cur.execute(
+                    f"INSERT INTO sync_users ({cols}) SELECT {cols} FROM sync_users_held "
+                    "WHERE active_membership_id = ? AND NOT EXISTS "
+                    "(SELECT 1 FROM sync_users WHERE active_membership_id = ?)", (am, am))
+                cur.execute("DELETE FROM sync_users_held WHERE active_membership_id = ?", (am,))
+                restored = True
+            else:
+                cur.execute("UPDATE sync_users_held SET held_reason = ?, held_for_date = ? "
+                            "WHERE active_membership_id = ?", (status, applied.isoformat(), am))
+                to_date.add(am)
+                released.discard(am)
+            moved += 1
+        # A date-held row leaving the intent remains under date ownership.
+        for am in released.copy():
+            if am in held_rows and held_rows[am] != "off_hours":
+                released.discard(am)
+                to_date.add(am)
+        if restored:
+            _refresh_member_account_links(cur)
+        cur.executemany("DELETE FROM off_hours_hold WHERE active_membership_id = ?",
+                        [(am,) for am in (intent | off_ids) - plan.target])
+        cur.executemany("INSERT OR IGNORE INTO off_hours_hold (active_membership_id, held_at) VALUES (?, ?)",
+                        [(am, now_iso()) for am in plan.target - intent])
+        return {"active": plan.active, "newly_held": sorted(plan.target - intent),
+                "released": sorted(released), "released_to_date": sorted(to_date),
+                "retry": sorted(plan.target & intent), "moved": moved,
+                "intent_changed": intent != set(plan.target), "skipped": skipped}
+
+    try:
+        out = _run_db_write_sync("apply_off_hours", _write)
+    except Exception:
+        # The failed transaction rolls back. Do not leave an existing hold on an input error.
+        out = _run_db_write_sync("release_off_hours", lambda c, p: _write(c, p, True))
+    if out.get("moved") or out.get("intent_changed"):
+        bump_local_state_generation()
+        invalidate_sync_cache()
+    return out
+
+
+def off_hours_in_play() -> bool:
+    try:
+        with get_conn() as conn:
+            return conn.execute(
+                "SELECT 1 FROM member_access_window WHERE off_hours_json IS NOT NULL "
+                "UNION ALL SELECT 1 FROM sync_upcoming_users WHERE off_hours_json IS NOT NULL "
+                "UNION ALL SELECT 1 FROM off_hours_hold LIMIT 1").fetchone() is not None
+    except Exception:
+        # An unreadable input still needs the release pass.
+        return True
+
+
+def list_off_hours_held_rows() -> List[Dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT h.* FROM sync_users_held h WHERE h.held_reason = 'off_hours' "
+            "OR EXISTS (SELECT 1 FROM off_hours_hold i WHERE i.active_membership_id = h.active_membership_id)"
+        ).fetchall()
+    return [_coerce_user_row_to_payload(dict(r)) for r in rows]
 
 
 def gym_date_status(*, pc_now_epoch: float) -> Dict[str, Any]:
@@ -5235,6 +5361,7 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
             # trusted; the clock columns of access_v2_state (the floor) are kept.
             cur.execute("DELETE FROM sync_users_held")
             cur.execute("DELETE FROM member_access_window")
+            cur.execute("DELETE FROM off_hours_hold")
             cur.execute("DELETE FROM sync_upcoming_users")
             cur.execute("DELETE FROM sync_upcoming_credentials")
             cur.execute(
@@ -6061,7 +6188,7 @@ def _forget_protocol2_membership(cur: sqlite3.Cursor, active_membership_id: Opti
     if active_membership_id is None:
         return False
     dropped = 0
-    for table in ("member_access_window", "sync_upcoming_users", "sync_users_held"):
+    for table in ("member_access_window", "sync_upcoming_users", "sync_users_held", "off_hours_hold"):
         try:
             dropped += cur.execute(
                 f"DELETE FROM {table} WHERE active_membership_id = ?", (active_membership_id,)
