@@ -96,13 +96,14 @@ def check_bulk_removal(
 ) -> RemovalVerdict:
     """Decide whether one removal step may run; report a refusal.
 
-    ``count`` is how many device users the step would remove, ``roster_count`` the
+    ``count`` is the number of unplanned removals, ``roster_count`` the REAL
     size of the DESIRED roster for this device (after its filters), ``path`` names
     the step (``standalone_revoke``, ``stale``, ``table_clear``...).
 
     Nothing to remove is always allowed. An empty desired roster refuses any removal:
     a failed or half-built roster must never read as "everyone left". Above the
     ceiling (strictly greater, as the standalone rule always was) is refused.
+    ``planned_count`` contributes only to the lease gate, never the roster or ceiling.
     """
     n = max(0, int(count or 0))
     roster = max(0, int(roster_count or 0))

@@ -1977,10 +1977,11 @@ stale-pin delete (`path=stale`) and the PullSDK `FULL_REPLACE` table clear (`pat
 counted as every row on the panel, because `DeleteDeviceData(table, "", "")` deletes them all,
 foreign users included). The ceiling is the standalone revoke pass's own rule,
 `max(REVOKE_ABSOLUTE_FLOOR=10, desired_roster × MAX_DELETE_FRACTION=0.25)`, strictly greater is
-refused; an empty desired roster refuses any removal. `[CODE: app/core/push_safety.py]`
+refused; an empty REAL desired roster refuses every unplanned removal. Planned off-hours
+pins never inflate that roster or its ceiling. `[CODE: app/core/push_safety.py]`
 `[TEST: test_push_safety_foundation.py::TestRemovalCeiling]`
 
-**Refused = `REVOKE_ABORTED`, retryable, never final.** Nothing is removed, the per-pin state is
+**Refused = `REVOKE_ABORTED`, retryable, never final.** No refused unplanned pin is removed; its per-pin state is
 kept (the prune is skipped on both paths, so the kept pins stay reachable — the §3.2c invariant),
 `[T] REVOKE_ABORTED device_id protocol path count roster ceiling reason sample` is emitted and the
 push-batch row carries `REVOKE_ABORTED=n (...)` in `error_message` (`/api/v2/push-history`). The
@@ -1988,6 +1989,15 @@ rest of the pass — the push of new/changed members, the door-parameter writes 
 the pass is not failed by it. An explicit revocation that needed the refused step stays
 unconfirmed (retried), exactly as before. It is deliberately NOT `SKIPPED_NOT_OWNED` (final): an
 abort that finalised a revocation would silently drop it. `[TEST: test_removal_ceiling_pullsdk.py]`
+
+Off-hours removals are an independent exact set: if the real desired roster is empty, or
+unplanned removals exceed its original ceiling, only planned pins may still be removed.
+An empty standalone roster still logs `REVOKE_SKIP_EMPTY_ROSTER`. `planned_count` is used
+only to keep the lease gate active, including planned-only removals; a blocked lease
+permits neither set. `[CODE: UltraDeviceWorker._neutralise_revoked_pins,
+DeviceSyncEngine._sync_one_device, push_safety.check_bulk_removal]`
+`[TEST: tests/test_off_hours_removal_bound.py::test_standalone_exact_hold_bound,
+::test_pullsdk_exact_hold_bound]`
 
 **Why the INCREMENTAL wipe is simply gone.** Its trigger `stale > desired and stale > 10` is always
 above the ceiling: desired ≤ 40 → ceiling 10 < stale; desired > 40 → 0.25 × desired < desired <
@@ -2885,6 +2895,11 @@ why. The protocol guard still fires inside that reused engine — which is exact
 the standalone path uses `_run_standalone_full_sync` → `push_roster` instead.
 
 ### 3.4 ULTRA authoritative revocation — source of truth and delivery semantics
+
+The full standalone off-hours exception removes only exact planned pins when the REAL
+roster is empty; unrelated revocations remain refused and pending. The refusal still
+prevents pruning their ownership state. `[CODE: UltraDeviceWorker._neutralise_revoked_pins]`
+`[TEST: tests/test_off_hours_removal_bound.py::test_standalone_exact_hold_bound]`
 
 An **authoritative revocation** is not an ordinary member change. It travels as a
 separate `revoked_ids` set from the accepted backend change through `MainApp`,
@@ -4270,8 +4285,10 @@ UltraDeviceWorker.request_off_hours, ::_drain_off_hours_commands, ::request_full
 `[TEST: tests/test_off_hours_app_wiring.py, tests/test_off_hours_removal_bound.py]`
 
 Full standalone revoke and PullSDK stale steps split exactly the known held pins from
-unplanned removals. Only unplanned removals count towards the ceiling, against desired
-roster plus planned removals; only the unplanned set can match a Confirm-removal approval.
+unplanned removals. Only unplanned removals count towards the ceiling, against the REAL
+desired roster; planned holds are never added to that count. An empty real roster refuses
+all unplanned pins while the exact planned set may still be removed. Only the unplanned
+set can match a Confirm-removal approval.
 Planned-only removals still obey leases. A failed held-pin lookup grants no exemption.
 An all-held owned roster can be removed without treating it as an accidental empty build.
 `[CODE: off_hours.held_pins_for_device, push_safety.check_bulk_removal]`

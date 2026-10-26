@@ -12,6 +12,7 @@ from tests.test_standalone_revoked_pin_removal import RevokeDriver
 
 @pytest.mark.parametrize("held_count,unplanned_count,desired_count,allowed", [
     (40, 0, 60, True), (0, 40, 60, False), (30, 12, 0, False), (40, 0, 0, True),
+    (30, 8, 0, False), (30, 0, 0, True),
 ])
 def test_pullsdk_exact_hold_bound(sqlite_db, monkeypatch, warns, held_count, unplanned_count,
                                  desired_count, allowed):
@@ -21,14 +22,19 @@ def test_pullsdk_exact_hold_bound(sqlite_db, monkeypatch, warns, held_count, unp
     for pin in old:
         sqlite_db.save_device_sync_state(device_id=1, pin=pin, desired_hash="h", ok=True, error=None)
     sdk = _run(_users(*range(101, 101 + desired_count)), _gym58_device(), device_pins=sorted(old))
-    assert _removed_pins(sdk) == (old if allowed else set())
+    assert _removed_pins(sdk) == (old if allowed else planned)
     assert bool([1 for name, _ in warns if name == "REVOKE_ABORTED"]) is (not allowed)
+    if not allowed:
+        [abort] = [fields for name, fields in warns if name == "REVOKE_ABORTED"]
+        assert abort["count"] == unplanned_count and abort["roster"] == desired_count
+        assert abort["reason"] == ("empty_roster" if desired_count == 0 else "above_ceiling")
 
 
 @pytest.mark.parametrize("held_count,unplanned_count,desired_count,allowed", [
     (40, 0, 60, True), (0, 40, 60, False), (30, 12, 0, False), (40, 0, 0, True),
+    (30, 8, 0, False), (30, 0, 0, True),
 ])
-def test_standalone_exact_hold_bound(monkeypatch, fstate, held_count, unplanned_count,
+def test_standalone_exact_hold_bound(monkeypatch, fstate, warns, held_count, unplanned_count,
                                     desired_count, allowed):
     drv = RevokeDriver()
     worker, _ = _worker(monkeypatch, driver=drv, users=[])
@@ -40,7 +46,11 @@ def test_standalone_exact_hold_bound(monkeypatch, fstate, held_count, unplanned_
     result = worker._neutralise_revoked_pins(desired_pins={str(i) for i in range(desired_count)},
                                             roster_count=desired_count)
     assert result is allowed
-    assert {p for call in drv.delete_calls for p in call} == (old if allowed else set())
+    assert {p for call in drv.delete_calls for p in call} == (old if allowed else planned)
+    if not allowed:
+        [abort] = [fields for name, fields in warns if name == "REVOKE_ABORTED"]
+        assert abort["count"] == unplanned_count and abort["roster"] == desired_count
+        assert abort["reason"] == ("empty_roster" if desired_count == 0 else "above_ceiling")
 
 
 def test_split_is_exact():

@@ -3636,7 +3636,7 @@ class DeviceSyncEngine:
                     from app.core.off_hours import held_pins_for_device, split_removals
                     unplanned, planned = split_removals(stale_pins, held_pins_for_device(device))
                     _stale_verdict = _push_safety.check_bulk_removal(
-                        count=len(unplanned), roster_count=len(desired_pins) + len(planned),
+                        count=len(unplanned), roster_count=len(desired_pins),
                         path="stale", device_id=did, protocol="ZK_PULLSDK",
                         sample=unplanned, planned_count=len(planned),
                     )
@@ -3653,7 +3653,8 @@ class DeviceSyncEngine:
                                 _push_safety.REVOKE_ABORTED, _stale_verdict.count,
                                 f"stale; ceiling {_stale_verdict.ceiling:.0f}",
                             ))
-                        stale_pins = []
+                        stale_pins = ([] if _stale_verdict.reason in
+                                      ("add_only", "handover_release", "not_leased") else planned)
                 if stale_pins:
                     failed_del: List[str] = list(stale_pins)
                     try:

@@ -5177,10 +5177,11 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             return False
         from app.core.off_hours import held_pins_for_device, split_removals
         held_pins = held_pins_for_device(self._device)
-        if roster_count + len(held_pins & set(owned)) <= 0:
+        if roster_count <= 0:
             _tel.warn("REVOKE_SKIP_EMPTY_ROSTER", worker=self._tel_wid)
-            self._last_revoke_step = "skipped"
-            return False
+            if not held_pins & set(owned):
+                self._last_revoke_step = "skipped"
+                return False
         # The guards below hold the WHOLE step back: nothing is attempted, so a pending
         # retry is parked, not cleared (review R2-20). "ran" is set after them.
         self._last_revoke_step = "skipped"
@@ -5252,7 +5253,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         # (push_safety, P3a-2); it emits REVOKE_ABORTED with the count.
         unplanned, planned = split_removals(revoked, held_pins)
         _verdict = _push_safety.check_bulk_removal(
-            count=len(unplanned), roster_count=roster_count + len(planned), path="standalone_revoke",
+            count=len(unplanned), roster_count=roster_count, path="standalone_revoke",
             device_id=self._device_id, protocol="ZK_STANDALONE", worker=self._tel_wid,
             sample=unplanned, planned_count=len(planned),
         )
@@ -5263,20 +5264,22 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             # exactly as for a ceiling refusal -- never recorded as a ceiling abort.
             return False
         if not _verdict.allowed:
-            self._last_revoke_aborted = len(revoked)
+            self._last_revoke_aborted = len(unplanned)
             # Kept alongside REVOKE_ABORTED: existing operator greps key on it.
             _tel.warn("REVOKE_ABORT_FLOOR", worker=self._tel_wid,
-                      revoked=len(revoked), roster=roster_count,
+                      revoked=len(unplanned), roster=roster_count,
                       ceiling=round(ceiling, 1),
                       max_frac=_MIRROR_MAX_DELETE_FRACTION,
                       abs_floor=_REVOKE_ABSOLUTE_FLOOR)
             logger.warning(
                 "%s revoke pass ABORTED: %d pin(s) would be stripped against a roster "
-                "of %d (ceiling %.0f) -- that is implausible, so nothing was changed "
-                "and the per-pin state is kept for a later retry.",
-                self._prefix, len(revoked), roster_count, ceiling,
+                "of %d (ceiling %.0f) -- unplanned pins are kept for a later retry; "
+                "only the exact planned off-hours pins may be removed.",
+                self._prefix, len(unplanned), roster_count, ceiling,
             )
-            return False
+            revoked = planned
+            if not revoked:
+                return False
 
         logger.warning(
             "%s revoking %d pin(s) no longer in the roster: %s",
@@ -5298,7 +5301,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             logger.warning("%s revoke fallback failed -- keeping per-pin state for retry",
                            self._prefix)
             return False
-        return outcome.removed == frozenset(revoked)
+        return _verdict.allowed and outcome.removed == frozenset(revoked)
 
     def _remove_departed_pins(
         self, pins: list[str],
