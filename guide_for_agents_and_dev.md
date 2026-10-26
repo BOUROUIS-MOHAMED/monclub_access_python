@@ -2901,6 +2901,21 @@ roster is empty; unrelated revocations remain refused and pending. The refusal s
 prevents pruning their ownership state. `[CODE: UltraDeviceWorker._neutralise_revoked_pins]`
 `[TEST: tests/test_off_hours_removal_bound.py::test_standalone_exact_hold_bound]`
 
+Off-hours releases have durable delivery ownership: `off_hours_release_pending` is
+written in the same transaction as the local release, including fail-open releases.
+Startup and the minute tick replay it even in manual mode. A worker's successful
+targeted release writes `off_hours_release_ack`; the queue clears only after every
+ULTRA device with current ownership or a durable removal fact has acknowledged that
+generation. Failed delivery or acknowledgement keeps the obligation across restarts.
+A later hold, forgotten membership or logout cancels it; date-held rows are not queued.
+If queue storage itself is unreadable, a forced release still commits the local restore,
+logs the storage failure and returns release ids for volatile delivery; restart durability
+then requires repairing that storage. `[CODE: db.apply_off_hours]`
+`[CODE: db.apply_off_hours, ::acknowledge_off_hours_release,
+UltraDeviceWorker._drain_off_hours_commands, off_hours_push.dispatch_off_hours]`
+`[TEST: tests/test_off_hours_db.py::test_release_ack_requires_every_owned_ultra_and_ignores_old_generation,
+tests/test_off_hours_app_wiring.py::test_tick_replays_durable_release_after_restart_and_ok_drain_clears_it]`
+
 An **authoritative revocation** is not an ordinary member change. It travels as a
 separate `revoked_ids` set from the accepted backend change through `MainApp`,
 `UltraEngine`, `UltraSyncScheduler`, and the worker; where the same ID is also changed,
@@ -4261,7 +4276,9 @@ invalidating dates. `[CODE: access_dates.parse_window, db._window_columns]`
 
 `db.apply_off_hours` copies complete rows, fingerprints included, between `sync_users`
 and `sync_users_held` with reason `off_hours`. `off_hours_hold` preserves intent across
-full/delta roster saves; logout and fast patches forget it. Date flips exclude off-hours
+full/delta roster saves. `off_hours_release_pending` commits with each local restore;
+`off_hours_release_ack` persists per-device acknowledgements for its `queued_at` generation.
+Logout and fast patches forget both queues and acknowledgements. Date flips exclude off-hours
 rows; release evaluates dates again and transfers expired/frozen/not-started rows to the
 date hold instead of restoring them. `[CODE: db.apply_off_hours, db._forget_protocol2_membership]`
 `[TEST: tests/test_off_hours_db.py]`
@@ -4278,7 +4295,10 @@ The ULTRA hours request uses only held/released membership ids, also in manual s
 Workers keep replaceable off-hours commands, drain one at a time over their existing single
 connection, re-check the local row, and retry a failed command after 60 s. A release replaces
 a queued hold and follows an active hold. A worker-side failure never escalates this request
-to a full pass; unavailable workers leave app pending ids for the next tick. Ownership,
+to a full pass; unavailable workers leave durable releases for the next tick or startup.
+Only an ok release drain on every ULTRA device that owned the pin (including its removal
+log proof) clears the SQLite obligation; enqueueing does not. Old-generation acknowledgements
+cannot clear a newer release. Held-again and date-held members are not restored. Ownership,
 device plan filters, ACCOUNT collapse and leases still apply. An open eligible membership
 keeps the person's ACCOUNT pin. `[CODE: off_hours_push.dispatch_off_hours,
 UltraDeviceWorker.request_off_hours, ::_drain_off_hours_commands, ::request_full_sync]`
@@ -4310,9 +4330,9 @@ access_dates.qr_off_hours_refused, access_verification.verify_totp, PopupWindow.
 `[TEST: tests/test_off_hours_qr.py]`
 
 DEVICE-mode PullSDK panels receive no targeted hours command: the next ordinary sync
-applies their stale removals. A process restart after local release but before delivery
-loses the in-memory release command; normal startup full sync repairs it, while manual
-mode needs the operator's next “Sync data”. Real hardware, actual DEVICE-mode gyms and
+applies their stale removals. Releases survive a process restart in manual mode as well;
+no operator sync is needed to resume targeted delivery. `[CODE: db.off_hours_in_play,
+off_hours_push.dispatch_off_hours]` Real hardware, actual DEVICE-mode gyms and
 operator-visible skip noise across multiple devices remain unverified. `[CODE:
 off_hours_push.still_on_devices, UltraEngine.request_sync_now]` `[UNVERIFIED: hardware,
 fleet use and operator noise; no device or real app run for A1]`

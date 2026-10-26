@@ -1381,6 +1381,11 @@ def _create_protocol2_tables(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "sync_upcoming_users", "off_hours_json", "off_hours_json TEXT")
     conn.execute("CREATE TABLE IF NOT EXISTS off_hours_hold "
                  "(active_membership_id INTEGER PRIMARY KEY, held_at TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS off_hours_release_pending "
+                 "(active_membership_id INTEGER PRIMARY KEY, queued_at TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS off_hours_release_ack "
+                 "(active_membership_id INTEGER NOT NULL, device_id INTEGER NOT NULL, "
+                 "queued_at TEXT NOT NULL, PRIMARY KEY (active_membership_id, device_id))")
     # Member fees F3c: _SYNC_USER_COLUMNS gained fees_json and a hold or a restore copies column
     # for column, so the held copy carries it too (guide §3.12).
     _ensure_column(conn, "sync_users_held", "fees_json", "fees_json TEXT")
@@ -2153,6 +2158,20 @@ def apply_off_hours(*, pc_now_epoch: float, source: str, force_release: bool = F
                 to_date.add(am)
         if restored:
             _refresh_member_account_links(cur)
+        # The local restore and its durable delivery obligation commit together.
+        try:
+            cur.executemany(
+                "INSERT OR IGNORE INTO off_hours_release_pending (active_membership_id, queued_at) VALUES (?, ?)",
+                [(am, datetime.utcnow().isoformat(timespec="microseconds") + "Z") for am in released])
+            for table in ("off_hours_release_pending", "off_hours_release_ack"):
+                cur.executemany(f"DELETE FROM {table} WHERE active_membership_id = ?",
+                                [(am,) for am in set(plan.target) | to_date])
+        except sqlite3.Error:
+            if plan.active:
+                raise  # Retry the transaction as a fail-open release, never a new hold.
+            logging.getLogger(__name__).warning(
+                "[OFF_HOURS] release queue unavailable; local restores commit, "
+                "delivery remains pending in memory", exc_info=True)
         try:
             cur.executemany("DELETE FROM off_hours_hold WHERE active_membership_id = ?",
                             [(am,) for am in (intent | off_ids) - plan.target])
@@ -2184,7 +2203,8 @@ def off_hours_in_play() -> bool:
             return conn.execute(
                 "SELECT 1 FROM member_access_window WHERE off_hours_json IS NOT NULL "
                 "UNION ALL SELECT 1 FROM sync_upcoming_users WHERE off_hours_json IS NOT NULL "
-                "UNION ALL SELECT 1 FROM off_hours_hold LIMIT 1").fetchone() is not None
+                "UNION ALL SELECT 1 FROM off_hours_hold "
+                "UNION ALL SELECT 1 FROM off_hours_release_pending LIMIT 1").fetchone() is not None
     except Exception:
         # An unreadable input still needs the release pass.
         return True
@@ -2197,6 +2217,57 @@ def list_off_hours_held_rows() -> List[Dict[str, Any]]:
             "OR EXISTS (SELECT 1 FROM off_hours_hold i WHERE i.active_membership_id = h.active_membership_id)"
         ).fetchall()
     return [_coerce_user_row_to_payload(dict(r)) for r in rows]
+
+
+def list_off_hours_release_pending() -> Dict[int, str]:
+    with get_conn() as conn:
+        return {int(r[0]): str(r[1]) for r in conn.execute(
+            "SELECT active_membership_id, queued_at FROM off_hours_release_pending")}
+
+
+def acknowledge_off_hours_release(*, active_membership_id: int, device_id: int,
+                                  queued_at: str, no_longer_wanted: bool = False) -> None:
+    """Acknowledge this release generation; only its last owned ULTRA device clears it."""
+    from app.core.device_sync import derive_member_pin, normalize_pin_scheme
+    am = int(active_membership_id)
+
+    def _write(conn, profile):
+        current = conn.execute("SELECT queued_at FROM off_hours_release_pending "
+                               "WHERE active_membership_id = ?", (am,)).fetchone()
+        if current is None or str(current[0]) != queued_at:
+            return  # An old command cannot clear a later window's release.
+        row = conn.execute("SELECT * FROM sync_users WHERE active_membership_id = ?", (am,)).fetchone()
+        if no_longer_wanted and row is not None:
+            return  # Wanted again since the worker's read: retry from the durable queue.
+        if row is None:
+            required = set()
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO off_hours_release_ack (active_membership_id, device_id, queued_at) "
+                "VALUES (?, ?, ?)", (am, int(device_id), queued_at))
+            member = _coerce_user_row_to_payload(dict(row))
+            required = set()
+            for stored in conn.execute("SELECT * FROM sync_devices WHERE UPPER(access_data_mode) = 'ULTRA'"):
+                device = _coerce_device_row_to_payload(_expand_device_json_fields(dict(stored)))
+                did = int(device["id"])
+                pin, _ = derive_member_pin(member, normalize_pin_scheme(device.get("pinScheme")))
+                # A successful hold deletes device_sync_state. The durable removal log
+                # still proves this was a MonClub pin, including after a process restart.
+                owned = conn.execute(
+                    "SELECT 1 FROM device_sync_state WHERE device_id = ? AND pin = ? AND ownership_confirmed = 1 "
+                    "UNION ALL SELECT 1 FROM v2_removal_log WHERE device_id = ? AND pin = ? LIMIT 1",
+                    (did, pin, did, pin)).fetchone()
+                if owned or not pin:
+                    required.add(did)
+            acknowledged = {int(r[0]) for r in conn.execute(
+                "SELECT device_id FROM off_hours_release_ack WHERE active_membership_id = ? AND queued_at = ?",
+                (am, queued_at))}
+            if not required <= acknowledged:
+                return
+        conn.execute("DELETE FROM off_hours_release_pending WHERE active_membership_id = ?", (am,))
+        conn.execute("DELETE FROM off_hours_release_ack WHERE active_membership_id = ?", (am,))
+
+    _run_db_write_sync("acknowledge_off_hours_release", _write)
 
 
 def gym_date_status(*, pc_now_epoch: float) -> Dict[str, Any]:
@@ -5367,6 +5438,8 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
             cur.execute("DELETE FROM sync_users_held")
             cur.execute("DELETE FROM member_access_window")
             cur.execute("DELETE FROM off_hours_hold")
+            cur.execute("DELETE FROM off_hours_release_pending")
+            cur.execute("DELETE FROM off_hours_release_ack")
             cur.execute("DELETE FROM sync_upcoming_users")
             cur.execute("DELETE FROM sync_upcoming_credentials")
             cur.execute(
@@ -6193,7 +6266,8 @@ def _forget_protocol2_membership(cur: sqlite3.Cursor, active_membership_id: Opti
     if active_membership_id is None:
         return False
     dropped = 0
-    for table in ("member_access_window", "sync_upcoming_users", "sync_users_held", "off_hours_hold"):
+    for table in ("member_access_window", "sync_upcoming_users", "sync_users_held", "off_hours_hold",
+                  "off_hours_release_pending", "off_hours_release_ack"):
         try:
             dropped += cur.execute(
                 f"DELETE FROM {table} WHERE active_membership_id = ?", (active_membership_id,)

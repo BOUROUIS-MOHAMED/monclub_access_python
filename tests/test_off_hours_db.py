@@ -56,6 +56,7 @@ def test_hold_release_idempotence_and_fingerprints(db):
     assert hold(db)["moved"] == 0
     assert hold(db, "2026-10-27T05:55:00")["released"] == [1]
     assert _user_row(1) == before and not _ids("off_hours_hold")
+    assert _ids("off_hours_release_pending") == {1}
     assert hold(db, "2026-10-27T05:55:00")["moved"] == 0
 
 
@@ -75,6 +76,7 @@ def test_off_hours_release_transfers_to_date_without_another_flip(db, status, sq
     assert out["released_to_date"] == [1] and not out["released"]
     assert _q("SELECT held_reason FROM sync_users_held")[0]["held_reason"] == status
     assert not _ids("off_hours_hold") and not _ids("sync_users")
+    assert not _ids("off_hours_release_pending")
 
 
 def test_date_hold_then_hours_hold(db):
@@ -103,7 +105,8 @@ def test_full_and_delta_saves_rehold_using_existing_intent(db):
 @pytest.mark.parametrize("sql", ["UPDATE access_v2_state SET trusted=0",
                                       "UPDATE access_v2_state SET clock_suspect=1",
                                       "UPDATE access_v2_state SET utc_offset_sec=NULL",
-                                      "DROP TABLE member_access_window", "DROP TABLE off_hours_hold"])
+                                      "DROP TABLE member_access_window", "DROP TABLE off_hours_hold",
+                                      "DROP TABLE off_hours_release_pending", "DROP TABLE off_hours_release_ack"])
 def test_uncertain_input_releases_every_off_hours_hold(db, sql):
     seed(db)
     hold(db)
@@ -128,3 +131,46 @@ def test_explicit_fail_open_releases_despite_a_closed_window(db):
     out = db.apply_off_hours(pc_now_epoch=epoch("2026-10-26T23:00:00"), source="read_error", force_release=True)
     assert out["released"] == [1] and not out["active"]
     assert _ids("sync_users") == {1} and not _ids("off_hours_hold")
+    assert _ids("off_hours_release_pending") == {1}
+
+
+@pytest.mark.parametrize("action", ["held_again", "fast_patch", "logout"])
+def test_pending_release_is_cancelled_when_no_longer_wanted(db, action):
+    seed(db)
+    hold(db)
+    db.apply_off_hours(pc_now_epoch=epoch("2026-10-26T23:00:00"), source="test", force_release=True)
+    assert _ids("off_hours_release_pending") == {1}
+    if action == "held_again":
+        hold(db)
+    elif action == "fast_patch":
+        db._run_db_write_sync("test", lambda c, p: db._forget_protocol2_membership(c.cursor(), 1))
+    else:
+        db.save_sync_cache(None)
+    assert not _ids("off_hours_release_pending")
+    assert not _ids("off_hours_release_ack")
+
+
+def test_release_ack_requires_every_owned_ultra_and_ignores_old_generation(db):
+    from tests.test_account_pin_device_sites import _pullsdk_device
+    seed(db)
+    db._run_db_write_sync("test", lambda c, p: [
+        db._insert_device_row(c.cursor(), _pullsdk_device(id=did)) for did in (1, 2)])
+    for did in (1, 2):
+        db.save_device_sync_state(device_id=did, pin="1", desired_hash="h", ok=True, error=None)
+    hold(db)
+    # The physical hold removes the ownership row, but its durable removal fact remains.
+    for did in (1, 2):
+        db.clear_device_revocation_state(device_id=did, pin="1")
+    hold(db, "2026-10-27T05:55:00")
+    token = db.list_off_hours_release_pending()[1]
+    db.acknowledge_off_hours_release(active_membership_id=1, device_id=1, queued_at=token)
+    assert _ids("off_hours_release_pending") == {1}
+    # Simulate loss of all in-memory device state between the acknowledgements.
+    db._shutdown_db_writer_for_tests()
+    db.acknowledge_off_hours_release(active_membership_id=1, device_id=2, queued_at=token)
+    assert not _ids("off_hours_release_pending") and not _ids("off_hours_release_ack")
+    hold(db)
+    db.apply_off_hours(pc_now_epoch=epoch("2026-10-26T23:00:00"), source="test", force_release=True)
+    assert db.list_off_hours_release_pending()[1] != token
+    db.acknowledge_off_hours_release(active_membership_id=1, device_id=1, queued_at=token)
+    assert _ids("off_hours_release_pending") == {1}

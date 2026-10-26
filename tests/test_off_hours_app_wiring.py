@@ -3,6 +3,8 @@ from unittest.mock import MagicMock
 from app.core import db, off_hours_push
 from app.core.ultra_engine import UltraEngine, UltraDeviceWorker
 from tests.test_p3b1_app_wiring import flip_app, fake_tel
+from tests.test_off_hours_db import db as real_db, seed, hold, epoch, _exec
+from app.ui.app import MainApp
 from types import SimpleNamespace
 import threading
 
@@ -94,6 +96,7 @@ def command_worker():
     worker._connected = True
     worker._prefix = "test"
     worker._pending_member_syncs = []
+    worker._device_id = 1
     return worker
 
 
@@ -124,7 +127,7 @@ def test_failed_hold_cannot_escalate_and_active_release_wins(monkeypatch):
     worker._run_standalone_member_revoke = failed
     worker.request_off_hours(held_ids={1}, released_ids=set())
     worker._drain_off_hours_commands()
-    assert worker._off_hours_commands[1] == (False, 0.0)
+    assert worker._off_hours_commands[1] == (False, 0.0, None)
 
 
 def test_revokes_are_owned_and_use_payload_mode_and_device_plan_filter(monkeypatch):
@@ -158,3 +161,52 @@ def test_discovery_error_releases_existing_holds_too(flip_app, monkeypatch):
     assert opened.call_args.kwargs["force_release"] is True
     assert flip_app._request_running_ultra_sync.call_args.kwargs["changed_ids"] == {2}
     assert not flip_app._request_running_ultra_sync.call_args.kwargs["revoked_ids"]
+
+
+def test_tick_replays_durable_release_after_restart_and_ok_drain_clears_it(real_db):
+    from tests.test_account_pin_device_sites import _pullsdk_device
+    seed(real_db)
+    real_db._run_db_write_sync("test", lambda c, p:
+        real_db._insert_device_row(c.cursor(), _pullsdk_device()))
+    real_db.save_device_sync_state(device_id=1, pin="1", desired_hash="h", ok=True, error=None)
+    hold(real_db)
+    real_db.clear_device_revocation_state(device_id=1, pin="1")
+    hold(real_db, "2026-10-27T05:55:00")
+    assert real_db.list_off_hours_release_pending().keys() == {1}
+    _exec("UPDATE member_access_window SET off_hours_json=NULL")
+    assert real_db.off_hours_in_play()  # Only the release queue remains.
+
+    app = object.__new__(MainApp)
+    app._init_date_flip_state()
+    app._stop_event = threading.Event()
+    app.after = MagicMock()
+    app.logger = MagicMock()
+    app._date_flip_now = lambda: epoch("2026-10-27T05:55:00")
+    app._date_flip_needed = lambda _: False
+    app._apply_off_hours_db = lambda now, source: {}
+    app._spawn_date_flip_thread = lambda source, target: target()
+    worker = command_worker()
+    worker._run_standalone_member_sync = MagicMock(return_value=False)
+    worker.request_off_hours(held_ids=set(), released_ids={1})
+    # Restart: both app and worker lose their volatile pending queues.
+    app._off_hours_pending = {"hold": set(), "release": set()}
+    worker._off_hours_commands.clear()
+    app._request_running_ultra_sync = MagicMock(side_effect=lambda **kw:
+        worker.request_off_hours(held_ids=kw["revoked_ids"], released_ids=kw["changed_ids"]))
+    app._off_hours_tick()
+    assert app._request_running_ultra_sync.call_args.kwargs["changed_ids"] == {1}
+    assert real_db.list_off_hours_release_pending().keys() == {1}  # Enqueue is not an ack.
+    worker._drain_off_hours_commands()
+    assert real_db.list_off_hours_release_pending().keys() == {1}  # A failed device retry persists.
+    worker._run_standalone_member_sync.return_value = True
+    app._off_hours_tick()
+    worker._drain_off_hours_commands()
+    assert not real_db.list_off_hours_release_pending()
+
+
+def test_startup_dispatch_replays_durable_release(flip_app, monkeypatch):
+    monkeypatch.setattr(db, "off_hours_in_play", lambda: False)
+    monkeypatch.setattr(db, "list_off_hours_release_pending", lambda: {7: "queued"})
+    flip_app._request_running_ultra_sync = MagicMock(return_value=True)
+    flip_app._apply_date_flips("startup")
+    assert flip_app._request_running_ultra_sync.call_args.kwargs["changed_ids"] == {7}

@@ -28,13 +28,19 @@ def still_on_devices(ids, limit=50):
 
 def dispatch_off_hours(app, off, source):
     pending = getattr(app, "_off_hours_pending", {"hold": set(), "release": set()})
+    try:
+        durable_release = set(db.list_off_hours_release_pending())
+    except Exception:
+        # Never lose the in-memory release when the persistent queue is unreadable.
+        durable_release = set()
+        app.logger.warning("[OFF_HOURS] release queue unreadable; keeping pending work", exc_info=True)
     # Empty result means no new decision (or a failed pass): never send an old revoke.
     if not off:
         hold = set()
-        release = set(pending["release"])
+        release = set(pending["release"]) | durable_release
     else:
         target = set(off.get("newly_held") or ()) | set(off.get("retry") or ())
-        release = (set(off.get("released") or ()) | set(pending["release"])) - target
+        release = (set(off.get("released") or ()) | set(pending["release"]) | durable_release) - target
         release -= set(off.get("released_to_date") or ())
         # Releases have committed in SQLite already. Save them before any fallible
         # ownership/device discovery so an unrelated hold cannot lose a restore.

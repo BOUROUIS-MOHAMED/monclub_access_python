@@ -1422,14 +1422,19 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
 
     def request_off_hours(self, *, held_ids, released_ids) -> bool:
         """Replace pending planned work without claiming authoritative revocation ownership."""
+        try:
+            from app.core.db import list_off_hours_release_pending
+            tokens = list_off_hours_release_pending() if released_ids else {}
+        except Exception:
+            tokens = {}  # Delivery may proceed; no durable row can be acknowledged on doubt.
         with self._member_sync_lock:
             pending = getattr(self, "_off_hours_commands", None)
             if pending is None:
                 pending = self._off_hours_commands = {}
             for am in released_ids:
-                pending[int(am)] = (False, 0.0)
+                pending[int(am)] = (False, 0.0, tokens.get(int(am)))
             for am in held_ids:
-                pending[int(am)] = (True, 0.0)
+                pending[int(am)] = (True, 0.0, None)
         self._wake_evt.set()
         return True
 
@@ -1442,7 +1447,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                           if command[1] <= time.monotonic()), None)
             if ready is None:
                 return 0
-            am, (hold, _) = ready
+            am, (hold, _, release_token) = ready
             del pending[am]
         ok = False
         try:
@@ -1470,14 +1475,18 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                         ok = engine.sync_member_on_connected_sdk(sdk=raw, device=self._device,
                             member_id=am, source="off_hours", revocation=hold)
                         ok = bool(ok or (hold and _revoke_skipped_not_owned(engine)))
+            if ok and not hold and release_token is not None:
+                db.acknowledge_off_hours_release(active_membership_id=am,
+                    device_id=self._device_id, queued_at=release_token, no_longer_wanted=not wanted)
         except Exception:
+            ok = False
             logger.warning("%s off-hours member command failed: %s", self._prefix, am, exc_info=True)
         finally:
             self._off_hours_executing_thread = None
         if not ok:
             with self._member_sync_lock:
                 # A newer opposite command wins while this one was executing.
-                self._off_hours_commands.setdefault(am, (hold, time.monotonic() + 60))
+                self._off_hours_commands.setdefault(am, (hold, time.monotonic() + 60, release_token))
         return 1
 
     def request_member_revoke(self, member_id: int) -> bool:
