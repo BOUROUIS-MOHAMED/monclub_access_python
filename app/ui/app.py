@@ -147,6 +147,7 @@ _RERUN_AFTER_ULTRA_DEFER_MARGIN_SEC = 5.0
 # on the applied day gets one automatic sync at 00:17:00 gym time, after the server's 00:16 job
 # that enables its QR credential (backend DailyScheduleService, cron "0 16 0 * * *").
 _DATE_FLIP_TICK_MS = 60 * 1000
+_OFF_HOURS_TICK_MS = 60 * 1000
 _DATE_FLIP_MIDNIGHT_GYM_TIME = (0, 0, 5)
 _FIRST_DAY_SYNC_GYM_TIME = (0, 17, 0)
 
@@ -704,6 +705,7 @@ class MainApp:
         except Exception:
             self.logger.warning("[ERASE] erase backups not pruned at start-up", exc_info=True)
         self.after(_DATE_FLIP_TICK_MS, self._date_flip_tick)
+        self.after(_OFF_HOURS_TICK_MS, self._off_hours_tick)
         try:
             self._arm_midnight_date_flip()
         except Exception:
@@ -1695,6 +1697,7 @@ class MainApp:
         # 60 s but the job stays queued. The next trigger then runs a flip unconditionally (it
         # queues behind the late one) and wakes the caches and ULTRA after it (review R5).
         self._date_flip_recover = False
+        self._off_hours_pending = {"hold": set(), "release": set()}
 
     @staticmethod
     def _date_flip_now() -> float:
@@ -1738,6 +1741,7 @@ class MainApp:
                 return None
             dur_ms = int((time.perf_counter() - started) * 1000)
             out = dict(out or {})
+            off = self._apply_off_hours_db(now_epoch, source)
             moved = int(out.get("moved") or 0)
             ultra_requested = False
             if recovering:
@@ -1780,11 +1784,10 @@ class MainApp:
                 self._arm_first_day_credentials_sync(out, now_epoch)
             except Exception:
                 self.logger.warning("[DATE] first-day sync not armed", exc_info=True)
+            self._dispatch_off_hours(off, source)
             return out
 
-    def _after_date_flip_moved(self, source: str) -> bool:
-        """Rows moved: expire the member caches, reset the engines' caches and ask a running
-        ULTRA engine for a full pass (P3a-2: removals first). Returns whether ULTRA was asked."""
+    def _invalidate_date_member_caches(self) -> None:
         from app.core import db as _db
 
         try:
@@ -1798,6 +1801,10 @@ class MainApp:
         # The PC's own view (AGENT decisions, QR checks, ULTRA's cached roster) moves in every
         # mode, manual sync included.
         self.reset_runtime_fast_patch_caches()
+
+    def _after_date_flip_moved(self, source: str) -> bool:
+        """Date rows moved: refresh caches and request the existing full pass."""
+        self._invalidate_date_member_caches()
         try:
             from app.core.settings_reader import get_backend_global_settings
 
@@ -1817,6 +1824,54 @@ class MainApp:
         except Exception:
             self.logger.warning("[DATE] ULTRA request after the flip failed", exc_info=True)
             return False
+
+    def _apply_off_hours_db(self, now_epoch: float, source: str) -> Dict[str, Any]:
+        from app.core import db as _db
+        started = time.perf_counter()
+        try:
+            if not _db.off_hours_in_play():
+                return {}
+            off = _db.apply_off_hours(pc_now_epoch=now_epoch, source=source)
+            if off.get("moved") or off.get("intent_changed"):
+                self._invalidate_date_member_caches()
+                _tel.event("OFF_HOURS", held=len(off.get("newly_held") or ()),
+                           released=len(off.get("released") or ()), retry=len(off.get("retry") or ()),
+                           dur_ms=int((time.perf_counter() - started) * 1000), source=source)
+            return off
+        except Exception as ex:
+            _tel.warn("OFF_HOURS_FAILED", source=source, err=str(ex)[:300])
+            self.logger.warning("[OFF_HOURS] pass failed", exc_info=True)
+            return {}
+
+    def _dispatch_off_hours(self, off, source):
+        from app.core.off_hours_push import dispatch_off_hours
+        try:
+            dispatch_off_hours(self, off, source)
+        except Exception as ex:
+            _tel.warn("OFF_HOURS_FAILED", source=source, err=str(ex)[:300])
+
+    def _off_hours_tick(self) -> None:
+        from app.core import db as _db
+
+        def run():
+            now = self._date_flip_now()
+            try:
+                needed = self._date_flip_needed(_db.gym_date_status(pc_now_epoch=now))
+            except Exception:
+                needed = False
+            if needed:
+                self._apply_date_flips("off_hours_tick", pc_now=now)
+            else:
+                with self._date_flip_lock:
+                    off = self._apply_off_hours_db(now, "off_hours_tick")
+                    self._dispatch_off_hours(off, "off_hours_tick")
+        try:
+            pending = getattr(self, "_off_hours_pending", {})
+            if _db.off_hours_in_play() or any(pending.values()):
+                self._spawn_date_flip_thread("off_hours", run)
+        finally:
+            if not self._stop_event.is_set():
+                self.after(_OFF_HOURS_TICK_MS, self._off_hours_tick)
 
     def _arm_first_day_credentials_sync(self, out: Dict[str, Any], now_epoch: float) -> None:
         """A membership starting on the applied day gets its QR credential enabled by the server's

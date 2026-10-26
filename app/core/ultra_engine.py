@@ -8802,6 +8802,10 @@ class UltraEngine:
         needs_scheduler = bool(unresolved_device_ids)
         if broadcast_devices and not normalized_device_ids:
             needs_scheduler = True
+        if reason == "off_hours":
+            # The scheduler fallback can reconcile other pending diffs. Planned hours
+            # must stay targeted, including in manual mode; the app retries next minute.
+            return bool(normalized_device_ids and not needs_scheduler)
         scheduled = False
         if needs_scheduler:
             fallback_device_ids = None if broadcast_devices else unresolved_device_ids
