@@ -5102,17 +5102,18 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         # For the removal retry (R1-06/08/22): "skipped" = nothing to attempt until the
         # roster changes; "errored" = could not evaluate, a pending retry stays armed.
         self._last_revoke_step = "errored"
-        if roster_count <= 0:
-            # A failed or half-built roster must never read as "everyone left".
-            _tel.warn("REVOKE_SKIP_EMPTY_ROSTER", worker=self._tel_wid)
-            self._last_revoke_step = "skipped"
-            return False
         try:
             from app.core.db import list_confirmed_device_sync_pins
             owned = list_confirmed_device_sync_pins(device_id=self._device_id) or set()
         except Exception:
             logger.warning("%s revoke pass: per-pin state unreadable -- skipping",
                            self._prefix, exc_info=True)
+            return False
+        from app.core.off_hours import held_pins_for_device, split_removals
+        held_pins = held_pins_for_device(self._device)
+        if roster_count + len(held_pins & set(owned)) <= 0:
+            _tel.warn("REVOKE_SKIP_EMPTY_ROSTER", worker=self._tel_wid)
+            self._last_revoke_step = "skipped"
             return False
         # The guards below hold the WHOLE step back: nothing is attempted, so a pending
         # retry is parked, not cleared (review R2-20). "ran" is set after them.
@@ -5183,10 +5184,11 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         # members off a turnstile. See _REVOKE_ABSOLUTE_FLOOR for why a fraction on
         # its own is not enough here. The ONE ceiling every removal path shares
         # (push_safety, P3a-2); it emits REVOKE_ABORTED with the count.
+        unplanned, planned = split_removals(revoked, held_pins)
         _verdict = _push_safety.check_bulk_removal(
-            count=len(revoked), roster_count=roster_count, path="standalone_revoke",
+            count=len(unplanned), roster_count=roster_count + len(planned), path="standalone_revoke",
             device_id=self._device_id, protocol="ZK_STANDALONE", worker=self._tel_wid,
-            sample=revoked,
+            sample=unplanned, planned_count=len(planned),
         )
         ceiling = _verdict.ceiling
         if not _verdict.allowed and _verdict.reason in ("add_only", "handover_release", "not_leased"):

@@ -97,3 +97,26 @@ def plan_off_hours(*, now_epoch, utc_offset_sec, trusted, clock_suspect,
         active = False
         target = frozenset()
     return OffHoursPlan(active, target, target - intent, intent - target, target & intent)
+
+
+def held_pins_for_device(device) -> set[str]:
+    """Exact known held pins, excluding any pin still used by a live membership."""
+    try:
+        from app.core import db
+        from app.core.device_sync import derive_member_pin, device_pin_scheme
+        rows = db.list_off_hours_held_rows()
+        if not rows:
+            return set()
+        scheme = device_pin_scheme(device)
+        pins = {derive_member_pin(r, scheme)[0] for r in rows}
+        live = {derive_member_pin(r, scheme)[0] for r in db.list_sync_users()}
+        return {p for p in pins - live if p and p.isdigit()}
+    except Exception:
+        return set()
+
+
+def split_removals(pins, held_pins):
+    unplanned, planned = [], []
+    for pin in pins:
+        (planned if pin in held_pins else unplanned).append(pin)
+    return unplanned, planned

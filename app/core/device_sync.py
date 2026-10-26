@@ -3633,10 +3633,12 @@ class DeviceSyncEngine:
                     # ONE ceiling for every bulk removal (P3a-2, guide §3.2g). Refused:
                     # nothing is removed, the per-pin state is kept (the prune below is
                     # skipped too) and the rest of the pass still runs.
+                    from app.core.off_hours import held_pins_for_device, split_removals
+                    unplanned, planned = split_removals(stale_pins, held_pins_for_device(device))
                     _stale_verdict = _push_safety.check_bulk_removal(
-                        count=len(stale_pins), roster_count=len(desired_pins),
+                        count=len(unplanned), roster_count=len(desired_pins) + len(planned),
                         path="stale", device_id=did, protocol="ZK_PULLSDK",
-                        sample=stale_pins,
+                        sample=unplanned, planned_count=len(planned),
                     )
                     if not _stale_verdict.allowed:
                         removal_aborted += _stale_verdict.count

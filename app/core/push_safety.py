@@ -92,6 +92,7 @@ def check_bulk_removal(
     protocol: str = "",
     worker: str = "",
     sample: Iterable[str] = (),
+    planned_count: int = 0,
 ) -> RemovalVerdict:
     """Decide whether one removal step may run; report a refusal.
 
@@ -107,14 +108,15 @@ def check_bulk_removal(
     roster = max(0, int(roster_count or 0))
     ceiling = removal_ceiling(roster)
     pins = [str(p) for p in (sample or ())]
-    if n <= 0:
+    physical_count = n + max(0, int(planned_count))
+    if physical_count <= 0:
         _problems.registry.removal_allowed(device_id, path)
         return RemovalVerdict(True, 0, roster, ceiling, "")
     blocked = _lease_gate.removals_blocked(device_id) if device_id is not None else None
     if blocked:
         try:
             _tel.warn("REMOVAL_DEFERRED", worker=worker or None, device_id=device_id,
-                      protocol=protocol or None, path=path, count=n, reason=blocked)
+                      protocol=protocol or None, path=path, count=physical_count, reason=blocked)
         except Exception:
             pass
         logger.warning(
@@ -122,6 +124,9 @@ def check_bulk_removal(
             "retried once the turnstile's record is trusted.", device_id, path, n, blocked,
         )
         return RemovalVerdict(False, n, roster, ceiling, blocked)
+    if n <= 0:
+        _problems.registry.removal_allowed(device_id, path)
+        return RemovalVerdict(True, 0, roster, ceiling, "")
     if roster <= 0:
         reason = "empty_roster"
     elif n > ceiling:
