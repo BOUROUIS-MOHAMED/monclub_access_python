@@ -26,6 +26,10 @@ Ships the exact x86 DLL set the production MonClub Access install uses, so the
 folder is self-contained - no ZKTeco software required on the PC:
 
 - `zkemkeeper.dll` (+ its dep `plcommpro.dll`) - standalone-terminal COM SDK
+- `zkemsdk.dll`, `commpro.dll` and the transports `tcpcomm.dll` (network), `comms.dll`,
+  `usbcomm.dll`, `rscomm.dll`, `usbstd.dll` - zkemsdk loads the transports by bare name
+  at connect time; without `tcpcomm.dll` every `Connect_Net` returns False (fresh gym PC,
+  2026-10-26). `sdk\` on PATH lets the scripts find them.
 - `libzkfpcsharp.dll`, `libzkfp.dll`, `fpslib.dll`, `ZKFPCap.dll` - ZK9500 capture
 
 `_common.ps1` prepends `sdk\` to PATH so the COM object and the .NET wrapper's
@@ -33,9 +37,8 @@ native deps resolve locally. Script 1 auto-registers the bundled `zkemkeeper.dll
 script 4 auto-loads the bundled `libzkfpcsharp.dll`. If you move the folder,
 re-run **[1]** (registration records the DLL's path).
 
-> Rare: on a PC that never had any ZKTeco software AND lacks
-> `C:\Windows\SysWOW64\zkemsdk.dll`, copy that file into `sdk\` too - the verify
-> step in **[1]** will tell you if it's missing.
+> PATH comes after `C:\Windows\SysWOW64` in the search order, so on a PC where ZKTeco
+> software left its own transport DLLs there, those are the ones the scripts load.
 
 ## The scripts
 

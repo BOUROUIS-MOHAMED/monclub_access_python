@@ -268,7 +268,10 @@ def check_zkemkeeper_registration() -> Dict[str, Any]:
         "ok": False,
         "windows": (os.name == "nt"),
         "pythonBits": None,  # filled in below from struct.calcsize on Windows
-        "progId": "zkemkeeper.CZKEM",
+        "progId": None,  # the first of ZKEMKEEPER_PROG_IDS found in the registry
+        # Where the network transport zkemsdk.dll needs at connect time is: our sdk copy
+        # (the driver preloads it), else SysWOW64, else None -> Connect_Net cannot succeed.
+        "tcpcomm": None,
         "clsid": None,
         "inprocServer32": None,
         "inprocExists": None,
@@ -287,6 +290,18 @@ def check_zkemkeeper_registration() -> Dict[str, Any]:
         result["pythonBits"] = struct.calcsize("P") * 8
     except Exception:
         result["pythonBits"] = None
+
+    from app.sdk.zk_standalone import ZKEMKEEPER_PROG_IDS
+
+    try:
+        sdk_tcpcomm = resolve_resource_path("sdk/tcpcomm.dll")
+        result["tcpcomm"] = str(sdk_tcpcomm)
+    except Exception:
+        system_tcpcomm = Path(os.environ.get("WINDIR", r"C:\Windows")) / "SysWOW64" / "tcpcomm.dll"
+        if system_tcpcomm.exists():
+            result["tcpcomm"] = str(system_tcpcomm)
+        else:
+            result["notes"].append("tcpcomm.dll found neither in sdk nor in SysWOW64: Connect_Net will fail.")
 
     try:
         import winreg
@@ -311,30 +326,27 @@ def check_zkemkeeper_registration() -> Dict[str, Any]:
 
         # Try both registry views because many ZKTeco components are 32-bit COM
         views = [None, 32, 64]
-        progid_paths = [
-            r"zkemkeeper.CZKEM\CLSID",
-            r"zkemkeeper.CZKEM.1\CLSID",
-        ]
 
         clsid = None
         clsid_view = None
         for wow in views:
-            for p in progid_paths:
-                v = _reg_get(p, None, wow)
+            for prog_id in ZKEMKEEPER_PROG_IDS:
+                v = _reg_get(prog_id + r"\CLSID", None, wow)
                 if v and v.strip().startswith("{") and v.strip().endswith("}"):
                     clsid = v.strip()
                     clsid_view = wow
+                    result["progId"] = prog_id
                     break
             if clsid:
                 break
 
         if not clsid:
-            result["error"] = "ProgID not found in registry (zkemkeeper.CZKEM)."
+            result["error"] = f"ProgID not found in registry ({' / '.join(ZKEMKEEPER_PROG_IDS)})."
             return result
 
         result["registryFound"] = True
         result["clsid"] = clsid
-        result["notes"].append(f"ProgID->CLSID found (view={clsid_view}).")
+        result["notes"].append(f"ProgID {result['progId']} -> CLSID found (view={clsid_view}).")
 
         inproc = None
         inproc_view = None
@@ -391,7 +403,7 @@ def check_zkemkeeper_registration() -> Dict[str, Any]:
                     pass
 
                 obj = None
-                for prog_id in ("zkemkeeper.ZKEM", "zkemkeeper.CZKEM", "zkemkeeper.ZKEM.1"):
+                for prog_id in ZKEMKEEPER_PROG_IDS:
                     try:
                         obj = w32.Dispatch(prog_id)
                         result["notes"].append(f"COM activation succeeded via {prog_id}.")
@@ -427,12 +439,15 @@ def check_zkemkeeper_registration() -> Dict[str, Any]:
             )
 
         # 'ok' = the class is registered AND its server file exists AND, where we
-        # could test it, the object actually activates. comCreateOk is None when
-        # pywin32 is missing, which must not be treated as a pass or as a failure.
+        # could test it, the object actually activates AND the network transport
+        # exists. comCreateOk is None when pywin32 is missing, which must not be
+        # treated as a pass or as a failure. Without tcpcomm.dll the object activates
+        # fine and only Connect_Net fails, so a green flag without it would mislead.
         result["ok"] = bool(
             result["registryFound"]
             and result.get("inprocExists")
             and result["comCreateOk"] is not False
+            and result.get("tcpcomm")
         )
         return result
 
@@ -591,9 +606,11 @@ class MainApp:
             self._zkemkeeper_status = check_zkemkeeper_registration()
             st = self._zkemkeeper_status
             self.logger.info(
-                "[ZKEMKeeper] ok=%s registryFound=%s comCreateOk=%s bits=%s clsid=%s inproc=%s exists=%s err=%s notes=%s",
+                "[ZKEMKeeper] ok=%s registryFound=%s progId=%s tcpcomm=%s comCreateOk=%s bits=%s clsid=%s inproc=%s exists=%s err=%s notes=%s",
                 st.get("ok"),
                 st.get("registryFound"),
+                st.get("progId"),
+                st.get("tcpcomm"),
                 st.get("comCreateOk"),
                 st.get("pythonBits"),
                 st.get("clsid"),

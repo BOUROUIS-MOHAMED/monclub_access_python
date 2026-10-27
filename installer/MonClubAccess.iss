@@ -377,33 +377,42 @@ begin
   ExecAndLog('taskkill /F /T /IM "{#TauriExe}"');
 end;
 
-function ZkemkeeperClsid(): string;
+function ZkemkeeperClsidFor(const ProgId: string): string;
 var
   Clsid: string;
 begin
   // Read HKLM\SOFTWARE\Classes DIRECTLY, and only then fall back to the merged
-  // HKEY_CLASSES_ROOT view.
-  //
-  // Field failure (1.4.24): regsvr32 genuinely succeeded -- the same command run
-  // by hand straight afterwards worked -- yet this post-check said the class was
-  // missing and setup showed an alarming "still not registered" error. HKCR is a
-  // MERGED view (HKLM\Software\Classes + HKCU\Software\Classes) and a process
-  // that has already read it can keep serving that cached view, so the pre-check
-  // ("is it already registered?") poisoned the post-check in the very same run.
-  // Reading the real hive avoids the merged-view cache entirely.
+  // HKEY_CLASSES_ROOT view (HKLM + HKCU), which a process can keep serving from a
+  // cache after it first reads it.
   Result := '';
-  if RegQueryStringValue(HKEY_LOCAL_MACHINE, 'SOFTWARE\Classes\zkemkeeper.CZKEM\CLSID', '', Clsid) then
+  if RegQueryStringValue(HKEY_LOCAL_MACHINE, 'SOFTWARE\Classes\' + ProgId + '\CLSID', '', Clsid) then
   begin
     Result := Trim(Clsid);
     if Result <> '' then Exit;
   end;
-  if RegQueryStringValue(HKEY_CURRENT_USER, 'Software\Classes\zkemkeeper.CZKEM\CLSID', '', Clsid) then
+  if RegQueryStringValue(HKEY_CURRENT_USER, 'Software\Classes\' + ProgId + '\CLSID', '', Clsid) then
   begin
     Result := Trim(Clsid);
     if Result <> '' then Exit;
   end;
-  if RegQueryStringValue(HKEY_CLASSES_ROOT, 'zkemkeeper.CZKEM\CLSID', '', Clsid) then
+  if RegQueryStringValue(HKEY_CLASSES_ROOT, ProgId + '\CLSID', '', Clsid) then
     Result := Trim(Clsid);
+end;
+
+function ZkemkeeperClsid(): string;
+begin
+  // The zkemkeeper.dll we ship registers ONLY 'zkemkeeper.ZKEM' (+ '.ZKEM.1'), read
+  // from the DLL's own registration strings 2026-10-27. This used to look up
+  // 'zkemkeeper.CZKEM' alone -- the .NET interop class name, which this DLL never
+  // writes -- so every install saw "not registered", re-ran regsvr32, and the
+  // post-check then reported the class missing. That is the real cause of the 1.4.24
+  // "regsvr32 succeeded but setup says still not registered" false alarm, not a
+  // merged-view cache. Same order as ZKEMKEEPER_PROG_IDS in app/sdk/zk_standalone.py.
+  Result := ZkemkeeperClsidFor('zkemkeeper.ZKEM');
+  if Result = '' then
+    Result := ZkemkeeperClsidFor('zkemkeeper.ZKEM.1');
+  if Result = '' then
+    Result := ZkemkeeperClsidFor('zkemkeeper.CZKEM');
 end;
 
 function ZkemkeeperRegisteredDll(): string;
@@ -439,8 +448,15 @@ begin
   // A CLSID whose InprocServer32 points at a file that no longer exists is
   // worse than no registration at all -- report that as unregistered so we
   // re-register instead of silently skipping.
+  //
+  // It must also point at OUR copy. While the lookup was broken (CZKEM, see
+  // ZkemkeeperClsid) every install re-registered ours, so in the field the app has
+  // always run our zkemkeeper.dll beside our zkemsdk.dll and transport DLLs. Fixing
+  // the lookup must not quietly switch a PC with some other ZKTeco program's
+  // registration over to that program's build.
   DllRef := ZkemkeeperRegisteredDll();
-  Result := (DllRef <> '') and FileExists(DllRef);
+  Result := (DllRef <> '') and FileExists(DllRef) and
+            (CompareText(DllRef, ExpandConstant('{app}\current\sdk\zkemkeeper.dll')) = 0);
 end;
 
 procedure RegisterZkemkeeper();
@@ -510,15 +526,13 @@ begin
     Failure := 'regsvr32 exited with code ' + IntToStr(ResultCode);
 
   // Deliberately NOT treating "regsvr32 said OK but I cannot see the class" as a
-  // failure. In the field that combination was a false alarm every time: the
-  // registration had genuinely worked and the identical command run by hand a
-  // minute later succeeded. regsvr32's exit code is the authoritative signal;
-  // this process's own registry view is not (see ZkemkeeperClsid). Log the
-  // discrepancy so it stays diagnosable, but do not alarm the installer with a
-  // scary, wrong message about hardware that is in fact fine.
+  // failure. In the field that combination was a false alarm every time (the
+  // lookup asked for the wrong ProgID -- see ZkemkeeperClsid). regsvr32's exit code
+  // is the authoritative signal; this process's own registry view is not. Log the
+  // discrepancy so it stays diagnosable, but do not alarm the installer.
   if (Failure = '') and (not ZkemkeeperIsRegistered()) then
-    Log('ZKEMKeeper: regsvr32 succeeded but this process cannot yet see the class '
-        + '(merged-view cache); treating as registered. DLL: ' + DllPath);
+    Log('ZKEMKeeper: regsvr32 succeeded but this process cannot see the class '
+        + 'pointing at our DLL; treating as registered. DLL: ' + DllPath);
 
   if Failure = '' then
   begin

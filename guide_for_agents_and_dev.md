@@ -5668,6 +5668,12 @@ create folders in ProgramData? Prove the first one on the owner's PC (still brok
   **registered** (`regsvr32`, elevated, 32-bit) along with its dependencies.
   `[FIELD: an unregistered COM server was one of the two root causes of the MB2000
   outage; registering it on the client PC was part of the remedy]`
+- **…and its network transport `tcpcomm.dll` must be loadable.** `zkemsdk.dll` loads its
+  transports by bare name at connect time; they ship in `app/sdk` and the driver preloads
+  them by absolute path (`zkemkeeper_guide.md` §1). Without them the COM object is created
+  and only `Connect_Net` fails, in ~0.1 s. The ProgID is `zkemkeeper.ZKEM` — a log line
+  reporting `CZKEM` not found came from a check that was wrong before 2026-10-27.
+  `[CODE]` `[FIELD: fresh gym PC, 2026-10-26]`
 - **Backend base URL** is a single constant, `app/core/app_const.py::MONCLUB_BASE_URL`.
   Not runtime-configurable and not editable from the UI. `[CODE]`
 - **On-site script pack**: `tools/mb2000_scripts/` (`0_MENU.ps1` plus 14 scripts — COM

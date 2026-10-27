@@ -45,6 +45,41 @@ Used for MB2000-class multi-bio terminals, which `plcommpro.dll` **cannot** driv
   (`regsvr32`, **elevated**, **32-bit**), along with its dependencies.
   `[FIELD: an unregistered COM server was one of the two root causes of the MB2000
   outage; registering it on the client PC was part of the remedy]`
+- **The ProgID is `zkemkeeper.ZKEM`, not `zkemkeeper.CZKEM`.** The shipped
+  `app/sdk/zkemkeeper.dll` registers only `zkemkeeper.ZKEM` and `zkemkeeper.ZKEM.1`;
+  `CZKEM` is the .NET interop class name. Driver, startup check (`app/ui/app.py`) and
+  installer all try `ZKEMKEEPER_PROG_IDS` (`ZKEM`, `ZKEM.1`, `CZKEM`) in that order.
+  `[CODE]` `[TEST: tests/test_zk_transport_dlls.py]` Before 2026-10-27 the startup check
+  and the installer looked for `CZKEM` only, so `[ZKEMKeeper] ok=False ... ProgID not
+  found` was logged on **every** PC, healthy or not, and the installer re-ran regsvr32 on
+  every install. That false red cost a wrong fix during the 2026-10-26 outage below.
+  `[FIELD]`
+- **Registration is not enough either: `zkemsdk.dll` loads its transports by bare name
+  at connect time** — `tcpcomm.dll` (network), `comms.dll`, `usbcomm.dll`, `rscomm.dll`,
+  `usbstd.dll`. They are not in its import table (static imports: `KERNEL32`, `commpro`),
+  so the COM object is created fine and only `Connect_Net` fails, returning `False` in
+  ~0.1 s with ping and TCP 4370 both fine. A bare `LoadLibrary` from a vendor DLL uses the
+  process search order (exe dir, system dirs, cwd, PATH), never the calling DLL's folder.
+  Why bare name: `zkemsdk.dll` imports `LoadLibraryA` and no system-directory API
+  (`[CODE: import table]`), and copying them into SysWOW64 fixed the gym — a path built
+  from the exe's or zkemsdk's own folder would not have been fixed by that. Which point of
+  the connect loads `tcpcomm.dll` is `[UNVERIFIED]`: against a local fake terminal that
+  never answered the handshake it was not loaded at all, so it is not the opening packet.
+  The `zkemsdk.dll` / `commpro.dll` copies also put in SysWOW64 that day cannot have
+  mattered: both are static imports already loaded from `sdk`. The five came from the dev
+  PC's ZKTeco SDK install, whose `zkemkeeper.dll`, `zkemsdk.dll` and `commpro.dll` are
+  hash-identical to ours. They now ship in `app/sdk` and
+  `_preload_transport_dlls()` loads them by absolute path, once per process, before the
+  COM object is created; Windows then resolves the bare-name load to the module already
+  loaded. `[CODE]` `[TEST: tests/test_zk_transport_dlls.py]` Verified 2026-10-27 under
+  32-bit Python 3.14: after the preload, `LoadLibraryW("tcpcomm.dll")` returned the
+  `app\sdk` copy although `C:\Windows\SysWOW64\tcpcomm.dll` also exists. `[FIELD]`
+  The startup line now logs `tcpcomm=<path>` and `ok` requires it.
+  `[FIELD: 2026-10-26, gym PC "Accueil" replaced by a fresh PC — neither MB2000 ever
+  connected (Connect_Net False on every try for 12 h); `C:\Windows\SysWOW64\tcpcomm.dll`
+  absent; copying the five DLLs + zkemsdk/commpro into SysWOW64 by hand fixed it at
+  2026-10-27 08:40 (both connected, roles and read-back restored). Older PCs had worked
+  only because ZKTeco software had once put the DLLs in SysWOW64.]`
 - **Bitness: 32-bit**, hosted in-process. A 32-bit subprocess sidecar remains the
   designed fallback if in-process COM fails on real hardware; only `_com_factory` would
   change. `[COMMENT]`
@@ -1248,6 +1283,11 @@ decoded reason. `[CODE]`
   payload projection, and a regression pin that the PullSDK door path is unchanged
 - protocol conformance via `isinstance` (a conformance check only — exercises no
   behaviour)
+- transports and ProgID `[TEST — tests/test_zk_transport_dlls.py]`: every
+  `_TRANSPORT_DLLS` entry ships in `app/sdk` as a 32-bit PE; the shipped `zkemkeeper.dll`
+  carries `ZKEMKEEPER_PROG_IDS[0]` and never `CZKEM`; `_preload_transport_dlls` loads by
+  absolute path, reports missing/failed DLLs without raising, pins the handles, and runs
+  once per process
 - the fingerprint-chain telemetry `[TEST — tests/test_fingerprint_telemetry.py]`:
   per-chunk aggregation, `failed_pins` reasons for all four causes, template-refusal
   and version-mismatch events, wedge / reconnect / abandon events, device counters,
