@@ -73,6 +73,78 @@ _VERIFY_METHOD_SCAN_MODE: Dict[int, str] = {
     3: "RFID_CARD",      # multi-verify: RF card
 }
 
+# ProgIDs tried, in order, to create the COM object. The zkemkeeper.dll we ship
+# (app/sdk) registers ONLY "zkemkeeper.ZKEM" and "zkemkeeper.ZKEM.1" -- read from the
+# DLL's embedded registration strings, 2026-10-27. "zkemkeeper.CZKEM" is the .NET
+# interop class name, kept last for other builds. app/ui/app.py's startup check reads
+# this same tuple: it used to look for CZKEM only and so logged "not registered" on
+# every PC, which sent a 2026-10-26 outage after the wrong fix.
+ZKEMKEEPER_PROG_IDS: tuple[str, ...] = ("zkemkeeper.ZKEM", "zkemkeeper.ZKEM.1", "zkemkeeper.CZKEM")
+
+# Transport DLLs zkemsdk.dll loads BY BARE NAME at connect time. They are not in its
+# import table (static imports: KERNEL32, commpro only), so creating the COM object
+# succeeds without them and only Connect_Net fails -- returns False in ~0.1 s with the
+# network fine. A bare LoadLibrary from inside a vendor DLL uses the PROCESS search
+# order (exe dir, system dirs, cwd, PATH), never the calling DLL's own folder, so the
+# copies in <install>\sdk are invisible to it. They used to resolve only on PCs where
+# ZKTeco software had once put them in SysWOW64; a fresh gym PC had none and neither
+# MB2000 ever connected (2026-10-26). Same trap and same fix as zkfinger.py's
+# _RUNTIME_LOADED_VENDOR_DLLS: preload by ABSOLUTE path, after which Windows resolves
+# the bare-name load to the module already in the process. They come from the ZKTeco SDK
+# install whose zkemsdk/commpro/zkemkeeper are hash-identical to ours. tcpcomm is the
+# network one; the others serve USB/serial (usbstd also needs
+# libusb0.dll, which we do not ship -- where it is absent usbstd reports "failed",
+# which is harmless for TCP).
+_TRANSPORT_DLLS: tuple[str, ...] = (
+    "tcpcomm.dll",
+    "comms.dll",
+    "usbcomm.dll",
+    "rscomm.dll",
+    "usbstd.dll",
+)
+_transport_lock = threading.Lock()
+_transport_handles: List[Any] = []  # keeps each preloaded module pinned for the process
+_transport_done = False
+
+
+def _preload_transport_dlls(sdk_dir: Optional[str] = None, loader: Optional[Callable[[str], Any]] = None) -> Dict[str, str]:
+    """Load the zkemsdk transport DLLs from our sdk folder by absolute path, once per process.
+
+    Returns {dll name: "loaded" | "missing" | "failed: <error>"} for the call that did
+    the work, {} afterwards. Best-effort: never raises -- a DLL that will not load is
+    reported, and Connect_Net then fails exactly as it did before this existed.
+    """
+    global _transport_done
+    with _transport_lock:
+        if _transport_done:
+            return {}
+        _transport_done = True
+        if sdk_dir is None:
+            try:
+                from app.core.utils import resolve_resource_path
+                sdk_dir = str(resolve_resource_path("sdk/zkemsdk.dll").parent)
+            except Exception as exc:
+                logger.warning("[ZKEM] transport DLLs not preloaded: sdk folder not found (%s)", exc)
+                return {}
+        if loader is None:
+            import ctypes
+            loader = ctypes.WinDLL
+        report: Dict[str, str] = {}
+        for name in _TRANSPORT_DLLS:
+            path = os.path.join(sdk_dir, name)
+            if not os.path.isfile(path):
+                report[name] = "missing"
+                continue
+            try:
+                _transport_handles.append(loader(path))
+                report[name] = "loaded"
+            except Exception as exc:
+                report[name] = f"failed: {exc}"
+        logger.info("[ZKEM] transport DLLs from %s: %s", sdk_dir,
+                    " ".join(f"{k}={v}" for k, v in report.items()))
+        return report
+
+
 _DEFAULT_CMD_TIMEOUT_SEC = 10.0
 _CONNECT_TIMEOUT_SEC = 20.0
 _EVENT_QUEUE_MAX = 4096
@@ -294,11 +366,12 @@ def _make_default_com_factory(driver: "ZKStandaloneDevice") -> Callable[[], Any]
     Uses DispatchWithEvents so the terminal's real-time OnAttTransactionEx lands in
     a sink bound (via closure) to this driver's _on_att_event — a plain Dispatch
     would register no sink and events would silently never arrive. Lazy-imports
-    pywin32 so this module stays importable in tests/CI without COM. Tries the
-    ProgIDs seen in the wild ('zkemkeeper.ZKEM' / 'zkemkeeper.CZKEM').
+    pywin32 so this module stays importable in tests/CI without COM. Tries
+    ZKEMKEEPER_PROG_IDS in order. Preloads the transport DLLs first (see _TRANSPORT_DLLS).
     """
 
     def _factory() -> Any:  # pragma: no cover - real COM only
+        _preload_transport_dlls()
         import win32com.client as w32
 
         class _AttEvents:
@@ -312,7 +385,7 @@ def _make_default_com_factory(driver: "ZKStandaloneDevice") -> Callable[[], Any]
                     logger.exception("%s sink handler error", driver._prefix)
 
         last_exc: Optional[Exception] = None
-        for prog_id in ("zkemkeeper.ZKEM", "zkemkeeper.CZKEM", "zkemkeeper.ZKEM.1"):
+        for prog_id in ZKEMKEEPER_PROG_IDS:
             try:
                 return w32.DispatchWithEvents(prog_id, _AttEvents)
             except Exception as exc:
