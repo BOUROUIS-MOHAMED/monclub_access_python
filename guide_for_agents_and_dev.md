@@ -4337,13 +4337,16 @@ cannot be repaired or replayed until it can be read/written again. `[CODE: db.ap
 db.off_hours_in_play, MainApp._apply_off_hours_db]` `[TEST: tests/test_off_hours_db.py]`
 
 QR uses the exact closure, with no five-minute lead, and refuses with `OFF_HOURS` in trial
-and enforce modes when all date-valid grants are closed. Unknown/no-hours grants remain
+and enforce modes when all date-valid grants are closed. The closure is judged on the PC clock
+(`verify_totp(pc_now_unix=)`, default `time.time()`), NOT the device scan time: the scan time may
+be up to an hour off the PC's and `OFF_HOURS` is final, so a slow turnstile clock would otherwise
+refuse a member whose plan has reopened. Every other scan-time check is unchanged. Unknown/no-hours grants remain
 open; untrusted snapshots, missing offset, suspect clock and exceptions add no hours
 refusal. Date-invalid memberships retain the date reason; existing no-hours order stays
 unchanged. Resilient verification does not retry a matched `OFF_HOURS`. Popup, dashboard,
 realtime and member history share « Hors horaires de votre formule ». `[CODE:
 access_dates.qr_off_hours_refused, access_verification.verify_totp, PopupWindow.A_DENY]`
-`[TEST: tests/test_off_hours_qr.py]`
+`[TEST: tests/test_off_hours_qr.py::test_slow_device_clock_is_judged_by_the_pc_clock_for_hours]`
 
 Non-ULTRA devices are **unsupported for off-hours**: both holds and releases reach them
 only at the next full sync, not on the minute tick. `still_on_devices` skips every

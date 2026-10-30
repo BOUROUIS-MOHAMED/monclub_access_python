@@ -650,6 +650,7 @@ def verify_totp(
     roster_current: bool = True,
     access_days: Optional[AccessDaysSnapshot] = None,
     access_days_index: Optional[AccessDaysSnapshot] = None,
+    pc_now_unix: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Validate a scanned QR/TOTP string.
 
@@ -667,6 +668,10 @@ def verify_totp(
     -- a caller whose index and own credentials are of different generations (the ULTRA
     rescue) gives each its own day; the index is used only when it covers the scan's counter
     window, so only this function knows which one matched (review R2).
+
+    ``pc_now_unix``: the PC clock for the plan-hours check ONLY (``OFF_HOURS`` is a final
+    refusal, and the scan time ``now_unix`` is the device's clock, accepted up to an hour away
+    from the PC's). None = ``time.time()``. Every other check keeps the scan time.
     """
     t0 = time.perf_counter()
 
@@ -880,7 +885,9 @@ def verify_totp(
                                account_on_roster=(roster_check == ROSTER_IN_BY_ACCOUNT),
                                roster_current=(roster_current or not used_index)) == DATE_NOT_TODAY:
                 _hours_reason = "DENY_NOT_ALLOWED_TODAY"
-            elif qr_off_hours_refused(_snap, grants=grants, users_by_am=users_by_am, now_epoch=now):
+            elif qr_off_hours_refused(
+                    _snap, grants=grants, users_by_am=users_by_am,
+                    now_epoch=float(pc_now_unix) if pc_now_unix is not None else time.time()):
                 _hours_reason = "OFF_HOURS"
         if _hours_reason:
             return {"allowed": False, "reason": _hours_reason, "scanMode": "QR_TOTP",

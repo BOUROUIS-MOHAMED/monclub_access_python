@@ -19,15 +19,17 @@ def snapshot(**kw):
         utc_offset_sec=3600, **kw)
 
 
-def check(when="2026-10-26T23:00:00", *, mode="trial", snap=None, users=None, grants=(1,), index=False):
+def check(when="2026-10-26T23:00:00", *, mode="trial", snap=None, users=None, grants=(1,), index=False,
+          pc_when=None):
     now = datetime.fromisoformat(when + "+01:00").timestamp()
+    pc_now = datetime.fromisoformat((pc_when or when) + "+01:00").timestamp()
     cred = _cred(1, list(grants), random.Random(71))
     settings = _settings(totp_roster_check_mode=mode)
     idx = av.build_totp_index([cred], settings, now, margin=1) if index else None
     return av.verify_totp(scanned=_code_for(cred, settings, now), settings=settings,
         creds_payload=[cred], users_by_am={99: _user(99)} if users is None else users, users_by_card={},
         now_unix=now, totp_index=idx, access_days=snap or snapshot(),
-        access_days_index=snap or snapshot())
+        access_days_index=snap or snapshot(), pc_now_unix=pc_now)
 
 
 @pytest.mark.parametrize("mode", ["trial", "enforce"])
@@ -42,6 +44,15 @@ def test_qr_uses_exact_end_even_during_turnstile_lead(when, allowed):
     result = check(when, users={1: _user(1)})
     assert result["allowed"] is allowed
     assert result["reason"] == ("ALLOW" if allowed else "OFF_HOURS")
+
+
+def test_slow_device_clock_is_judged_by_the_pc_clock_for_hours():
+    # Closed until 06:00 Tunis. The device clock reads 05:58 (2 min slow) but the PC says 06:01.
+    slow = check("2026-10-27T05:58:00", pc_when="2026-10-27T06:01:00", users={1: _user(1)})
+    assert slow["allowed"] and slow["reason"] == "ALLOW"
+    # The other way round: a device clock that is ahead does not open a closed plan.
+    fast = check("2026-10-27T06:01:00", pc_when="2026-10-27T05:58:00", users={1: _user(1)})
+    assert not fast["allowed"] and fast["reason"] == "OFF_HOURS"
 
 
 def test_two_grants_one_open_allows():

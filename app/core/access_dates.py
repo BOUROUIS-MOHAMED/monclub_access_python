@@ -562,7 +562,9 @@ def effective_credentials(
 
 
 def qr_off_hours_refused(snapshot, *, grants, users_by_am, now_epoch) -> bool:
-    """Refuse only when every date-valid granted membership is closed; uncertainty opens."""
+    """Refuse only when every date-valid granted membership is closed; uncertainty opens.
+    ``now_epoch`` must be the PC clock, never a device scan time (a slow device clock would
+    refuse a member the plan already lets in)."""
     try:
         if (snapshot is None or not snapshot.active or snapshot.utc_offset_sec is None
                 or snapshot.clock_suspect):
