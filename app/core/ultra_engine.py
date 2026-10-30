@@ -7236,7 +7236,10 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         best-effort audit record, and the device's own log retains the event).
         """
         if not _service_gate.keeps_history(self._settings):
-            return  # Keep entry history off: no row for this device (spec section 3)
+            # Entry limits need local and uploaded passes even on history-off devices.
+            from app.core.db import limited_user_ids
+            if user_id not in limited_user_ids():
+                return
         item = {
             "event_id": event_id,
             "door_id": door_id,

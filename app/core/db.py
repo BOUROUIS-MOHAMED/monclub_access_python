@@ -106,6 +106,8 @@ _read_pool: List[Tuple[str, sqlite3.Connection]] = []  # idle (db_path, connecti
 # ---------------------------------------------------------------------------
 _local_state_gen_lock = threading.Lock()
 _local_state_gen = [0]
+_limited_user_ids_lock = threading.Lock()
+_limited_user_ids_cache = (-1, frozenset())
 
 
 def bump_local_state_generation() -> None:
@@ -131,6 +133,33 @@ def get_local_state_generation() -> int:
             return _local_state_gen[0]
     except Exception:
         return 0
+
+
+def limited_user_ids() -> frozenset[int]:
+    """People with entry-limited memberships on this PC, cached at one generation."""
+    global _limited_user_ids_cache
+    with _limited_user_ids_lock:
+        generation = get_local_state_generation()
+        if _limited_user_ids_cache[0] == generation:
+            return _limited_user_ids_cache[1]
+        try:
+            with get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT user_id FROM sync_users u WHERE user_id IS NOT NULL AND "
+                    "(EXISTS (SELECT 1 FROM member_access_window w WHERE w.active_membership_id = u.active_membership_id "
+                    "AND w.entry_limits_json IS NOT NULL) OR EXISTS "
+                    "(SELECT 1 FROM sync_upcoming_users w WHERE w.active_membership_id = u.active_membership_id "
+                    "AND w.entry_limits_json IS NOT NULL)) "
+                    "UNION SELECT user_id FROM sync_users_held u WHERE user_id IS NOT NULL AND "
+                    "(EXISTS (SELECT 1 FROM member_access_window w WHERE w.active_membership_id = u.active_membership_id "
+                    "AND w.entry_limits_json IS NOT NULL) OR EXISTS "
+                    "(SELECT 1 FROM sync_upcoming_users w WHERE w.active_membership_id = u.active_membership_id "
+                    "AND w.entry_limits_json IS NOT NULL))").fetchall()
+            users = frozenset(int(r[0]) for r in rows)
+        except Exception:
+            users = frozenset()
+        _limited_user_ids_cache = (generation, users)
+        return users
 
 
 # ---------------------------------------------------------------------------

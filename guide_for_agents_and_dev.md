@@ -248,7 +248,9 @@ adding evidence. Full grading in [`pullsdk_guide.md`](pullsdk_guide.md) §2.
 - **In service** (`active` and `accessDevice`, `app/core/device_service_gate.py`): off = no worker
   (`UltraEngine.start`, `ultra_worker_pool.py::reconcile`), no push (`device_sync.py`), and
   `_process_event` drops the device's events as a second check. **Keep entry history** off:
-  `_enqueue_history` writes no row for that device. Operator actions from the local UI (manual door
+  `_enqueue_history` skips rows except people with entry-limited memberships on this PC
+  (1.4.39; see Planned holds). `[CODE: db.limited_user_ids, UltraDeviceWorker._enqueue_history]`
+  Operator actions from the local UI (manual door
   open, control panel, Erase wizard) stay available `[CODE: local_access_api_v2.py, not gated]`.
   `[TEST: test_ultra_pc_entry.py, test_ultra_worker_pool.py, test_device_push_rules.py]`
 - **Changes apply without a restart.** Polling knobs: `_apply_poll_settings` on every
@@ -4370,6 +4372,13 @@ adds no entry hold and clears its reasons; hours keep their existing fail-open p
 `[CODE: db._read_entry_limit_inputs, db.list_allowed_passes_for_users,
 db.apply_off_hours, entry_limits.merged_state]`
 `[UNVERIFIED: tests/test_entry_limits_db.py written, not run; real hardware and timing]`
+
+With Keep entry history off, `_enqueue_history` still records rows whose `user_id`
+belongs to a limited membership on this PC (roster or held). `db.limited_user_ids`
+caches that set per local-state generation; a failed read yields an empty set.
+Other history-off rows and the desk-alert history gate keep their existing behavior.
+`[CODE: db.limited_user_ids, UltraDeviceWorker._enqueue_history]`
+`[UNVERIFIED: tests/test_entry_limits_history.py written, not run]`
 
 QR uses the exact closure, with no five-minute lead, and refuses with `OFF_HOURS` in trial
 and enforce modes when all date-valid grants are closed. The closure is judged on the PC clock
