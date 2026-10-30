@@ -3,6 +3,7 @@ from app.core import db
 
 
 def still_on_devices(ids, limit=50):
+    from app.core.device_service_gate import device_in_service
     from app.core.device_sync import derive_member_pin, device_pin_scheme
     from app.core.off_hours import live_pins_for_device
     requested = set(ids)
@@ -14,6 +15,8 @@ def still_on_devices(ids, limit=50):
     for device in db.list_sync_devices_payload():
         if str(device.get("accessDataMode") or "").upper() != "ULTRA":
             continue
+        if not device_in_service(device):
+            continue  # No worker runs for it: a hold queued for it could never be served.
         scheme = device_pin_scheme(device)
         owned = db.list_confirmed_device_sync_pins(device_id=int(device["id"]))
         live_pins = live_pins_for_device(device, live)

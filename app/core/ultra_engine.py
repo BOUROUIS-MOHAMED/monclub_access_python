@@ -5198,8 +5198,10 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         from app.core.off_hours import held_pins_for_device, split_removals
         held_pins = held_pins_for_device(self._device)
         if roster_count <= 0:
-            _tel.warn("REVOKE_SKIP_EMPTY_ROSTER", worker=self._tel_wid)
             if not held_pins & set(owned):
+                # Only a pass that really skips says so; one that goes on to remove planned
+                # (off-hours) pins is not a skip.
+                _tel.warn("REVOKE_SKIP_EMPTY_ROSTER", worker=self._tel_wid)
                 self._last_revoke_step = "skipped"
                 return False
         # The guards below hold the WHOLE step back: nothing is attempted, so a pending

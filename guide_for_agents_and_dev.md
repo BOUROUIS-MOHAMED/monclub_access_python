@@ -1992,7 +1992,8 @@ abort that finalised a revocation would silently drop it. `[TEST: test_removal_c
 
 Off-hours removals are an independent exact set: if the real desired roster is empty, or
 unplanned removals exceed its original ceiling, only planned pins may still be removed.
-An empty standalone roster still logs `REVOKE_SKIP_EMPTY_ROSTER`. `planned_count` is used
+An empty standalone roster logs `REVOKE_SKIP_EMPTY_ROSTER` only when the pass really skips (no
+planned pin is owned); a pass that goes on to remove planned pins does not log it. `planned_count` is used
 only to keep the lease gate active, including planned-only removals; a blocked lease
 permits neither set. `[CODE: UltraDeviceWorker._neutralise_revoked_pins,
 DeviceSyncEngine._sync_one_device, push_safety.check_bulk_removal]`
@@ -4350,7 +4351,8 @@ access_dates.qr_off_hours_refused, access_verification.verify_totp, PopupWindow.
 
 Non-ULTRA devices are **unsupported for off-hours**: both holds and releases reach them
 only at the next full sync, not on the minute tick. `still_on_devices` skips every
-non-ULTRA device and the targeted dispatcher reaches ULTRA workers only. `[CODE:
+non-ULTRA device and every ULTRA device that is out of service (no worker, `device_in_service`),
+and the targeted dispatcher reaches ULTRA workers only. `[CODE:
 off_hours_push.still_on_devices, UltraEngine.request_sync_now]`
 `[UNVERIFIED: the assumption that no gym runs DEVICE mode has not been checked]`
 
