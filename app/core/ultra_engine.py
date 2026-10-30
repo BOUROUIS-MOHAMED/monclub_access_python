@@ -1452,14 +1452,23 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         ok = False
         try:
             from app.core import db
+            from app.core.device_sync import member_deliverable_to_device
             # A queued hold must never outlive the local decision (release, fast patch,
             # logout). A queued release must not restore a row now held by dates.
+            members = []
             if hold:
                 wanted = any(int(r["activeMembershipId"]) == am for r in db.list_off_hours_held_rows())
             else:
-                wanted = bool(db.list_sync_users_by_active_membership_ids({am}))
+                members = db.list_sync_users_by_active_membership_ids({am})
+                wanted = bool(members)
             if not wanted:
                 ok = True
+            elif (not hold and release_token is not None and db.off_hours_release_acked(
+                    active_membership_id=am, device_id=self._device_id, queued_at=release_token)):
+                ok = True  # This device already delivered this release; nothing to repeat.
+            elif (not hold and members and isinstance(getattr(self, "_device", None), dict)
+                    and not any(member_deliverable_to_device(m, self._device) for m in members)):
+                ok = True  # The device's allowedMemberships filter never delivers this member.
             else:
                 self._off_hours_executing_thread = threading.get_ident()
                 if getattr(self._sdk, "owns_event_source", False):

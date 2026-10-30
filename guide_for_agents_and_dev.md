@@ -2905,15 +2905,28 @@ Off-hours releases have durable delivery ownership: `off_hours_release_pending` 
 written in the same transaction as the local release, including fail-open releases.
 Startup and the minute tick replay it even in manual mode. A worker's successful
 targeted release writes `off_hours_release_ack`; the queue clears only after every
-ULTRA device with current ownership or a durable removal fact has acknowledged that
-generation. Failed delivery or acknowledgement keeps the obligation across restarts.
+ULTRA device that is in service (`device_in_service`), still delivers the member (its
+`allowedMemberships` filter, `device_sync.membership_allowed`) and owns the pin has
+acknowledged that generation. Owning = a confirmed `device_sync_state` row, or a
+`v2_removal_log` row whose `removed_at` is at/after the start of the hold being released
+(minus 1 h of clock skew: the log uses the server-corrected clock, the hold time is the PC
+local `now_iso()` text copied into `off_hours_release_pending.held_at`; both are compared as
+epochs). A pending row without `held_at` (older database) counts any logged removal. The log
+is never pruned, so without this an old removal, an out-of-service device or a filtered-out
+device kept the release pending for ever. A worker skips a release it already acknowledged
+for the current `queued_at` and treats a device that filters the member out as done, but the
+app still enqueues the release on every ULTRA worker (it does not narrow the dispatch).
+Failed delivery or acknowledgement keeps the obligation across restarts.
 A later hold, forgotten membership or logout cancels it; date-held rows are not queued.
 If queue storage itself is unreadable, a forced release still commits the local restore,
 logs the storage failure and returns release ids for volatile delivery; restart durability
 then requires repairing that storage. `[CODE: db.apply_off_hours]`
-`[CODE: db.apply_off_hours, ::acknowledge_off_hours_release,
+`[CODE: db.apply_off_hours, ::acknowledge_off_hours_release, ::off_hours_release_acked,
 UltraDeviceWorker._drain_off_hours_commands, off_hours_push.dispatch_off_hours]`
 `[TEST: tests/test_off_hours_db.py::test_release_ack_requires_every_owned_ultra_and_ignores_old_generation,
+::test_out_of_service_device_does_not_block_release_ack,
+::test_device_filtering_the_member_out_does_not_block_release_ack,
+::test_stale_removal_before_the_hold_does_not_make_a_device_required,
 tests/test_off_hours_app_wiring.py::test_tick_replays_durable_release_after_restart_and_ok_drain_clears_it]`
 
 An **authoritative revocation** is not an ordinary member change. It travels as a
@@ -4296,8 +4309,9 @@ Workers keep replaceable off-hours commands, drain one at a time over their exis
 connection, re-check the local row, and retry a failed command after 60 s. A release replaces
 a queued hold and follows an active hold. A worker-side failure never escalates this request
 to a full pass; unavailable workers leave durable releases for the next tick or startup.
-Only an ok release drain on every ULTRA device that owned the pin (including its removal
-log proof) clears the SQLite obligation; enqueueing does not. Old-generation acknowledgements
+Only an ok release drain on every in-service ULTRA device that delivers the member and owned
+the pin (including a removal-log proof from this hold, see §3.4) clears the SQLite obligation;
+enqueueing does not. Old-generation acknowledgements
 cannot clear a newer release. Held-again and date-held members are not restored. Ownership,
 device plan filters, ACCOUNT collapse and leases still apply. An open eligible membership
 keeps the person's ACCOUNT pin. `[CODE: off_hours_push.dispatch_off_hours,

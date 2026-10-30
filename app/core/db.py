@@ -1386,6 +1386,8 @@ def _create_protocol2_tables(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS off_hours_release_ack "
                  "(active_membership_id INTEGER NOT NULL, device_id INTEGER NOT NULL, "
                  "queued_at TEXT NOT NULL, PRIMARY KEY (active_membership_id, device_id))")
+    # When the hold that this release ends began (now_iso() local text); NULL on older rows.
+    _ensure_column(conn, "off_hours_release_pending", "held_at", "held_at TEXT")
     # Member fees F3c: _SYNC_USER_COLUMNS gained fees_json and a hold or a restore copies column
     # for column, so the held copy carries it too (guide §3.12).
     _ensure_column(conn, "sync_users_held", "fees_json", "fees_json TEXT")
@@ -2097,9 +2099,14 @@ def apply_off_hours(*, pc_now_epoch: float, source: str, force_release: bool = F
         on_roster = {int(r[0]) for r in cur.execute(
             "SELECT active_membership_id FROM sync_users WHERE active_membership_id IS NOT NULL").fetchall()}
         state, windows, intent = {}, {}, set()
+        hold_began = {}  # active_membership_id -> held_at text (when the current hold began)
         skipped = "failed_input" if force_release else None
         try:
-            intent = {int(r[0]) for r in cur.execute("SELECT active_membership_id FROM off_hours_hold")}
+            hold_began = {int(r[0]): r[1] for r in cur.execute(
+                "SELECT active_membership_id, held_at FROM sync_users_held WHERE held_reason = 'off_hours'")}
+            intent_rows = cur.execute("SELECT active_membership_id, held_at FROM off_hours_hold").fetchall()
+            hold_began.update({int(r[0]): r[1] for r in intent_rows})
+            intent = {int(r[0]) for r in intent_rows}
             if not force_release:
                 row = cur.execute("SELECT * FROM access_v2_state WHERE id=1").fetchone()
                 state = dict(row) if row else {}
@@ -2161,8 +2168,10 @@ def apply_off_hours(*, pc_now_epoch: float, source: str, force_release: bool = F
         # The local restore and its durable delivery obligation commit together.
         try:
             cur.executemany(
-                "INSERT OR IGNORE INTO off_hours_release_pending (active_membership_id, queued_at) VALUES (?, ?)",
-                [(am, datetime.utcnow().isoformat(timespec="microseconds") + "Z") for am in released])
+                "INSERT OR IGNORE INTO off_hours_release_pending (active_membership_id, queued_at, held_at) "
+                "VALUES (?, ?, ?)",
+                [(am, datetime.utcnow().isoformat(timespec="microseconds") + "Z", hold_began.get(am))
+                 for am in released])
             for table in ("off_hours_release_pending", "off_hours_release_ack"):
                 cur.executemany(f"DELETE FROM {table} WHERE active_membership_id = ?",
                                 [(am,) for am in set(plan.target) | to_date])
@@ -2225,14 +2234,42 @@ def list_off_hours_release_pending() -> Dict[int, str]:
             "SELECT active_membership_id, queued_at FROM off_hours_release_pending")}
 
 
+# A removal-log time is the server-corrected clock, the hold time the PC's: allow this much skew.
+_OFF_HOURS_REMOVAL_SKEW_SEC = 3600.0
+
+
+def _local_text_epoch(text: Any) -> float | None:
+    """Epoch of a ``now_iso()`` text ("YYYY-MM-DD HH:MM:SS", PC local time); None if unreadable."""
+    try:
+        return datetime.strptime(str(text).strip(), "%Y-%m-%d %H:%M:%S").timestamp()
+    except Exception:
+        return None
+
+
+def off_hours_release_acked(*, active_membership_id: int, device_id: int, queued_at: str) -> bool:
+    """True when this device already acknowledged the release generation ``queued_at``."""
+    try:
+        with get_conn() as conn:
+            return conn.execute(
+                "SELECT 1 FROM off_hours_release_ack WHERE active_membership_id = ? AND device_id = ? "
+                "AND queued_at = ?", (int(active_membership_id), int(device_id), str(queued_at))
+            ).fetchone() is not None
+    except Exception:
+        return False  # On doubt the worker simply delivers again.
+
+
 def acknowledge_off_hours_release(*, active_membership_id: int, device_id: int,
                                   queued_at: str, no_longer_wanted: bool = False) -> None:
-    """Acknowledge this release generation; only its last owned ULTRA device clears it."""
-    from app.core.device_sync import derive_member_pin, normalize_pin_scheme
+    """Acknowledge this release generation; the queue clears when every ULTRA device that is in
+    service, delivers this member and owns its pin (confirmed row, or a removal at/after the hold
+    began) has acknowledged."""
+    from app.core.device_service_gate import device_in_service
+    from app.core.device_sync import (allowed_membership_ids, derive_member_pin, membership_allowed,
+                                      normalize_pin_scheme)
     am = int(active_membership_id)
 
     def _write(conn, profile):
-        current = conn.execute("SELECT queued_at FROM off_hours_release_pending "
+        current = conn.execute("SELECT queued_at, held_at FROM off_hours_release_pending "
                                "WHERE active_membership_id = ?", (am,)).fetchone()
         if current is None or str(current[0]) != queued_at:
             return  # An old command cannot clear a later window's release.
@@ -2247,17 +2284,40 @@ def acknowledge_off_hours_release(*, active_membership_id: int, device_id: int,
                 "VALUES (?, ?, ?)", (am, int(device_id), queued_at))
             member = _coerce_user_row_to_payload(dict(row))
             required = set()
+            # None (old row, unreadable text) keeps the old rule: any logged removal counts.
+            hold_epoch = _local_text_epoch(current[1])
             for stored in conn.execute("SELECT * FROM sync_devices WHERE UPPER(access_data_mode) = 'ULTRA'"):
                 device = _coerce_device_row_to_payload(_expand_device_json_fields(dict(stored)))
                 did = int(device["id"])
+                # No worker runs for a device out of service, and a device whose
+                # allowedMemberships filter excludes the member never receives it: neither
+                # can acknowledge, and neither holds a pin to give back.
+                if not device_in_service(device):
+                    continue
+                if not membership_allowed(member, allowed_membership_ids(device)):
+                    continue
                 pin, _ = derive_member_pin(member, normalize_pin_scheme(device.get("pinScheme")))
+                if not pin:
+                    required.add(did)
+                    continue
                 # A successful hold deletes device_sync_state. The durable removal log
-                # still proves this was a MonClub pin, including after a process restart.
+                # still proves this was a MonClub pin, including after a process restart;
+                # only a removal from this hold counts (the log is never pruned).
                 owned = conn.execute(
-                    "SELECT 1 FROM device_sync_state WHERE device_id = ? AND pin = ? AND ownership_confirmed = 1 "
-                    "UNION ALL SELECT 1 FROM v2_removal_log WHERE device_id = ? AND pin = ? LIMIT 1",
-                    (did, pin, did, pin)).fetchone()
-                if owned or not pin:
+                    "SELECT 1 FROM device_sync_state WHERE device_id = ? AND pin = ? AND ownership_confirmed = 1",
+                    (did, pin)).fetchone()
+                if not owned:
+                    removed = conn.execute(
+                        "SELECT removed_at FROM v2_removal_log WHERE device_id = ? AND pin = ?",
+                        (did, pin)).fetchone()
+                    if removed is not None:
+                        try:
+                            removed_at = float(removed[0])
+                        except (TypeError, ValueError):
+                            removed_at = None
+                        owned = (hold_epoch is None or removed_at is None
+                                 or removed_at >= hold_epoch - _OFF_HOURS_REMOVAL_SKEW_SEC)
+                if owned:
                     required.add(did)
             acknowledged = {int(r[0]) for r in conn.execute(
                 "SELECT device_id FROM off_hours_release_ack WHERE active_membership_id = ? AND queued_at = ?",

@@ -174,3 +174,53 @@ def test_release_ack_requires_every_owned_ultra_and_ignores_old_generation(db):
     assert db.list_off_hours_release_pending()[1] != token
     db.acknowledge_off_hours_release(active_membership_id=1, device_id=1, queued_at=token)
     assert _ids("off_hours_release_pending") == {1}
+
+
+def _release_with_removals(db, devices, removed_ids):
+    seed(db)
+    db._run_db_write_sync("test", lambda c, p: [db._insert_device_row(c.cursor(), d) for d in devices])
+    for d in devices:
+        db.save_device_sync_state(device_id=d["id"], pin="1", desired_hash="h", ok=True, error=None)
+    hold(db)
+    for did in removed_ids:
+        db.clear_device_revocation_state(device_id=did, pin="1")
+    hold(db, "2026-10-27T05:55:00")
+    return db.list_off_hours_release_pending()[1]
+
+
+def test_out_of_service_device_does_not_block_release_ack(db):
+    from tests.test_account_pin_device_sites import _pullsdk_device
+    # Device 2 has no worker, so it can never acknowledge; it must not hold the queue open.
+    token = _release_with_removals(
+        db, [_pullsdk_device(id=1), _pullsdk_device(id=2, active=False)], (1, 2))
+    db.acknowledge_off_hours_release(active_membership_id=1, device_id=1, queued_at=token)
+    assert not _ids("off_hours_release_pending") and not _ids("off_hours_release_ack")
+
+
+def test_device_filtering_the_member_out_does_not_block_release_ack(db):
+    from tests.test_account_pin_device_sites import _pullsdk_device
+    token = _release_with_removals(
+        db, [_pullsdk_device(id=1), _pullsdk_device(id=2, allowedMemberships=[424242])], (1, 2))
+    db.acknowledge_off_hours_release(active_membership_id=1, device_id=1, queued_at=token)
+    assert not _ids("off_hours_release_pending")
+
+
+def test_stale_removal_before_the_hold_does_not_make_a_device_required(db):
+    from tests.test_account_pin_device_sites import _pullsdk_device
+    import time
+    seed(db)
+    devices = [_pullsdk_device(id=1), _pullsdk_device(id=2)]
+    db._run_db_write_sync("test", lambda c, p: [db._insert_device_row(c.cursor(), d) for d in devices])
+    for d in devices:
+        db.save_device_sync_state(device_id=d["id"], pin="1", desired_hash="h", ok=True, error=None)
+    # Device 2 lost this pin days ago (an old, unrelated removal that is never pruned).
+    db.clear_device_revocation_state(device_id=2, pin="1")
+    db._run_db_write_sync("test", lambda c, p: c.execute(
+        "UPDATE v2_removal_log SET removed_at = ? WHERE device_id = 2", (time.time() - 3 * 86400,)))
+    hold(db)
+    db.clear_device_revocation_state(device_id=1, pin="1")
+    hold(db, "2026-10-27T05:55:00")
+    assert _q("SELECT held_at FROM off_hours_release_pending")[0]["held_at"]
+    token = db.list_off_hours_release_pending()[1]
+    db.acknowledge_off_hours_release(active_membership_id=1, device_id=1, queued_at=token)
+    assert not _ids("off_hours_release_pending")
