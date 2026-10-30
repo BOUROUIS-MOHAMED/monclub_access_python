@@ -2110,9 +2110,78 @@ def apply_local_date_flips(*, pc_now_epoch: float, grace_days: int, source: str)
     return out
 
 
+def list_allowed_passes_for_users(user_ids, since_created_text) -> dict[int, list[datetime]]:
+    """Read outside the writer; use exactly the local timestamp sent by history upload."""
+    from app.core.device_attendance import _normalize_datetime_text
+
+    ids = sorted({int(uid) for uid in user_ids})
+    result = {uid: [] for uid in ids}
+    if not ids:
+        return result
+    with get_conn() as conn:
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            marks = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                "SELECT user_id, event_time, created_at FROM access_history "
+                f"WHERE allowed = 1 AND user_id IN ({marks}) AND created_at >= ?",
+                (*chunk, since_created_text)).fetchall()
+            for uid, event_time, created_at in rows:
+                try:
+                    text = _normalize_datetime_text(event_time, fallback=created_at)
+                    stamp = datetime.fromisoformat(text)
+                    if stamp.tzinfo is None:
+                        result[int(uid)].append(stamp)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+    return result
+
+
+@dataclass(frozen=True)
+class _EntryLimitInputs:
+    windows: tuple = ()
+    persons: tuple = ()
+    passes: tuple = ()
+
+
+def _read_entry_limit_inputs() -> _EntryLimitInputs:
+    """All potentially long history reads finish before a writer job is queued."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT active_membership_id, access_from, access_until, off_days_json, "
+            "off_days_beyond_horizon, off_hours_json, entry_limits_json, entry_usage_json "
+            "FROM sync_upcoming_users WHERE entry_limits_json IS NOT NULL "
+            "UNION ALL SELECT active_membership_id, access_from, access_until, off_days_json, "
+            "off_days_beyond_horizon, off_hours_json, entry_limits_json, entry_usage_json "
+            "FROM member_access_window WHERE entry_limits_json IS NOT NULL").fetchall()
+        windows = {}
+        for r in rows:
+            w = _window_from_columns(*r[1:])
+            if w is not None and w.entry_limits is not None and w.entry_usage is not None:
+                windows[int(r[0])] = w
+        if not windows:
+            return _EntryLimitInputs()
+        persons = {int(am): int(uid) for am, uid in conn.execute(
+            "SELECT active_membership_id, user_id FROM sync_users "
+            "WHERE active_membership_id IS NOT NULL AND user_id IS NOT NULL "
+            "UNION ALL SELECT active_membership_id, user_id FROM sync_users_held WHERE user_id IS NOT NULL")}
+    since = (min(w.entry_usage.list_from for w in windows.values()) - timedelta(days=2)).isoformat(sep=" ")
+    passes = list_allowed_passes_for_users({persons[am] for am in windows if am in persons}, since)
+    return _EntryLimitInputs(tuple(windows.items()), tuple(persons.items()),
+                             tuple((uid, tuple(times)) for uid, times in passes.items()))
+
+
 def apply_off_hours(*, pc_now_epoch: float, source: str, force_release: bool = False) -> Dict[str, Any]:
-    """Apply closures in one writer job; a failed input read releases off-hours holds."""
-    from app.core import access_dates as ad, off_hours as oh
+    """Apply planned holds (hours or entry limits); uncertain inputs release them."""
+    from app.core import access_dates as ad, entry_limits as el, off_hours as oh
+
+    entry_inputs = _EntryLimitInputs()
+    if not force_release:
+        try:
+            entry_inputs = _read_entry_limit_inputs()
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "[ENTRY_LIMIT] input read failed; entry holds released", exc_info=True)
 
     def _write(conn, profile, force_release=False):
         profile["off_hours_source"] = source
@@ -2148,6 +2217,64 @@ def apply_off_hours(*, pc_now_epoch: float, source: str, force_release: bool = F
             clock_suspect=bool(state.get("clock_suspect")),
             windows_by_am={am: w.off_hours for am, w in windows.items()},
             known_ids=on_roster | set(held_rows), intent_ids=intent | off_ids)
+        # held_reason='off_hours' is the shared planned-hold mechanism, including limits.
+        # Only immutable pre-read inputs enter the limit rule; never read history here.
+        entry_rows = {}
+        entry_hold_changed = entry_hold_ids_changed = False
+        hours_plan = plan
+        try:
+            if plan.active and not force_release and entry_inputs.windows:
+                limited = {am: w for am, w in entry_inputs.windows
+                           if am in windows and w == windows[am]
+                           and w.entry_limits is not None and w.entry_usage is not None}
+                if limited:
+                    persons, passes = dict(entry_inputs.persons), dict(entry_inputs.passes)
+                    known_ids = on_roster | set(held_rows)
+                    applied = ad.parse_iso_date(state.get("applied_date"))
+                    if applied is None:
+                        raise ValueError("missing applied gym date")
+                    kw = dict(horizon_end=ad.parse_iso_date(state.get("horizon_end")),
+                              server_today=ad.parse_iso_date(state.get("server_today")),
+                              grace_days=state.get("grace_days") or 0)
+                    unlimited = {persons[am] for am in known_ids
+                                 if am in persons and am in windows and windows[am].entry_limits is None
+                                 and ad.window_status(windows[am], applied, **kw) in ad.DELIVERABLE_STATUSES}
+                    now_local = datetime(1970, 1, 1) + timedelta(
+                        seconds=float(pc_now_epoch) + int(state["utc_offset_sec"]))
+                    for am, w in limited.items():
+                        uid = persons.get(am)
+                        if (am not in known_ids or uid is None or uid in unlimited
+                                or ad.window_status(w, applied, **kw) not in ad.DELIVERABLE_STATUSES):
+                            continue
+                        entry_state = el.merged_state(w.entry_limits, w.entry_usage, passes.get(uid, ()), now_local)
+                        if entry_state.held:
+                            entry_rows[am] = (entry_state.blocked_until.isoformat()
+                                              if entry_state.blocked_until else None,
+                                              ",".join(sorted(entry_state.reasons)))
+                    target = plan.target | (frozenset(entry_rows) & known_ids)
+                    previous = frozenset(intent | off_ids)
+                    plan = oh.OffHoursPlan(plan.active, target, target - previous,
+                                           previous - target, target & previous)
+            existing = {int(am): (until, reasons) for am, until, reasons in cur.execute(
+                "SELECT active_membership_id, until_text, reasons FROM entry_limit_hold")}
+            entry_hold_changed = existing != entry_rows
+            entry_hold_ids_changed = set(existing) != set(entry_rows)
+            if entry_hold_changed:
+                cur.execute("DELETE FROM entry_limit_hold")
+                cur.executemany(
+                    "INSERT INTO entry_limit_hold (active_membership_id, until_text, reasons) VALUES (?, ?, ?)",
+                    [(am, *values) for am, values in entry_rows.items()])
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "[ENTRY_LIMIT] planning failed; entry holds released", exc_info=True)
+            plan = hours_plan
+            # Preserve the hours-only plan even when the entry reason table is unreadable.
+            try:
+                cleared = cur.execute("DELETE FROM entry_limit_hold").rowcount > 0
+                entry_hold_changed = entry_hold_changed or cleared
+                entry_hold_ids_changed = entry_hold_ids_changed or cleared
+            except sqlite3.Error:
+                pass
         cols = ", ".join(_SYNC_USER_COLUMNS)
         moved = 0
         for am in plan.target & on_roster:
@@ -2216,14 +2343,15 @@ def apply_off_hours(*, pc_now_epoch: float, source: str, force_release: bool = F
         return {"active": plan.active, "newly_held": sorted(plan.target - intent),
                 "released": sorted(released), "released_to_date": sorted(to_date),
                 "retry": sorted(plan.target & intent), "moved": moved,
-                "intent_changed": intent != set(plan.target), "skipped": skipped}
+                "intent_changed": intent != set(plan.target), "skipped": skipped,
+                "entry_hold_changed": entry_hold_changed, "entry_hold_ids_changed": entry_hold_ids_changed}
 
     try:
         out = _run_db_write_sync("apply_off_hours", lambda c, p: _write(c, p, force_release))
     except Exception:
         # The failed transaction rolls back. Do not leave an existing hold on an input error.
         out = _run_db_write_sync("release_off_hours", lambda c, p: _write(c, p, True))
-    if out.get("moved") or out.get("intent_changed"):
+    if out.get("moved") or out.get("intent_changed") or out.get("entry_hold_ids_changed"):
         bump_local_state_generation()
         invalidate_sync_cache()
     return out
@@ -2235,6 +2363,9 @@ def off_hours_in_play() -> bool:
             return conn.execute(
                 "SELECT 1 FROM member_access_window WHERE off_hours_json IS NOT NULL "
                 "UNION ALL SELECT 1 FROM sync_upcoming_users WHERE off_hours_json IS NOT NULL "
+                "UNION ALL SELECT 1 FROM member_access_window WHERE entry_limits_json IS NOT NULL "
+                "UNION ALL SELECT 1 FROM sync_upcoming_users WHERE entry_limits_json IS NOT NULL "
+                "UNION ALL SELECT 1 FROM entry_limit_hold "
                 "UNION ALL SELECT 1 FROM off_hours_hold "
                 "UNION ALL SELECT 1 FROM off_hours_release_pending LIMIT 1").fetchone() is not None
     except Exception:

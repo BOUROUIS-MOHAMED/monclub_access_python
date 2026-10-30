@@ -4302,7 +4302,8 @@ db._save_sync_cache, db._forget_protocol2_membership]`
 not run in the implementation sandbox, which cannot launch Python]`
 
 `db.apply_off_hours` copies complete rows, fingerprints included, between `sync_users`
-and `sync_users_held` with reason `off_hours`. `off_hours_hold` preserves intent across
+and `sync_users_held` with reason `off_hours`, which now means a planned hold from
+off-hours or entry limits. `off_hours_hold` preserves their shared intent across
 full/delta roster saves. `off_hours_release_pending` commits with each local restore;
 `off_hours_release_ack` persists per-device acknowledgements for its `queued_at` generation.
 Logout and fast patches forget both queues and acknowledgements. Date flips exclude off-hours
@@ -4349,6 +4350,26 @@ rows and creates no new hold. An unreadable presence check schedules the release
 input exceptions do not make the date dispatcher fail. A wholly inaccessible database
 cannot be repaired or replayed until it can be read/written again. `[CODE: db.apply_off_hours,
 db.off_hours_in_play, MainApp._apply_off_hours_db]` `[TEST: tests/test_off_hours_db.py]`
+
+Entry-limit targets join that same planned-hold set; no separate removal or release
+path is used. `entry_limit_hold` contains only the entry reasons (`DAY`, `WEEK`,
+`MONTH`, `TOTAL`) and latest release time (NULL for total exhaustion). It is rewritten
+only on a content change, cleared on fail-open or forced release, and its id-set changes
+advance the QR snapshot generation even when no roster row moves.
+`[CODE: db.apply_off_hours]`
+
+History reads finish on a normal read connection before the writer job is queued.
+Allowed rows for the limited people are selected in batches of 500 users, with a
+two-day receive-time margin before the earliest `listFrom`. Their timestamps use
+`device_attendance._normalize_datetime_text(event_time, fallback=created_at)`, exactly
+the value uploaded as `date`, interpreted locally without timezone conversion.
+The rule regroups backend visit starts with all local passes since `listFrom`; `asOf`
+is not a cut-off. A deliverable unlimited membership of the same person wins.
+No offset, untrusted windows, suspect clock, unreadable history or a rule exception
+adds no entry hold and clears its reasons; hours keep their existing fail-open policy.
+`[CODE: db._read_entry_limit_inputs, db.list_allowed_passes_for_users,
+db.apply_off_hours, entry_limits.merged_state]`
+`[UNVERIFIED: tests/test_entry_limits_db.py written, not run; real hardware and timing]`
 
 QR uses the exact closure, with no five-minute lead, and refuses with `OFF_HOURS` in trial
 and enforce modes when all date-valid grants are closed. The closure is judged on the PC clock
