@@ -205,7 +205,7 @@ DATE_NOT_TODAY = "not_today"
 # A matched credential refused on the member list or on the allowed days. The wall-clock
 # retry in verify_totp_resilient exists for clock skew (no match / expired); these
 # verdicts are final.
-_MATCHED_REFUSALS = frozenset({"DENY_NOT_IN_LOCAL_ROSTER", "DENY_NOT_ALLOWED_TODAY", "OFF_HOURS"})
+_MATCHED_REFUSALS = frozenset({"DENY_NOT_IN_LOCAL_ROSTER", "DENY_NOT_ALLOWED_TODAY", "OFF_HOURS", "ENTRY_LIMIT"})
 
 # Process-wide counts of roster verdicts, one per scan. verify_totp stays pure (the
 # resilient wrapper can call it twice per scan, and tests call it freely); the two
@@ -874,21 +874,22 @@ def verify_totp(
             roster_check = ROSTER_NOT_IN
         roster_mode = totp_roster_check_mode(settings)
 
-        from app.core.access_dates import qr_off_hours_refused, _grant_ids as _grant_ids_for_hours
+        from app.core.access_dates import qr_planned_hold_reason, _grant_ids as _grant_ids_for_hours
         _snap = access_days_index if (used_index and access_days_index is not None) else access_days
         _hours_reason = None
         if _snap is not None and any(
-                getattr(_snap.windows.get(am), "off_hours", ()) for am in _grant_ids_for_hours(grants)):
-            # Preserve the date reason for an expired/frozen plan carrying hours, even
-            # when the held row is absent from an enforced roster. No-hours order is unchanged.
+                getattr(_snap.windows.get(am), "off_hours", ()) or am in _snap.entry_limit_held
+                for am in _grant_ids_for_hours(grants)):
+            # Date refusal keeps priority over either planned-hold reason, even
+            # when a held row is absent from the enforced roster.
             if qr_date_verdict(_snap, grants=grants, users_by_am=users_by_am,
                                account_on_roster=(roster_check == ROSTER_IN_BY_ACCOUNT),
                                roster_current=(roster_current or not used_index)) == DATE_NOT_TODAY:
                 _hours_reason = "DENY_NOT_ALLOWED_TODAY"
-            elif qr_off_hours_refused(
+            else:
+                _hours_reason = qr_planned_hold_reason(
                     _snap, grants=grants, users_by_am=users_by_am,
-                    now_epoch=float(pc_now_unix) if pc_now_unix is not None else time.time()):
-                _hours_reason = "OFF_HOURS"
+                    now_epoch=float(pc_now_unix) if pc_now_unix is not None else time.time())
         if _hours_reason:
             return {"allowed": False, "reason": _hours_reason, "scanMode": "QR_TOTP",
                     "accountId": account_id, "credId": cred_id, "matchedCounter": matched_ctr,

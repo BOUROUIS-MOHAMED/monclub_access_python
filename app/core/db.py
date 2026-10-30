@@ -1539,6 +1539,11 @@ def load_access_days_snapshot():
             state = dict(row) if row is not None else {}
             today, upcoming, qr = _read_protocol2_windows(conn)
             try:
+                entry_limit_held = frozenset(int(r[0]) for r in conn.execute(
+                    "SELECT active_membership_id FROM entry_limit_hold"))
+            except Exception:
+                entry_limit_held = frozenset()
+            try:
                 links = conn.execute(
                     "SELECT active_membership_id, user_id FROM member_person_link "
                     "WHERE user_id IS NOT NULL"
@@ -1572,6 +1577,7 @@ def load_access_days_snapshot():
         person_of=person_of,
         utc_offset_sec=clock_state_from_row(state).utc_offset_sec,
         clock_suspect=bool(state.get("clock_suspect")),
+        entry_limit_held=entry_limit_held,
     )
 
 

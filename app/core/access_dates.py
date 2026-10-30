@@ -449,6 +449,7 @@ class AccessDaysSnapshot:
     person_of: Mapping[int, int] = field(default_factory=dict)
     utc_offset_sec: Optional[int] = None
     clock_suspect: bool = False
+    entry_limit_held: frozenset = frozenset()
 
     @property
     def active(self) -> bool:
@@ -570,21 +571,31 @@ def effective_credentials(
     return out
 
 
-def qr_off_hours_refused(snapshot, *, grants, users_by_am, now_epoch) -> bool:
-    """Refuse only when every date-valid granted membership is closed; uncertainty opens.
+def qr_planned_hold_reason(snapshot, *, grants, users_by_am, now_epoch) -> Optional[str]:
+    """Refuse only when every date-valid grant is blocked by hours or entry limits.
     ``now_epoch`` must be the PC clock, never a device scan time (a slow device clock would
     refuse a member the plan already lets in)."""
     try:
         if (snapshot is None or not snapshot.active or snapshot.utc_offset_sec is None
                 or snapshot.clock_suspect):
-            return False
+            return None
         candidates = [am for am in _grant_ids(grants)
                       if snapshot.deliverable(am) is True or am in users_by_am]
         if not candidates:
-            return False
+            return None
         day, minute = off_hours.local_week_minute(now_epoch, snapshot.utc_offset_sec)
-        return all(am in snapshot.windows and bool(snapshot.windows[am].off_hours)
-                   and off_hours.closed(snapshot.windows[am].off_hours, day, minute)
-                   for am in candidates)
+        hours_closed = {am for am in candidates if am in snapshot.windows
+                        and snapshot.windows[am].off_hours
+                        and off_hours.closed(snapshot.windows[am].off_hours, day, minute)}
+        if all(am in hours_closed for am in candidates):
+            return "OFF_HOURS"
+        if all(am in hours_closed or am in snapshot.entry_limit_held for am in candidates):
+            return "ENTRY_LIMIT"
+        return None
     except Exception:
-        return False
+        return None
+
+
+def qr_off_hours_refused(snapshot, *, grants, users_by_am, now_epoch) -> bool:
+    return qr_planned_hold_reason(snapshot, grants=grants, users_by_am=users_by_am,
+                                  now_epoch=now_epoch) == "OFF_HOURS"

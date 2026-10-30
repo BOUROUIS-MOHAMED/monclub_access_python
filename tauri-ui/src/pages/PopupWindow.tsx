@@ -314,6 +314,7 @@ const A_DENY_FALLBACK: DenyCopy = {
   short: "Accès refusé",
 };
 const A_DENY: Record<string, DenyCopy> = {
+  ENTRY_LIMIT: { title: "Limite d'entrées atteinte", action: "Revenez quand votre limite se libère ou présentez-vous à l'accueil.", short: "Limite atteinte" },
   OFF_HOURS: { title: "Hors horaires de votre formule", action: "Revenez pendant les horaires de votre formule ou présentez-vous à l'accueil.", short: "Hors horaires" },
   DENY_NO_CARD_MATCH: { title: "Cette carte n'est pas reconnue", action: "Présentez-vous à l'accueil — nous la réassocierons en un instant.", short: "Carte non reconnue" },
   DENY_NO_MATCH: { title: "Ce badge n'est pas reconnu", action: "Présentez-vous à l'accueil — nous le réassocierons en un instant.", short: "Badge non reconnu" },

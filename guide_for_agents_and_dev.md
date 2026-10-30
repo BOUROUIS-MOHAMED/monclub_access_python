@@ -4380,14 +4380,24 @@ Other history-off rows and the desk-alert history gate keep their existing behav
 `[CODE: db.limited_user_ids, UltraDeviceWorker._enqueue_history]`
 `[UNVERIFIED: tests/test_entry_limits_history.py written, not run]`
 
-QR uses the exact closure, with no five-minute lead, and refuses with `OFF_HOURS` in trial
-and enforce modes when all date-valid grants are closed. The closure is judged on the PC clock
+QR uses the exact hours closure, with no five-minute lead, and refuses with `OFF_HOURS` in trial
+and enforce modes when all date-valid grants are closed by hours. Otherwise, when every
+candidate is either closed by hours or in the snapshot's `entry_limit_held` set, it
+refuses with `ENTRY_LIMIT`. One open candidate allows; the date reason retains priority.
+The entry set is loaded with `db.load_access_days_snapshot` (read error -> empty), cached
+per local-state generation, and never read from the DB by `verify_totp` per scan.
+`[CODE: access_dates.qr_planned_hold_reason, db.load_access_days_snapshot,
+access_verification.current_access_days, ::verify_totp]`
+`[UNVERIFIED: tests/test_entry_limits_qr.py written, not run]`
+The hours closure is judged on the PC clock
 (`verify_totp(pc_now_unix=)`, default `time.time()`), NOT the device scan time: the scan time may
 be up to an hour off the PC's and `OFF_HOURS` is final, so a slow turnstile clock would otherwise
 refuse a member whose plan has reopened. Every other scan-time check is unchanged. Unknown/no-hours grants remain
 open; untrusted snapshots, missing offset, suspect clock and exceptions add no hours
 refusal. Date-invalid memberships retain the date reason; existing no-hours order stays
-unchanged. Resilient verification does not retry a matched `OFF_HOURS`. Popup, dashboard,
+unchanged. Resilient verification does not retry a matched `OFF_HOURS` or `ENTRY_LIMIT`.
+The entry-limit popup says « Limite d'entrées atteinte » and asks the member to return
+when the limit resets or visit reception. `[CODE: PopupWindow.A_DENY]` Popup, dashboard,
 realtime and member history share « Hors horaires de votre formule ». `[CODE:
 access_dates.qr_off_hours_refused, access_verification.verify_totp, PopupWindow.A_DENY]`
 `[TEST: tests/test_off_hours_qr.py::test_slow_device_clock_is_judged_by_the_pc_clock_for_hours]`
