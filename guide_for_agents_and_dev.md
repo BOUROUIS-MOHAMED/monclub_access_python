@@ -1992,7 +1992,8 @@ abort that finalised a revocation would silently drop it. `[TEST: test_removal_c
 
 Off-hours removals are an independent exact set: if the real desired roster is empty, or
 unplanned removals exceed its original ceiling, only planned pins may still be removed.
-An empty standalone roster still logs `REVOKE_SKIP_EMPTY_ROSTER`. `planned_count` is used
+An empty standalone roster logs `REVOKE_SKIP_EMPTY_ROSTER` only when the pass really skips (no
+planned pin is owned); a pass that goes on to remove planned pins does not log it. `planned_count` is used
 only to keep the lease gate active, including planned-only removals; a blocked lease
 permits neither set. `[CODE: UltraDeviceWorker._neutralise_revoked_pins,
 DeviceSyncEngine._sync_one_device, push_safety.check_bulk_removal]`
@@ -2905,15 +2906,30 @@ Off-hours releases have durable delivery ownership: `off_hours_release_pending` 
 written in the same transaction as the local release, including fail-open releases.
 Startup and the minute tick replay it even in manual mode. A worker's successful
 targeted release writes `off_hours_release_ack`; the queue clears only after every
-ULTRA device with current ownership or a durable removal fact has acknowledged that
-generation. Failed delivery or acknowledgement keeps the obligation across restarts.
+ULTRA device that is in service (`device_in_service`), still delivers the member (its
+`allowedMemberships` filter, `device_sync.membership_allowed`) and owns the pin has
+acknowledged that generation. Owning = a confirmed `device_sync_state` row, or a
+`v2_removal_log` row whose `removed_at` is at/after the start of the hold being released
+(minus 1 h of clock skew: the log uses the server-corrected clock, the hold time is the PC
+local `now_iso()` text copied into `off_hours_release_pending.held_at`; both are compared as
+epochs). A device on which the member derives no pin (ACCOUNT scheme without a main
+account) is never required: the member cannot be on it. A pending row without `held_at`
+(older database) counts any logged removal. The log
+is never pruned, so without this an old removal, an out-of-service device or a filtered-out
+device kept the release pending for ever. A worker skips a release it already acknowledged
+for the current `queued_at` and treats a device that filters the member out as done, but the
+app still enqueues the release on every ULTRA worker (it does not narrow the dispatch).
+Failed delivery or acknowledgement keeps the obligation across restarts.
 A later hold, forgotten membership or logout cancels it; date-held rows are not queued.
 If queue storage itself is unreadable, a forced release still commits the local restore,
 logs the storage failure and returns release ids for volatile delivery; restart durability
 then requires repairing that storage. `[CODE: db.apply_off_hours]`
-`[CODE: db.apply_off_hours, ::acknowledge_off_hours_release,
+`[CODE: db.apply_off_hours, ::acknowledge_off_hours_release, ::off_hours_release_acked,
 UltraDeviceWorker._drain_off_hours_commands, off_hours_push.dispatch_off_hours]`
 `[TEST: tests/test_off_hours_db.py::test_release_ack_requires_every_owned_ultra_and_ignores_old_generation,
+::test_out_of_service_device_does_not_block_release_ack,
+::test_device_filtering_the_member_out_does_not_block_release_ack,
+::test_stale_removal_before_the_hold_does_not_make_a_device_required,
 tests/test_off_hours_app_wiring.py::test_tick_replays_durable_release_after_restart_and_ok_drain_clears_it]`
 
 An **authoritative revocation** is not an ordinary member change. It travels as a
@@ -3380,8 +3396,8 @@ on the worker, while the STA thread is idle:
    handles it exactly as before (a dying pump is a disconnect). `[CODE: _sta_main]`
 2. `_yield_during_device_work`: every queued event is decided (`_process_event` — a QR/TOTP or
    staff-RFID rescue opens the door here) and queued desk opens run (`_sync_yield_to_doors`).
-3. At most ONE pending member update or revoke is served (`_drain_member_sync_commands(limit=1)`),
-   never twice for the same member in one pass (a failing revoke re-queues itself). The pins it
+3. At most ONE pending member update or revoke is served (`_drain_member_sync_commands(limit=1, include_off_hours=False)`: off-hours commands never run in
+   the yield, so the member it marks as served is a normal one), never twice for the same member in one pass (a failing revoke re-queues itself). The pins it
    handled — named by `_note_push_superseded` from the member-sync, deferral and revoke paths,
    whatever their outcome — are dropped from the chunks not yet sent and returned in the result's
    `superseded_pins`: neither pushed, nor failed, nor `not_attempted`. The pass then leaves them
@@ -4293,16 +4309,19 @@ for 300 members, not re-measured here]`
 
 The ULTRA hours request uses only held/released membership ids, also in manual sync mode.
 Workers keep replaceable off-hours commands, drain one at a time over their existing single
-connection, re-check the local row, and retry a failed command after 60 s. A release replaces
+connection (at most one per `_drain_member_sync_commands` call, which then goes on to the normal
+pending member syncs in the same call; the mid-push yield serves normal syncs only), re-check the local row, and retry a failed command after 60 s. A release replaces
 a queued hold and follows an active hold. A worker-side failure never escalates this request
 to a full pass; unavailable workers leave durable releases for the next tick or startup.
-Only an ok release drain on every ULTRA device that owned the pin (including its removal
-log proof) clears the SQLite obligation; enqueueing does not. Old-generation acknowledgements
+Only an ok release drain on every in-service ULTRA device that delivers the member and owned
+the pin (including a removal-log proof from this hold, see §3.4) clears the SQLite obligation;
+enqueueing does not. Old-generation acknowledgements
 cannot clear a newer release. Held-again and date-held members are not restored. Ownership,
 device plan filters, ACCOUNT collapse and leases still apply. An open eligible membership
 keeps the person's ACCOUNT pin. `[CODE: off_hours_push.dispatch_off_hours,
 UltraDeviceWorker.request_off_hours, ::_drain_off_hours_commands, ::request_full_sync]`
-`[TEST: tests/test_off_hours_app_wiring.py, tests/test_off_hours_removal_bound.py]`
+`[TEST: tests/test_off_hours_app_wiring.py, tests/test_off_hours_removal_bound.py,
+tests/test_off_hours_app_wiring.py::test_one_drain_call_serves_an_off_hours_command_and_a_normal_member_sync]`
 
 Full standalone revoke and PullSDK stale steps split exactly the known held pins from
 unplanned removals. Only unplanned removals count towards the ceiling, against the REAL
@@ -4321,17 +4340,21 @@ cannot be repaired or replayed until it can be read/written again. `[CODE: db.ap
 db.off_hours_in_play, MainApp._apply_off_hours_db]` `[TEST: tests/test_off_hours_db.py]`
 
 QR uses the exact closure, with no five-minute lead, and refuses with `OFF_HOURS` in trial
-and enforce modes when all date-valid grants are closed. Unknown/no-hours grants remain
+and enforce modes when all date-valid grants are closed. The closure is judged on the PC clock
+(`verify_totp(pc_now_unix=)`, default `time.time()`), NOT the device scan time: the scan time may
+be up to an hour off the PC's and `OFF_HOURS` is final, so a slow turnstile clock would otherwise
+refuse a member whose plan has reopened. Every other scan-time check is unchanged. Unknown/no-hours grants remain
 open; untrusted snapshots, missing offset, suspect clock and exceptions add no hours
 refusal. Date-invalid memberships retain the date reason; existing no-hours order stays
 unchanged. Resilient verification does not retry a matched `OFF_HOURS`. Popup, dashboard,
 realtime and member history share « Hors horaires de votre formule ». `[CODE:
 access_dates.qr_off_hours_refused, access_verification.verify_totp, PopupWindow.A_DENY]`
-`[TEST: tests/test_off_hours_qr.py]`
+`[TEST: tests/test_off_hours_qr.py::test_slow_device_clock_is_judged_by_the_pc_clock_for_hours]`
 
 Non-ULTRA devices are **unsupported for off-hours**: both holds and releases reach them
 only at the next full sync, not on the minute tick. `still_on_devices` skips every
-non-ULTRA device and the targeted dispatcher reaches ULTRA workers only. `[CODE:
+non-ULTRA device and every ULTRA device that is out of service (no worker, `device_in_service`),
+and the targeted dispatcher reaches ULTRA workers only. `[CODE:
 off_hours_push.still_on_devices, UltraEngine.request_sync_now]`
 `[UNVERIFIED: the assumption that no gym runs DEVICE mode has not been checked]`
 

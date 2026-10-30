@@ -712,6 +712,29 @@ def _to_int(v, default: int | None = None) -> int | None:
         return default
 
 
+def allowed_membership_ids(device: Dict[str, Any]) -> Set[int]:
+    """The device's ``allowedMemberships`` filter as ints; empty = no filter (everyone passes)."""
+    out: Set[int] = set()
+    for x in (device or {}).get("allowedMemberships") or []:
+        xi = _to_int(x, default=None)
+        if xi is not None:
+            out.add(int(xi))
+    return out
+
+
+def membership_allowed(user: Dict[str, Any], allowed_set: Set[int]) -> bool:
+    """The ``allowedMemberships`` rule of ``_filter_users_for_device``, on its own: with a
+    filter, only a row whose ``membershipId`` is in it is delivered."""
+    if not allowed_set:
+        return True
+    mid = _to_int(user.get("membershipId"), default=None)
+    return mid is not None and int(mid) in allowed_set
+
+
+def member_deliverable_to_device(user: Dict[str, Any], device: Dict[str, Any]) -> bool:
+    return membership_allowed(user, allowed_membership_ids(device))
+
+
 def _to_float(v, default: float | None = None) -> float | None:
     try:
         if v is None:
@@ -2103,12 +2126,7 @@ class DeviceSyncEngine:
         caller that only measures what a pass WOULD write (the Erase wizard's refill check, the
         heartbeat of a held turnstile, lane 1b), so the signal stays one line per real pass.
         """
-        allowed_raw = device.get("allowedMemberships") or []
-        allowed_set: Set[int] = set()
-        for x in allowed_raw:
-            xi = _to_int(x, default=None)
-            if xi is not None:
-                allowed_set.add(int(xi))
+        allowed_set = allowed_membership_ids(device)
 
         door_ids = _norm_int_list(device.get("doorIds") or [])
         if not door_ids:
@@ -2126,10 +2144,7 @@ class DeviceSyncEngine:
         dropped_sample: List[Dict[str, Any]] = []
 
         def _deliverable(u: Dict[str, Any]) -> bool:
-            mid = _to_int(u.get("membershipId"), default=None)
-            if allowed_set and (mid is None or int(mid) not in allowed_set):
-                return False
-            return True
+            return membership_allowed(u, allowed_set)
 
         if scheme != PIN_SCHEME_ACCOUNT:
             for u in users or []:

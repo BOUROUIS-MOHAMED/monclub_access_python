@@ -1452,14 +1452,23 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         ok = False
         try:
             from app.core import db
+            from app.core.device_sync import member_deliverable_to_device
             # A queued hold must never outlive the local decision (release, fast patch,
             # logout). A queued release must not restore a row now held by dates.
+            members = []
             if hold:
                 wanted = any(int(r["activeMembershipId"]) == am for r in db.list_off_hours_held_rows())
             else:
-                wanted = bool(db.list_sync_users_by_active_membership_ids({am}))
+                members = db.list_sync_users_by_active_membership_ids({am})
+                wanted = bool(members)
             if not wanted:
                 ok = True
+            elif (not hold and release_token is not None and db.off_hours_release_acked(
+                    active_membership_id=am, device_id=self._device_id, queued_at=release_token)):
+                ok = True  # This device already delivered this release; nothing to repeat.
+            elif (not hold and members and isinstance(getattr(self, "_device", None), dict)
+                    and not any(member_deliverable_to_device(m, self._device) for m in members)):
+                ok = True  # The device's allowedMemberships filter never delivers this member.
             else:
                 self._off_hours_executing_thread = threading.get_ident()
                 if getattr(self._sdk, "owns_event_source", False):
@@ -2082,7 +2091,9 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             # Best-effort: a yield poll must never abort the in-flight push.
             pass
 
-    def _drain_member_sync_commands(self, limit: int = 1) -> int:
+    def _drain_member_sync_commands(self, limit: int = 1, *, include_off_hours: bool = True) -> int:
+        """Serve up to ``limit`` normal member syncs/revokes, preceded by at most ONE off-hours
+        command. ``include_off_hours=False`` (the mid-push yield) serves normal ones only."""
         if limit <= 0:
             return 0
         if _v2_writes_blocked(getattr(self, "_device_id", None)):
@@ -2094,9 +2105,9 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             # the rescues keep running until then.
             return 0
 
-        off_drained = self._drain_off_hours_commands()
-        if off_drained:
-            return off_drained
+        # One off-hours command per call, then on to the normal queue: a steady stream of
+        # off-hours commands must not starve the member syncs waiting behind them.
+        off_drained = self._drain_off_hours_commands() if include_off_hours else 0
         drained = 0
         while drained < limit:
             if (getattr(self._sdk, "owns_event_source", False)
@@ -2207,7 +2218,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                     member_id=member_id, err=type(exc).__name__,
                 )
             drained += 1
-        return drained
+        return drained + off_drained
 
     # ------------------------------------------------------------------ #
     # ZK_STANDALONE (push-driver) sync path
@@ -3084,7 +3095,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                     served_ids.add(int(nxt))
                 self._push_yield_pins = touched
                 try:
-                    served = self._drain_member_sync_commands(limit=1)
+                    served = self._drain_member_sync_commands(limit=1, include_off_hours=False)
                 finally:
                     self._push_yield_pins = None
         except Exception:
@@ -5187,8 +5198,10 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         from app.core.off_hours import held_pins_for_device, split_removals
         held_pins = held_pins_for_device(self._device)
         if roster_count <= 0:
-            _tel.warn("REVOKE_SKIP_EMPTY_ROSTER", worker=self._tel_wid)
             if not held_pins & set(owned):
+                # Only a pass that really skips says so; one that goes on to remove planned
+                # (off-hours) pins is not a skip.
+                _tel.warn("REVOKE_SKIP_EMPTY_ROSTER", worker=self._tel_wid)
                 self._last_revoke_step = "skipped"
                 return False
         # The guards below hold the WHOLE step back: nothing is attempted, so a pending
