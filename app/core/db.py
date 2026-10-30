@@ -2298,7 +2298,8 @@ def acknowledge_off_hours_release(*, active_membership_id: int, device_id: int,
                     continue
                 pin, _ = derive_member_pin(member, normalize_pin_scheme(device.get("pinScheme")))
                 if not pin:
-                    required.add(did)
+                    # No pin under this device's scheme (e.g. ACCOUNT without a main account):
+                    # the member cannot be on it, so there is nothing to give back here.
                     continue
                 # A successful hold deletes device_sync_state. The durable removal log
                 # still proves this was a MonClub pin, including after a process restart;

@@ -2912,7 +2912,9 @@ acknowledged that generation. Owning = a confirmed `device_sync_state` row, or a
 `v2_removal_log` row whose `removed_at` is at/after the start of the hold being released
 (minus 1 h of clock skew: the log uses the server-corrected clock, the hold time is the PC
 local `now_iso()` text copied into `off_hours_release_pending.held_at`; both are compared as
-epochs). A pending row without `held_at` (older database) counts any logged removal. The log
+epochs). A device on which the member derives no pin (ACCOUNT scheme without a main
+account) is never required: the member cannot be on it. A pending row without `held_at`
+(older database) counts any logged removal. The log
 is never pruned, so without this an old removal, an out-of-service device or a filtered-out
 device kept the release pending for ever. A worker skips a release it already acknowledged
 for the current `queued_at` and treats a device that filters the member out as done, but the
