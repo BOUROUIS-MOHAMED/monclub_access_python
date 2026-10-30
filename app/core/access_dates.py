@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-from app.core import off_hours
+from app.core import entry_limits, off_hours
 
 # A PC clock reading more than this BEHIND the latest trustworthy time it has seen (the last
 # server time, or the highest PC time seen since) is suspect. Policy: absorbs ordinary NTP
@@ -60,6 +60,11 @@ class AccessWindow:
     off_days: frozenset = frozenset()
     off_days_beyond_horizon: bool = False
     off_hours: tuple = ()
+    entry_limits: object = None
+    entry_usage: object = None
+    # Keep validated wire objects for canonical storage, including optional wire metadata.
+    entry_limits_raw: object = field(default=None, compare=False, repr=False)
+    entry_usage_raw: object = field(default=None, compare=False, repr=False)
 
 
 def parse_window(obj: Mapping[str, Any]) -> Optional[AccessWindow]:
@@ -85,8 +90,12 @@ def parse_window(obj: Mapping[str, Any]) -> Optional[AccessWindow]:
         if d is None:
             return None
         off.add(d)
+    limits = entry_limits.parse_limits(obj.get("entryLimits"))
+    usage = entry_limits.parse_usage(obj.get("entryUsage"))
     return AccessWindow(frm, until, frozenset(off), obj.get("offDaysBeyondHorizon") is True,
-                        off_hours.parse_windows(obj.get("offHours")))
+                        off_hours.parse_windows(obj.get("offHours")), limits, usage,
+                        dict(obj["entryLimits"]) if limits is not None else None,
+                        dict(obj["entryUsage"]) if usage is not None else None)
 
 
 def window_status(

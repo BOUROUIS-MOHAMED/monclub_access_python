@@ -4283,12 +4283,23 @@ none; the flat battery logged `CLOCK_SUSPECT reason=behind` and the fix `CLOCK_O
 failed. `[TEST: same harness, 2026-09-19]` Re-run on the final branch head `5094150` after six
 review rounds (2026-09-26): 58 checks, 0 failed. `[TEST: same harness]`
 
-### Off-hours hold (1.4.38)
+### Planned holds: off-hours and entry limits (1.4.39)
 
 `offHours` is optional on protocol-2 membership windows (`day`, `startMinute`,
 `durationMinutes`); `windowsVersion` already digests it. It is stored as `off_hours_json`
 on `member_access_window` / `sync_upcoming_users`. Bad entries are ignored without
 invalidating dates. `[CODE: access_dates.parse_window, db._window_columns]`
+
+Protocol-2 windows also store optional `entryLimits` and `entryUsage` in
+`entry_limits_json` / `entry_usage_json` on both window tables. The pure
+`entry_limits` parsers reject malformed rules or usage without invalidating dates;
+validated wire objects are re-encoded with sorted keys and compact separators.
+`entry_limit_hold(active_membership_id, until_text, reasons)` records entry-specific
+hold reasons and is forgotten on logout or a fast patch of that membership.
+`[CODE: access_dates.parse_window, db._window_columns, db._read_protocol2_windows,
+db._save_sync_cache, db._forget_protocol2_membership]`
+`[UNVERIFIED: tests/test_entry_limits_rule.py and tests/test_entry_limits_db.py written;
+not run in the implementation sandbox, which cannot launch Python]`
 
 `db.apply_off_hours` copies complete rows, fingerprints included, between `sync_users`
 and `sync_users_held` with reason `off_hours`. `off_hours_hold` preserves intent across

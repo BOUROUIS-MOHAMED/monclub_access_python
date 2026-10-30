@@ -1315,7 +1315,9 @@ def _create_protocol2_tables(conn: sqlite3.Connection) -> None:
             access_until            TEXT    NOT NULL,
             off_days_json           TEXT    NOT NULL DEFAULT '[]',
             off_days_beyond_horizon INTEGER NOT NULL DEFAULT 0,
-            off_hours_json TEXT
+            off_hours_json TEXT,
+            entry_limits_json TEXT,
+            entry_usage_json TEXT
         );
         """
     )
@@ -1329,7 +1331,9 @@ def _create_protocol2_tables(conn: sqlite3.Connection) -> None:
             off_days_json           TEXT    NOT NULL DEFAULT '[]',
             off_days_beyond_horizon INTEGER NOT NULL DEFAULT 0,
             qr_account_id           INTEGER,
-            off_hours_json          TEXT
+            off_hours_json          TEXT,
+            entry_limits_json      TEXT,
+            entry_usage_json       TEXT
         );
         """
     )
@@ -1379,6 +1383,11 @@ def _create_protocol2_tables(conn: sqlite3.Connection) -> None:
     )
     _ensure_column(conn, "member_access_window", "off_hours_json", "off_hours_json TEXT")
     _ensure_column(conn, "sync_upcoming_users", "off_hours_json", "off_hours_json TEXT")
+    for table in ("member_access_window", "sync_upcoming_users"):
+        _ensure_column(conn, table, "entry_limits_json", "entry_limits_json TEXT")
+        _ensure_column(conn, table, "entry_usage_json", "entry_usage_json TEXT")
+    conn.execute("CREATE TABLE IF NOT EXISTS entry_limit_hold "
+                 "(active_membership_id INTEGER PRIMARY KEY, until_text TEXT, reasons TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS off_hours_hold "
                  "(active_membership_id INTEGER PRIMARY KEY, held_at TEXT NOT NULL)")
     conn.execute("CREATE TABLE IF NOT EXISTS off_hours_release_pending "
@@ -1442,16 +1451,24 @@ def clock_state_from_row(row: Mapping[str, Any]):
     )
 
 
-def _window_from_columns(access_from, access_until, off_days_json, beyond, off_hours_json=None):
+def _window_from_columns(access_from, access_until, off_days_json, beyond, off_hours_json=None,
+                         entry_limits_json=None, entry_usage_json=None):
     from app.core import access_dates as _ad
     from app.core import off_hours as _oh
     try:
         off = json.loads(off_days_json or "[]")
     except Exception:
         return None
+    def _object(text):
+        try:
+            return json.loads(text) if text is not None else None
+        except (TypeError, ValueError):
+            return None
     return _ad.parse_window({"accessFrom": access_from, "accessUntil": access_until,
                              "offDays": off, "offDaysBeyondHorizon": bool(beyond),
-                             "offHours": json.loads(_oh.encode_windows(_oh.decode_windows(off_hours_json)) or "[]")})
+                             "offHours": json.loads(_oh.encode_windows(_oh.decode_windows(off_hours_json)) or "[]"),
+                             "entryLimits": _object(entry_limits_json),
+                             "entryUsage": _object(entry_usage_json)})
 
 
 def _read_protocol2_windows(conn: Any) -> tuple[Dict[int, Any], Dict[int, Any], Dict[int, int]]:
@@ -1459,18 +1476,19 @@ def _read_protocol2_windows(conn: Any) -> tuple[Dict[int, Any], Dict[int, Any], 
     today: Dict[int, Any] = {}
     for r in conn.execute(
         "SELECT active_membership_id, access_from, access_until, off_days_json, "
-        "off_days_beyond_horizon, off_hours_json FROM member_access_window"
+        "off_days_beyond_horizon, off_hours_json, entry_limits_json, entry_usage_json FROM member_access_window"
     ).fetchall():
-        w = _window_from_columns(r[1], r[2], r[3], r[4], r[5])
+        w = _window_from_columns(r[1], r[2], r[3], r[4], r[5], r[6], r[7])
         if w is not None:
             today[int(r[0])] = w
     upcoming: Dict[int, Any] = {}
     qr: Dict[int, int] = {}
     for r in conn.execute(
         "SELECT active_membership_id, access_from, access_until, off_days_json, "
-        "off_days_beyond_horizon, qr_account_id, off_hours_json FROM sync_upcoming_users"
+        "off_days_beyond_horizon, qr_account_id, off_hours_json, entry_limits_json, entry_usage_json "
+        "FROM sync_upcoming_users"
     ).fetchall():
-        w = _window_from_columns(r[1], r[2], r[3], r[4], r[6])
+        w = _window_from_columns(r[1], r[2], r[3], r[4], r[6], r[7], r[8])
         if w is not None:
             upcoming[int(r[0])] = w
             if r[5] is not None:
@@ -1618,7 +1636,7 @@ def _client_received_epoch(data: Any) -> float:
 
 
 def _window_columns(w: Any) -> tuple:
-    """Date columns followed by the optional weekly closures of an AccessWindow."""
+    """Seven window columns, preserving validated wire limits and usage canonically."""
     from app.core import off_hours as _oh
     return (
         w.access_from.isoformat(),
@@ -1626,6 +1644,10 @@ def _window_columns(w: Any) -> tuple:
         json.dumps(sorted(d.isoformat() for d in w.off_days)),
         1 if w.off_days_beyond_horizon else 0,
         _oh.encode_windows(w.off_hours),
+        json.dumps(w.entry_limits_raw, separators=(",", ":"), sort_keys=True)
+        if w.entry_limits_raw is not None else None,
+        json.dumps(w.entry_usage_raw, separators=(",", ":"), sort_keys=True)
+        if w.entry_usage_raw is not None else None,
     )
 
 
@@ -1657,8 +1679,8 @@ def _replace_member_access_windows(cur: Any, windows: Mapping[int, Any]) -> None
             """
             INSERT INTO member_access_window (
                 active_membership_id, access_from, access_until, off_days_json,
-                off_days_beyond_horizon, off_hours_json
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                off_days_beyond_horizon, off_hours_json, entry_limits_json, entry_usage_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [(int(am),) + _window_columns(w) for am, w in windows.items()],
         )
@@ -1690,8 +1712,9 @@ def _replace_sync_upcoming(cur: Any, p: Any) -> None:
             """
             INSERT INTO sync_upcoming_users (
                 active_membership_id, payload_json, access_from, access_until,
-                off_days_json, off_days_beyond_horizon, off_hours_json, qr_account_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                off_days_json, off_days_beyond_horizon, off_hours_json, entry_limits_json,
+                entry_usage_json, qr_account_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -5499,6 +5522,7 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
             cur.execute("DELETE FROM sync_users_held")
             cur.execute("DELETE FROM member_access_window")
             cur.execute("DELETE FROM off_hours_hold")
+            cur.execute("DELETE FROM entry_limit_hold")
             cur.execute("DELETE FROM off_hours_release_pending")
             cur.execute("DELETE FROM off_hours_release_ack")
             cur.execute("DELETE FROM sync_upcoming_users")
@@ -6327,7 +6351,7 @@ def _forget_protocol2_membership(cur: sqlite3.Cursor, active_membership_id: Opti
     if active_membership_id is None:
         return False
     dropped = 0
-    for table in ("member_access_window", "sync_upcoming_users", "sync_users_held", "off_hours_hold",
+    for table in ("member_access_window", "sync_upcoming_users", "sync_users_held", "off_hours_hold", "entry_limit_hold",
                   "off_hours_release_pending", "off_hours_release_ack"):
         try:
             dropped += cur.execute(
