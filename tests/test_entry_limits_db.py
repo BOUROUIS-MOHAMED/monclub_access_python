@@ -237,3 +237,20 @@ def test_history_user_list_is_chunked(db):
     result = db.list_allowed_passes_for_users(range(7001, 8002), "2026-10-30 00:00:00")
     assert result[7501] == [datetime(2026, 11, 2, 5)]
     assert len(result) == 1001
+
+
+def test_failed_reason_rewrite_invalidates_snapshot_without_moving_hours_hold(db):
+    from app.core import access_verification as av
+    hours = [{"day": "MON", "startMinute": 420, "durationMinutes": 120}]
+    seed(db, users=[row(offHours=hours, entryUsage=usage(visits=["2026-11-02T05:00:00"]))])
+    hold(db)
+    assert av.current_access_days().entry_limit_held == {1}
+    generation = db.get_local_state_generation()
+    _exec("CREATE TRIGGER reject_entry_reason BEFORE INSERT ON entry_limit_hold "
+          "BEGIN SELECT RAISE(FAIL, 'reason write failed'); END")
+    _exec("UPDATE member_access_window SET entry_limits_json = ?", ('{"total":1}',))
+    out = hold(db)
+    assert out["moved"] == 0 and not out["intent_changed"] and out["entry_hold_ids_changed"]
+    assert db.get_local_state_generation() > generation
+    assert not av.current_access_days().entry_limit_held
+    assert _ids("off_hours_hold") == {1} and not _ids("entry_limit_hold")

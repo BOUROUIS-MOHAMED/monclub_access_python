@@ -2256,8 +2256,11 @@ def apply_off_hours(*, pc_now_epoch: float, source: str, force_release: bool = F
         # Only immutable pre-read inputs enter the limit rule; never read history here.
         entry_rows = {}
         entry_hold_changed = entry_hold_ids_changed = False
+        existing = None
         hours_plan = plan
         try:
+            existing = {int(am): (until, reasons) for am, until, reasons in cur.execute(
+                "SELECT active_membership_id, until_text, reasons FROM entry_limit_hold")}
             if plan.active and not force_release and entry_inputs.windows:
                 limited = {am: w for am, w in entry_inputs.windows
                            if am in windows and w == windows[am]
@@ -2290,8 +2293,6 @@ def apply_off_hours(*, pc_now_epoch: float, source: str, force_release: bool = F
                     previous = frozenset(intent | off_ids)
                     plan = oh.OffHoursPlan(plan.active, target, target - previous,
                                            previous - target, target & previous)
-            existing = {int(am): (until, reasons) for am, until, reasons in cur.execute(
-                "SELECT active_membership_id, until_text, reasons FROM entry_limit_hold")}
             entry_hold_changed = existing != entry_rows
             entry_hold_ids_changed = set(existing) != set(entry_rows)
             if entry_hold_changed:
@@ -2306,10 +2307,11 @@ def apply_off_hours(*, pc_now_epoch: float, source: str, force_release: bool = F
             # Preserve the hours-only plan even when the entry reason table is unreadable.
             try:
                 cleared = cur.execute("DELETE FROM entry_limit_hold").rowcount > 0
-                entry_hold_changed = entry_hold_changed or cleared
-                entry_hold_ids_changed = entry_hold_ids_changed or cleared
+                entry_hold_changed = entry_hold_changed or cleared or existing is None or bool(existing)
+                entry_hold_ids_changed = entry_hold_ids_changed or cleared or existing is None or bool(existing)
             except sqlite3.Error:
-                pass
+                # An unreadable table cannot prove that an old QR snapshot has no holds.
+                entry_hold_changed = entry_hold_ids_changed = True
         cols = ", ".join(_SYNC_USER_COLUMNS)
         moved = 0
         for am in plan.target & on_roster:
