@@ -4314,8 +4314,8 @@ date hold instead of restoring them. `[CODE: db.apply_off_hours, db._forget_prot
 `[TEST: tests/test_off_hours_db.py]`
 
 Startup and every save-triggered date pass apply hours before dispatch. A separate
-60 s tick does one read-only presence query when no hours or intent exist; it makes no
-date write then. With hours it uses the stored gym UTC offset, holds at the start and
+60 s tick does one read-only presence query when no hours, entry limits or intent exist;
+it makes no date write then. With hours it uses the stored gym UTC offset, holds at the start and
 releases five minutes before the end, including midnight/week wrap. Scheduling precision
 is up to 60 s, plus device apply latency. `[CODE: MainApp._off_hours_tick, off_hours.held]`
 `[UNVERIFIED: real sleep/resume timing and device latency; owner measured about three minutes
@@ -4402,7 +4402,7 @@ realtime and member history share « Hors horaires de votre formule ». `[CODE:
 access_dates.qr_off_hours_refused, access_verification.verify_totp, PopupWindow.A_DENY]`
 `[TEST: tests/test_off_hours_qr.py::test_slow_device_clock_is_judged_by_the_pc_clock_for_hours]`
 
-Non-ULTRA devices are **unsupported for off-hours**: both holds and releases reach them
+Non-ULTRA devices are **unsupported for planned holds**: both holds and releases reach them
 only at the next full sync, not on the minute tick. `still_on_devices` skips every
 non-ULTRA device and every ULTRA device that is out of service (no worker, `device_in_service`),
 and the targeted dispatcher reaches ULTRA workers only. `[CODE:
