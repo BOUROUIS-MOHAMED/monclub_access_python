@@ -22,6 +22,7 @@ import { useTrayIntegration } from "@/hooks/useTrayIntegration";
 import { usePageChromeValue } from "@/context/PageChromeContext";
 import { ThemeToggle } from "@/components/theme-toggle";
 import PcIdentityBanner from "@/components/PcIdentityBanner";
+import AccessWhatsNewCard from "@/components/update/AccessWhatsNewCard";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { SOFT, type Tone } from "@/components/ui/tone";
@@ -497,6 +498,10 @@ export default function MainLayout() {
           </div>
         </main>
       </div>
+
+      {status?.updates?.currentVersion && (
+        <AccessWhatsNewCard key={status.updates.currentVersion} version={status.updates.currentVersion} />
+      )}
 
       {/* Logout dialog */}
       <ConfirmDialog
