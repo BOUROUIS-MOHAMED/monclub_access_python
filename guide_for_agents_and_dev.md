@@ -3393,8 +3393,8 @@ on the worker, while the STA thread is idle:
    handles it exactly as before (a dying pump is a disconnect). `[CODE: _sta_main]`
 2. `_yield_during_device_work`: every queued event is decided (`_process_event` — a QR/TOTP or
    staff-RFID rescue opens the door here) and queued desk opens run (`_sync_yield_to_doors`).
-3. At most ONE pending member update or revoke is served (`_drain_member_sync_commands(limit=1)`),
-   never twice for the same member in one pass (a failing revoke re-queues itself). The pins it
+3. At most ONE pending member update or revoke is served (`_drain_member_sync_commands(limit=1, include_off_hours=False)`: off-hours commands never run in
+   the yield, so the member it marks as served is a normal one), never twice for the same member in one pass (a failing revoke re-queues itself). The pins it
    handled — named by `_note_push_superseded` from the member-sync, deferral and revoke paths,
    whatever their outcome — are dropped from the chunks not yet sent and returned in the result's
    `superseded_pins`: neither pushed, nor failed, nor `not_attempted`. The pass then leaves them
@@ -4306,7 +4306,8 @@ for 300 members, not re-measured here]`
 
 The ULTRA hours request uses only held/released membership ids, also in manual sync mode.
 Workers keep replaceable off-hours commands, drain one at a time over their existing single
-connection, re-check the local row, and retry a failed command after 60 s. A release replaces
+connection (at most one per `_drain_member_sync_commands` call, which then goes on to the normal
+pending member syncs in the same call; the mid-push yield serves normal syncs only), re-check the local row, and retry a failed command after 60 s. A release replaces
 a queued hold and follows an active hold. A worker-side failure never escalates this request
 to a full pass; unavailable workers leave durable releases for the next tick or startup.
 Only an ok release drain on every in-service ULTRA device that delivers the member and owned
@@ -4316,7 +4317,8 @@ cannot clear a newer release. Held-again and date-held members are not restored.
 device plan filters, ACCOUNT collapse and leases still apply. An open eligible membership
 keeps the person's ACCOUNT pin. `[CODE: off_hours_push.dispatch_off_hours,
 UltraDeviceWorker.request_off_hours, ::_drain_off_hours_commands, ::request_full_sync]`
-`[TEST: tests/test_off_hours_app_wiring.py, tests/test_off_hours_removal_bound.py]`
+`[TEST: tests/test_off_hours_app_wiring.py, tests/test_off_hours_removal_bound.py,
+tests/test_off_hours_app_wiring.py::test_one_drain_call_serves_an_off_hours_command_and_a_normal_member_sync]`
 
 Full standalone revoke and PullSDK stale steps split exactly the known held pins from
 unplanned removals. Only unplanned removals count towards the ceiling, against the REAL

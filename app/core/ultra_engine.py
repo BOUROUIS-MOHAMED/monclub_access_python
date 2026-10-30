@@ -2091,7 +2091,9 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             # Best-effort: a yield poll must never abort the in-flight push.
             pass
 
-    def _drain_member_sync_commands(self, limit: int = 1) -> int:
+    def _drain_member_sync_commands(self, limit: int = 1, *, include_off_hours: bool = True) -> int:
+        """Serve up to ``limit`` normal member syncs/revokes, preceded by at most ONE off-hours
+        command. ``include_off_hours=False`` (the mid-push yield) serves normal ones only."""
         if limit <= 0:
             return 0
         if _v2_writes_blocked(getattr(self, "_device_id", None)):
@@ -2103,9 +2105,9 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             # the rescues keep running until then.
             return 0
 
-        off_drained = self._drain_off_hours_commands()
-        if off_drained:
-            return off_drained
+        # One off-hours command per call, then on to the normal queue: a steady stream of
+        # off-hours commands must not starve the member syncs waiting behind them.
+        off_drained = self._drain_off_hours_commands() if include_off_hours else 0
         drained = 0
         while drained < limit:
             if (getattr(self._sdk, "owns_event_source", False)
@@ -2216,7 +2218,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                     member_id=member_id, err=type(exc).__name__,
                 )
             drained += 1
-        return drained
+        return drained + off_drained
 
     # ------------------------------------------------------------------ #
     # ZK_STANDALONE (push-driver) sync path
@@ -3093,7 +3095,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                     served_ids.add(int(nxt))
                 self._push_yield_pins = touched
                 try:
-                    served = self._drain_member_sync_commands(limit=1)
+                    served = self._drain_member_sync_commands(limit=1, include_off_hours=False)
                 finally:
                     self._push_yield_pins = None
         except Exception:

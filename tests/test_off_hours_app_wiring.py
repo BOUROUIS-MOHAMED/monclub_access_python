@@ -210,3 +210,25 @@ def test_startup_dispatch_replays_durable_release(flip_app, monkeypatch):
     flip_app._request_running_ultra_sync = MagicMock(return_value=True)
     flip_app._apply_date_flips("startup")
     assert flip_app._request_running_ultra_sync.call_args.kwargs["changed_ids"] == {7}
+
+
+def test_one_drain_call_serves_an_off_hours_command_and_a_normal_member_sync(monkeypatch):
+    from collections import deque
+    worker = command_worker()
+    monkeypatch.setattr(db, "list_sync_users_by_active_membership_ids", lambda ids: [{"activeMembershipId": 1}])
+    worker._pending_member_syncs = deque([5])
+    worker._pending_member_sync_ids = {5}
+    worker._pending_member_revoke_ids = set()
+    worker._active_member_revoke_ids = set()
+    calls = []
+    worker._run_standalone_member_sync = lambda am: calls.append(am) or True
+    worker.request_off_hours(held_ids=set(), released_ids={1})
+    # The off-hours release runs first (one per call), the waiting normal sync in the same call.
+    assert worker._drain_member_sync_commands(limit=1) == 2
+    assert calls == [1, 5] and not worker._pending_member_syncs
+    # The mid-push yield serves normal member syncs only and leaves off-hours commands queued.
+    worker._pending_member_syncs = deque([6])
+    worker._pending_member_sync_ids = {6}
+    worker.request_off_hours(held_ids=set(), released_ids={1})
+    assert worker._drain_member_sync_commands(limit=1, include_off_hours=False) == 1
+    assert calls == [1, 5, 6] and 1 in worker._off_hours_commands
