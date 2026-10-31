@@ -5327,11 +5327,13 @@ creation queues retain their automatic upload behaviour and use staff current at
 Every gym records confirmed local operator opens in `staff_force_open_events` (UUID, device,
 door, local time and current staff ID or null). The ULTRA, AGENT and PullSDK connection paths
 are unchanged. The sync tick uploads pending rows with this installation's PC UUID and retries
-failures using the same local IDs. **Not implemented:** recording a forwarded reader press
-on its initiating PC. The reader protocol has no command-result read, so request acceptance
-cannot prove a successful open. No success row is invented on acceptance, and the driver's
-in-process execution is not misattributed to the driver PC. This part of A4 needs a backend
-completion contract. Unknown/failed local opens are not recorded as successes.
+failures using the same local IDs. A reader press is forwarded through the server to the
+driver (DOOR_OPEN command). The server adds `requestedByPcId` to that command's payload when the
+driver claims it (`AccessPcCommandService.claimPayload`; the stored payload is unchanged), and the
+driver records the open it really performed, tagged with that reader (`requested_by_pc_id`,
+shown in door history as "requested from <reader PC>"; owner decision 2026-10-31). The reader
+itself records nothing on request acceptance. A dashboard remote open (no `requestedByPcId`) is
+not recorded as a desk force-open. Unknown/failed local opens are not recorded as successes.
 `[CODE; TEST: tests/test_staff_force_opens.py]`
 Real backend interoperability and turnstile hardware are `[UNVERIFIED]`.
 

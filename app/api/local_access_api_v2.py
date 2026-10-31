@@ -4351,15 +4351,20 @@ def _door_open_error_fr(err: Any) -> str:
 
 
 def staff_record_force_open(ctx, device_id: int, door_id: int) -> None:
-    # Remote commands do not identify the initiating staff/PC in this handler. Their
-    # reporting needs a completion contract; do not misattribute them to this driver.
+    # A remote command runs in process. Record it only when a reader PC filed it (the server adds
+    # requestedByPcId): this driver really opened the door, and the row is tagged with that reader.
+    # A dashboard remote open is not a desk force-open and is not recorded here.
+    requested_by = None
     if getattr(ctx, "in_process", False):
-        return
+        requested_by = (ctx.body() or {}).get("requestedByPcId")
+        if not isinstance(requested_by, int) or isinstance(requested_by, bool) or requested_by <= 0:
+            return
     try:
         from app.core.db import insert_force_open_event
         staff = getattr(ctx.app, "staff_session", None)
         current = (staff.snapshot().get("agent") or {}) if staff else {}
-        insert_force_open_event(device_id=device_id, door_id=door_id, agent_id=current.get("id"))
+        insert_force_open_event(device_id=device_id, door_id=door_id, agent_id=current.get("id"),
+                                requested_by_pc_id=requested_by)
     except Exception:
         _logger.exception("Staff force-open event could not be saved")
     _staff_activity(ctx.app)
@@ -4377,7 +4382,8 @@ def staff_upload_force_opens(app, token: str) -> None:
         return  # Keep the events until this installation has its PC identity.
     ids = [row["local_id"] for row in rows]
     events = [{"localId": row["local_id"], "pcUuid": pc_uuid, "deviceId": row["device_id"],
-               "doorId": row["door_id"], "occurredAt": row["occurred_at"], "agentId": row["agent_id"]}
+               "doorId": row["door_id"], "occurredAt": row["occurred_at"], "agentId": row["agent_id"],
+               "requestedByPcId": row.get("requested_by_pc_id")}
               for row in rows]
     try:
         app._api().upload_force_opens(token=token, events=events)

@@ -2729,7 +2729,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS staff_force_open_events (
                 local_id TEXT PRIMARY KEY, device_id INTEGER, door_id INTEGER,
                 occurred_at TEXT, agent_id INTEGER, created_at TEXT, synced_at TEXT,
-                attempts INTEGER DEFAULT 0, last_error TEXT
+                attempts INTEGER DEFAULT 0, last_error TEXT, requested_by_pc_id INTEGER
             )
         """)
         # -----------------------------
@@ -11439,13 +11439,14 @@ def normalize_access_history_sync_state(v: Any) -> str:
 
 
 def insert_force_open_event(*, device_id: int, door_id: int, agent_id: int | None = None,
-                            occurred_at: str | None = None) -> str:
+                            occurred_at: str | None = None, requested_by_pc_id: int | None = None) -> str:
     local_id = str(uuid.uuid4())
     occurred_at = occurred_at or datetime.now().isoformat(timespec="microseconds")
     def write(conn, _profile):
         conn.execute("INSERT INTO staff_force_open_events "
-                     "(local_id, device_id, door_id, occurred_at, agent_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                     (local_id, device_id, door_id, occurred_at, agent_id, now_iso()))
+                     "(local_id, device_id, door_id, occurred_at, agent_id, created_at, requested_by_pc_id) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     (local_id, device_id, door_id, occurred_at, agent_id, now_iso(), requested_by_pc_id))
     _run_db_write_sync("staff_force_open_insert", write, durable=True)
     return local_id
 

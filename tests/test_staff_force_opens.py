@@ -61,3 +61,19 @@ def test_forwarded_request_is_not_recorded_as_a_successful_open(db):
     v2_routes._handle_v2_request_door(ctx)
     assert ctx.send_json.call_args.args[0] == 202
     assert db.list_pending_force_open_events() == []
+
+
+def test_reader_forwarded_open_is_recorded_on_the_driver_with_the_reader(db):
+    from app.api import local_access_api_v2 as routes
+    app = SimpleNamespace(staff_session=None)
+    reader_ctx = SimpleNamespace(app=app, in_process=True, body=lambda: {"doorNumber": 1, "requestedByPcId": 42})
+    routes.staff_record_force_open(reader_ctx, 7, 1)
+    rows = db.list_pending_force_open_events()
+    assert len(rows) == 1 and rows[0]["requested_by_pc_id"] == 42
+
+
+def test_dashboard_remote_open_is_not_recorded_as_a_desk_force_open(db):
+    from app.api import local_access_api_v2 as routes
+    ctx = SimpleNamespace(app=SimpleNamespace(staff_session=None), in_process=True, body=lambda: {"doorNumber": 1})
+    routes.staff_record_force_open(ctx, 7, 1)
+    assert db.list_pending_force_open_events() == []
