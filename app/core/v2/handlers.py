@@ -126,7 +126,13 @@ class CommandHandlers:
         if not lease_gate.device_allowed(did):
             return ("FAILED", "NOT_DRIVER", {"gymDeviceId": did})
         door = int((run.payload or {}).get("doorNumber") or 1)
-        ctx = LocalCtx(self.app, {"deviceId": did}, {"doorNumber": door, "pulseSeconds": 3})
+        body = {"doorNumber": door, "pulseSeconds": 3}
+        # Filed by a reader PC: the server names it on the claim, so this driver records the
+        # force-open as requested from that reader (owner decision 2026-10-31).
+        requester = (run.payload or {}).get("requestedByPcId")
+        if isinstance(requester, int) and not isinstance(requester, bool) and requester > 0:
+            body["requestedByPcId"] = requester
+        ctx = LocalCtx(self.app, {"deviceId": did}, body)
         _gated("_handle_device_door_open")(ctx)
         status, p = ctx.status, ctx.payload
         detail = {"gymDeviceId": did, "door": door, "source": p.get("source")}

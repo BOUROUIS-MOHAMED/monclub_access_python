@@ -18,6 +18,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useApp } from "@/context/AppContext";
+import { staffTime } from "@/components/StaffChip";
 import { usePopupStream } from "@/api/hooks";
 import { get, post } from "@/api/client";
 import { usePageChrome } from "@/context/PageChromeContext";
@@ -414,6 +415,8 @@ export default function DashboardPage() {
       <Panel className="col-span-4" aria-label="État du poste">
         <PanelHeader title="État du poste" />
         <PanelList>
+          {status.staff?.enabled && <ListRow icon={Users} tone={status.staff.agent ? "primary" : "grey"} title="Agent Access"
+            sub={status.staff.agent ? `${status.staff.agent.name} depuis ${staffTime(status.staff.agent.since)} · suit le tableau de bord` : "Aucun agent"} />}
           <ListRow
             icon={Router}
             tone={readerTone}

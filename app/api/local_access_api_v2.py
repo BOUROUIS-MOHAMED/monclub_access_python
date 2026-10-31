@@ -800,6 +800,13 @@ def _build_status_payload(app: Any) -> Dict[str, Any]:
     return result
 
 
+def invalidate_staff_status() -> None:
+    """The SSE loop observes the new staff snapshot on its next one-second pass."""
+    global _status_payload_cache
+    with _status_payload_lock:
+        _status_payload_cache = (0, None, None)
+
+
 def _pc_drives_ultra_turnstiles(mode: Any) -> bool:
     """Whether this PC is meant to connect to at least one ULTRA turnstile.
 
@@ -992,6 +999,10 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
         "ultra": ultra,
         "updates": updates,
         "popup": popup,
+        "staff": app.staff_session.snapshot() if getattr(app, "staff_session", None) else {
+            "enabled": False, "agent": None, "allowedAgents": [], "permissions": [],
+            "changedAt": None, "previousAgentName": None,
+        },
     }
 
 
@@ -1045,6 +1056,8 @@ def _handle_auth_login(ctx: _Ctx) -> None:
 
         from access.store import save_auth_token
         save_auth_token(email=email, token=token)
+        if getattr(ctx.app, "staff_session", None):
+            ctx.app.staff_session.clear(api)
         _reset_gym_name_refresh(ctx.app)
         try:
             from tv.auth_bridge import mirror_access_auth_to_tv
@@ -1356,6 +1369,8 @@ def _handle_auth_logout(ctx: _Ctx) -> None:
         pass
     from access.store import clear_auth_token
     clear_auth_token()
+    if getattr(ctx.app, "staff_session", None):
+        ctx.app.staff_session.clear(ctx.app._api())
     _reset_gym_name_refresh(ctx.app)
     try:
         from tv.auth_bridge import clear_tv_auth_bridge_state
@@ -2155,6 +2170,8 @@ def _handle_member_photo(ctx: _Ctx) -> None:
     """Attach a member photo. For a SYNCED member (real activeMembershipId) it uploads
     immediately via the managed-media presign flow; for an OFFLINE-PENDING member
     (offlinePendingLocalId) it stores the photo and defers the upload until reconcile."""
+    if not _staff_require(ctx, "ACTIVE_MEMBERSHIP_UPDATE"):
+        return
     body = ctx.body()
     image_b64 = _safe_str(body.get("imageBase64") or body.get("image_base64"), "").strip()
     if not image_b64:
@@ -2184,6 +2201,8 @@ def _handle_member_photo(ctx: _Ctx) -> None:
     except Exception as e:
         ctx.send_json(400, {"ok": False, "error": str(e)})
         return
+    if res.get("ok"):
+        _staff_activity(ctx.app)
     ctx.send_json(200 if res.get("ok") else 400, res)
 
 
@@ -3650,6 +3669,8 @@ def _handle_offline_creation_get(ctx: _Ctx) -> None:
 
 
 def _handle_offline_creation_attempt(ctx: _Ctx) -> None:
+    if not _staff_require(ctx, "ACTIVE_MEMBERSHIP_CREATION"):
+        return
     body = ctx.body()
     creation_kind = _safe_str(body.get("creationKind") or body.get("creation_kind"), "membership_only")
     payload = _queue_payload_from_body(body)
@@ -3661,10 +3682,14 @@ def _handle_offline_creation_attempt(ctx: _Ctx) -> None:
         client_request_id=client_request_id or None,
     )
     # Keep 200 with ok=false so UI can decide modify vs save-later without transport errors.
+    if result.get("ok"):
+        _staff_activity(ctx.app)
     ctx.send_json(200, result)
 
 
 def _handle_offline_creation_queue(ctx: _Ctx) -> None:
+    if not _staff_require(ctx, "ACTIVE_MEMBERSHIP_CREATION"):
+        return
     body = ctx.body()
     creation_kind = _safe_str(body.get("creationKind") or body.get("creation_kind"), "membership_only")
     payload = _queue_payload_from_body(body)
@@ -3679,6 +3704,7 @@ def _handle_offline_creation_queue(ctx: _Ctx) -> None:
 
     try:
         row = ctx.app.queue_offline_creation(creation_kind=creation_kind, payload=payload, failure=failure)
+        _staff_activity(ctx.app)
         ctx.send_json(201, {"ok": True, "row": row})
     except Exception as e:
         ctx.send_json(400, {"ok": False, "error": str(e)})
@@ -3797,6 +3823,92 @@ def _handle_offline_subresources_process_due(ctx: _Ctx) -> None:
     ctx.send_json(200, res)
 
 
+_STAFF_MUTATION_PERMISSIONS = {
+    "edit": "ACTIVE_MEMBERSHIP_UPDATE",
+    "freeze_create": "ACTIVE_MEMBERSHIP_FREEZING",
+    "freeze_cancel": "ACTIVE_MEMBERSHIP_FREEZING",
+    "delete": "ACTIVE_MEMBERSHIP_DELETION",
+    "renew": "ACTIVE_MEMBERSHIP_RENEWAL",
+    "pay_rest": "ACTIVE_MEMBERSHIP_PAY_REMAINING",
+}
+
+
+def _staff_require(ctx: _Ctx, permission: str, *, switch_required: bool = False) -> bool:
+    staff = getattr(ctx.app, "staff_session", None)
+    if switch_required and (not staff or not staff.snapshot()["enabled"]):
+        allowed, code = False, "NO_AGENT"
+    else:
+        allowed, code = staff.require("ACTIVE_MEMBERSHIP_MANAGEMENT", permission) if staff else (True, None)
+    if not allowed:
+        ctx.send_json(403, {"ok": False, "code": code, "permission": permission})
+    return allowed
+
+
+def _staff_activity(app) -> None:
+    try:
+        from access.store import load_auth_token
+        staff = getattr(app, "staff_session", None)
+        auth = load_auth_token() if staff else None
+        if auth and auth.token:
+            staff.post_activity(app._api, auth.token)
+    except Exception:
+        pass  # Activity must never change an action's result.
+
+
+def _staff_online_action(ctx: _Ctx, method: str, permission: str) -> None:
+    if not _staff_require(ctx, permission, switch_required=True):
+        return
+    from access.store import load_auth_token
+    auth = load_auth_token()
+    if not auth or not auth.token:
+        ctx.send_json(401, {"ok": False, "error": "Connexion requise"})
+        return
+    payload = ctx.body()
+    try:
+        api = ctx.app._api()
+        if method in ("renew_quote", "staff_payment_details"):
+            result = getattr(api, method)(token=auth.token, payload=payload)
+        else:
+            import uuid
+            key = str(payload.get("clientRequestId") or uuid.uuid4())
+            result = getattr(api, method)(token=auth.token, payload=payload, idempotency_key=key)
+    except MonClubApiHttpError as exc:
+        try:
+            error = json.loads(exc.body)
+        except Exception:
+            error = {"ok": False, "error": str(exc)}
+        ctx.send_json(exc.status_code, error)
+        return
+    except MonClubApiError:
+        ctx.send_json(503, {"code": "OFFLINE", "error": "Internet requis pour renouveler" if method not in ("pay_rest", "staff_payment_details")
+                           else "Internet requis pour payer le reste"})
+        return
+    if method not in ("renew_quote", "staff_payment_details"):
+        _staff_activity(ctx.app)
+        try:
+            _schedule_sync_request(ctx.app, trigger_source="STAFF_ACTION", run_type="TRIGGERED",
+                                   trigger_hint={"reason": "STAFF_MEMBERSHIP_CHANGED"})
+        except Exception:
+            pass
+    ctx.send_json(200, result)
+
+
+def _handle_staff_renew_quote(ctx: _Ctx) -> None:
+    _staff_online_action(ctx, "renew_quote", "ACTIVE_MEMBERSHIP_RENEWAL")
+
+
+def _handle_staff_renew(ctx: _Ctx) -> None:
+    _staff_online_action(ctx, "renew", "ACTIVE_MEMBERSHIP_RENEWAL")
+
+
+def _handle_staff_pay_rest(ctx: _Ctx) -> None:
+    _staff_online_action(ctx, "pay_rest", "ACTIVE_MEMBERSHIP_PAY_REMAINING")
+
+
+def _handle_staff_payment_details(ctx: _Ctx) -> None:
+    _staff_online_action(ctx, "staff_payment_details", "ACTIVE_MEMBERSHIP_PAY_REMAINING")
+
+
 def _handle_member_mutation(ctx: _Ctx) -> None:
     """Submit a lifecycle mutation (edit/delete/freeze/tax/...) on a SYNCED member.
     Online-first → queue-on-failure. The body is generic so the UI builds each op:
@@ -3804,6 +3916,9 @@ def _handle_member_mutation(ctx: _Ctx) -> None:
     Always replies HTTP 200 with an outcome (ok/queued/conflict/needsFix) so the UI decides."""
     body = ctx.body()
     op_kind = _safe_str(body.get("opKind") or body.get("op_kind"), "").strip().lower()
+    permission = _STAFF_MUTATION_PERMISSIONS.get(op_kind)
+    if permission and not _staff_require(ctx, permission):
+        return
     target_kind = _safe_str(body.get("targetKind") or body.get("target_kind"), "active_membership").strip().lower()
     raw_tid = body.get("targetId")
     if raw_tid is None:
@@ -3834,6 +3949,8 @@ def _handle_member_mutation(ctx: _Ctx) -> None:
     except Exception as e:
         ctx.send_json(400, {"ok": False, "error": str(e)})
         return
+    if res.get("ok") or res.get("queued"):
+        _staff_activity(ctx.app)
     ctx.send_json(200, res)
 
 
@@ -4233,6 +4350,49 @@ def _door_open_error_fr(err: Any) -> str:
     return f"échec de l'ouverture de porte ({e or 'erreur inconnue'})"
 
 
+def staff_record_force_open(ctx, device_id: int, door_id: int) -> None:
+    # A remote command runs in process. Record it only when a reader PC filed it (the server adds
+    # requestedByPcId): this driver really opened the door, and the row is tagged with that reader.
+    # A dashboard remote open is not a desk force-open and is not recorded here.
+    requested_by = None
+    if getattr(ctx, "in_process", False):
+        requested_by = (ctx.body() or {}).get("requestedByPcId")
+        if not isinstance(requested_by, int) or isinstance(requested_by, bool) or requested_by <= 0:
+            return
+    try:
+        from app.core.db import insert_force_open_event
+        staff = getattr(ctx.app, "staff_session", None)
+        current = (staff.snapshot().get("agent") or {}) if staff else {}
+        insert_force_open_event(device_id=device_id, door_id=door_id, agent_id=current.get("id"),
+                                requested_by_pc_id=requested_by)
+    except Exception:
+        _logger.exception("Staff force-open event could not be saved")
+    _staff_activity(ctx.app)
+
+
+def staff_upload_force_opens(app, token: str) -> None:
+    from app.core.db import (list_pending_force_open_events, mark_force_open_events_synced,
+                             mark_force_open_events_failed)
+    from access.pc_identity import get_pc_identity_service
+    rows = list_pending_force_open_events()
+    if not rows:
+        return
+    pc_uuid = get_pc_identity_service(app).status().get("pcUuid")
+    if not pc_uuid:
+        return  # Keep the events until this installation has its PC identity.
+    ids = [row["local_id"] for row in rows]
+    events = [{"localId": row["local_id"], "pcUuid": pc_uuid, "deviceId": row["device_id"],
+               "doorId": row["door_id"], "occurredAt": row["occurred_at"], "agentId": row["agent_id"],
+               "requestedByPcId": row.get("requested_by_pc_id")}
+              for row in rows]
+    try:
+        app._api().upload_force_opens(token=token, events=events)
+    except Exception as exc:
+        mark_force_open_events_failed(ids, str(exc))
+    else:
+        mark_force_open_events_synced(ids)
+
+
 def _handle_device_door_open(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
 
@@ -4263,6 +4423,7 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
                 timeout_ms=4000,
             )
             if res.ok:
+                staff_record_force_open(ctx, did, door)
                 ctx.send_json(200, {"ok": True, "rc": 0, "source": "agent"})
                 return
         except Exception:
@@ -4328,6 +4489,7 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
             _door_ms = round((time.monotonic() - _door_t0) * 1000)
             if ok:
                 _logger.info("[LocalAPI] ULTRA door open OK: device_id=%s door=%s", did, door)
+                staff_record_force_open(ctx, did, door)
                 ctx.send_json(200, {"ok": True, "rc": 0, "source": "ultra"})
                 _tel.event("DOOR_OPEN", device_id=did, door=door, result="200_ok", wait_ms=_door_ms)
             elif err == "timeout":
@@ -4372,6 +4534,7 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
         return
     try:
         rc = sdk.door_pulse_open(door=door, seconds=pulse_sec)
+        staff_record_force_open(ctx, did, door)
         ctx.send_json(200, {"ok": True, "rc": rc})
     except Exception as e:
         ctx.send_json(500, {"ok": False, "error": str(e)})
@@ -6194,6 +6357,8 @@ def _enroll_set_phase(data: Dict[str, Any]) -> None:
 
 
 def _handle_enroll_start(ctx: _Ctx) -> None:
+    if not _staff_require(ctx, "ACTIVE_MEMBERSHIP_FINGERPRINTS"):
+        return
     body = ctx.body()
 
     # accept either "type" or "target" from frontend
@@ -6284,6 +6449,8 @@ def _enroll_clear_tpl() -> None:
 
 def _handle_enroll_retry_push(ctx: _Ctx) -> None:
     """Retry saving the last enrolled template to the backend (no re-scan needed)."""
+    if not _staff_require(ctx, "ACTIVE_MEMBERSHIP_FINGERPRINTS"):
+        return
     with _enroll_last_tpl_lock:
         tpl = _enroll_last_tpl
 
@@ -6330,7 +6497,11 @@ def _handle_enroll_retry_push(ctx: _Ctx) -> None:
                 "enabled": True,
             }
             api = _app_ref._api()
+            staff = getattr(_app_ref, "staff_session", None)
+            if staff and not staff.has_permission("ACTIVE_MEMBERSHIP_MANAGEMENT", "ACTIVE_MEMBERSHIP_FINGERPRINTS"):
+                raise RuntimeError("Permission d'enrôlement retirée")
             resp = api.create_user_fingerprint(token=_token_snapshot, payload=payload)
+            _staff_activity(_app_ref)
             _enroll_add_log(f"Push OK: {resp}")
             _enroll_set_result("success")
             _enroll_clear_tpl()
@@ -6472,10 +6643,13 @@ def _handle_fingerprints_list(ctx: _Ctx) -> None:
 
 
 def _handle_fingerprints_delete(ctx: _Ctx) -> None:
+    if not _staff_require(ctx, "ACTIVE_MEMBERSHIP_FINGERPRINTS"):
+        return
     fp_id = ctx.param_int("id")
     from access.store import delete_fingerprint
     try:
         delete_fingerprint(fp_id)
+        _staff_activity(ctx.app)
         ctx.send_json(200, {"ok": True})
     except Exception as e:
         ctx.send_json(400, {"ok": False, "error": str(e)})
@@ -7426,6 +7600,8 @@ def _handle_v1_health(ctx: _Ctx) -> None:
 
 def _handle_v1_enroll(ctx: _Ctx) -> None:
     """Deprecated: use POST /api/v2/enroll/start"""
+    if not _staff_require(ctx, "ACTIVE_MEMBERSHIP_FINGERPRINTS"):
+        return
     user_id = ctx.q("id", "userId", "user_id")
     finger_id = ctx.q("fingerId", "finger_id")
     full_name = ctx.q("fullName", "fullname", "name")

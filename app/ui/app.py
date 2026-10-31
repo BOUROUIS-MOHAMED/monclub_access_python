@@ -723,6 +723,12 @@ class MainApp:
             self.logger.warning("[ERASE] erase backups not pruned at start-up", exc_info=True)
         self.after(_DATE_FLIP_TICK_MS, self._date_flip_tick)
         self.after(_OFF_HOURS_TICK_MS, self._off_hours_tick)
+        from app.core.staff_session import StaffSession
+        from app.api.local_access_api_v2 import invalidate_staff_status
+        self.staff_session = StaffSession(on_change=invalidate_staff_status,
+                                          is_token_current=self._staff_token_current)
+        self._staff_poll_busy = False
+        self.after(0, self._staff_tick)
         try:
             self._arm_midnight_date_flip()
         except Exception:
@@ -1892,6 +1898,29 @@ class MainApp:
             if not self._stop_event.is_set():
                 self.after(_OFF_HOURS_TICK_MS, self._off_hours_tick)
 
+    @staticmethod
+    def _staff_token_current(token: str) -> bool:
+        auth = load_auth_token()
+        return bool(auth and auth.token == token)
+
+    def _staff_tick(self) -> None:
+        def run():
+            try:
+                auth = load_auth_token()
+                if auth and auth.token:
+                    self.staff_session.poll_once(self._api(), auth.token)
+            except Exception:
+                self.logger.debug("Staff poll failed", exc_info=True)
+            finally:
+                self._staff_poll_busy = False
+        try:
+            if not self._staff_poll_busy:
+                self._staff_poll_busy = True
+                threading.Thread(target=run, name="staff-poll", daemon=True).start()
+        finally:
+            if not self._stop_event.is_set():
+                self.after(10_000, self._staff_tick)
+
     def _arm_first_day_credentials_sync(self, out: Dict[str, Any], now_epoch: float) -> None:
         """A membership starting on the applied day gets its QR credential enabled by the server's
         00:16 job (F8): arm ONE sync at 00:17:00 gym time. A later flip replaces it."""
@@ -2329,7 +2358,11 @@ class MainApp:
 
     # ======================= API helpers =======================
     def _api(self) -> MonClubApi:
-        return MonClubApi(endpoints=build_access_api_endpoints(self.cfg), logger=self.logger)
+        api = MonClubApi(endpoints=build_access_api_endpoints(self.cfg), logger=self.logger)
+        staff = getattr(self, "staff_session", None)
+        if staff:
+            staff.apply_cookie(api)
+        return api
 
     # ======================= Offline creation queue =======================
     def _auth_token_value(self) -> str:
@@ -3916,6 +3949,12 @@ class MainApp:
                     self.logger.warning("[FingerprintPush] report failed: %s", _fp_exc)
 
             try:
+                from app.api.local_access_api_v2 import staff_upload_force_opens
+                staff_upload_force_opens(self, auth.token)
+            except Exception as ex:
+                self.logger.warning("Staff force-open upload failed: %s", ex)
+
+            try:
                 self._device_attendance_engine.run_blocking(
                     source="timer",
                     sync_online=sync_online,
@@ -4642,6 +4681,13 @@ class MainApp:
             else:
                 tpl_text = to_b64(tpl_bytes)
 
+            # Capture can take long enough for the staff member or permissions to change.
+            # Check before BOTH save paths, including a pending member's deferred save.
+            staff = getattr(self, "staff_session", None)
+            if staff and not staff.has_permission("ACTIVE_MEMBERSHIP_MANAGEMENT", "ACTIVE_MEMBERSHIP_FINGERPRINTS"):
+                fail("Permission d'enrôlement retirée", "staff_permission_denied")
+                return
+
             # Store template for retry-push if the save fails
             from app.api.local_access_api_v2 import _enroll_store_tpl, _enroll_clear_tpl
             _enroll_store_tpl({
@@ -4677,6 +4723,8 @@ class MainApp:
                     },
                 )
                 _enroll_clear_tpl()  # nothing to retry-push; it's deferred durably
+                from app.api.local_access_api_v2 import _staff_activity
+                _staff_activity(self)
                 self.logger.info("[OfflineSubresource] fingerprint deferred for pending member local=%s finger=%s",
                                  pending_local_id, finger_id)
                 success("Fingerprint captured. It will be saved to the member automatically "
@@ -4728,7 +4776,12 @@ class MainApp:
             api = self._api()
             _t_backend = time.monotonic()
             try:
+                staff = getattr(self, "staff_session", None)
+                if staff and not staff.has_permission("ACTIVE_MEMBERSHIP_MANAGEMENT", "ACTIVE_MEMBERSHIP_FINGERPRINTS"):
+                    raise RuntimeError("Permission d'enrôlement retirée")
                 resp = api.create_user_fingerprint(token=auth.token, payload=payload)
+                from app.api.local_access_api_v2 import _staff_activity
+                _staff_activity(self)
             except Exception as _exc_api:
                 # create_user_fingerprint carries the HTTP status and body inside its
                 # message; monclub_api emits the structured ENROLL_BACKEND line with

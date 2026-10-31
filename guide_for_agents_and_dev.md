@@ -5274,7 +5274,9 @@ the membership in `sync_users` nor `sync_users_held`. `[CODE]`
   targets (other id spaces) and memberships no longer on this PC keep the bare `#id`. A failed
   lookup leaves the rows as they were. `[TEST: tests/test_member_card_details.py::TestMutationTargetNames]`
 
-**Not built: « Renouveler » (Card M 7e).** Two facts block an honest renew button. `[CODE]`
+**Historical blocker for « Renouveler » (Card M 7e, before 1.5.0).** These two facts explain
+why the old client did not have a renew button. The staff flow below adds a separate online
+path; it does not enable the offline money queue. `[CODE]`
 1. `renew` is a money op (`db.py::_MONEY_OP_KINDS`) and `app.py`'s `_offline_money_mutations_enabled`
    is `False` with no code path setting it: `submit_offline_mutation` queues a money op without a
    live attempt and the drain skips it (`money-gated`), so a renew would wait in the queue forever.
@@ -5300,6 +5302,40 @@ the membership in `sync_users` nor `sync_users_held`. `[CODE]`
    `acknowledgeDoorLoss` (409) — none of which the PC can know offline.
 
 ---
+
+### 3.14a Staff login, online renewal and force-opens (1.5.0)
+
+`app/core/staff_session.py::StaffSession` polls `/manager/gym/access/v1/staff/current`
+every 10 s on a daemon thread (`app.py::_staff_tick`). The snapshot and DPAPI-protected
+Access-scoped token are stored in `v2_kv.staff_session`; every API client made by `App._api`
+gets the current `currentAgentId` cookie. Logout clears it and prevents an in-flight poll from
+restoring the session. Network failures keep the last snapshot. The gym switch off means
+no staff cookie, no staff UI and no new permission refusal on existing actions. `[CODE]`
+`[TEST: tests/test_staff_session.py]`
+
+With the switch on, the local API checks MANAGEMENT plus the action's own permission for
+create, edit, freeze, delete, photo and fingerprint capture/save/delete. New online-only
+`/members/renew/quote`, `/members/renew`, `/members/pay-rest` routes bypass the offline queues
+and money gate. The dialogs use backend-computed quotes, debt choices (including term IDs,
+totals seen and kept due dates), and door/start-inside-period confirmations. Pay-rest reads
+live membership and terms via `/members/pay-rest/details`, because the local roster has no
+balance. Real successful staff actions send a background activity ping at most once/minute;
+polls, quotes and queue drains do not count as activity. Existing offline edit/freeze/delete/
+creation queues retain their automatic upload behaviour and use staff current at send time.
+`[CODE; TEST: tests/test_staff_gate.py]`
+
+Every gym records confirmed local operator opens in `staff_force_open_events` (UUID, device,
+door, local time and current staff ID or null). The ULTRA, AGENT and PullSDK connection paths
+are unchanged. The sync tick uploads pending rows with this installation's PC UUID and retries
+failures using the same local IDs. A reader press is forwarded through the server to the
+driver (DOOR_OPEN command). The server adds `requestedByPcId` to that command's payload when the
+driver claims it (`AccessPcCommandService.claimPayload`; the stored payload is unchanged), and the
+driver records the open it really performed, tagged with that reader (`requested_by_pc_id`,
+shown in door history as "requested from <reader PC>"; owner decision 2026-10-31). The reader
+itself records nothing on request acceptance. A dashboard remote open (no `requestedByPcId`) is
+not recorded as a desk force-open. Unknown/failed local opens are not recorded as successes.
+`[CODE; TEST: tests/test_staff_force_opens.py]`
+Real backend interoperability and turnstile hardware are `[UNVERIFIED]`.
 
 ### 3.15 Profil — the session window, the role and the gym name (Access v5 Card P, 2026-10-16)
 

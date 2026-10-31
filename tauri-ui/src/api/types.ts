@@ -132,7 +132,29 @@ export interface UpdatesBlock {
   lastResult?: UpdateLastResult | null;
 }
 
+export interface StaffRef {
+  id: number;
+  name: string;
+  adminAgent: boolean;
+}
+
+export interface StaffBlock {
+  enabled: boolean;
+  agent: (StaffRef & { since: string | null }) | null;
+  allowedAgents: StaffRef[];
+  permissions: string[];
+  changedAt: string | null;
+  previousAgentName: string | null;
+}
+
+export interface StaffMember {
+  activeMembershipId?: number | string;
+  membershipId?: number | string;
+  fullName?: string;
+}
+
 export interface StatusResponse extends ApiOk {
+  staff?: StaffBlock;
   session: SessionBlock;
   mode: ModeBlock;
   sync: SyncBlock;
