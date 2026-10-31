@@ -136,6 +136,18 @@ export interface StaffRef {
   id: number;
   name: string;
   adminAgent: boolean;
+  permissions?: string[];
+  permissionScopes?: Record<string, string>;
+}
+
+export interface StaffOffline {
+  active: boolean; manual: boolean; since: string | null; unlocked: boolean;
+  actAs: { id: number; name: string } | null;
+  role: "DRIVER" | "READER" | "ALL_TURNSTILES" | "UNKNOWN"; driverName: string | null;
+  codeSet: boolean; lock: { remaining: number; lockedSeconds: number };
+  limits: { door: { used: number; max: number }; money: { used: number; max: number } };
+  pending: { count: number; lastError: string | null };
+  lastUpload: { count: number; at: string } | null;
 }
 
 export interface StaffBlock {
@@ -145,6 +157,7 @@ export interface StaffBlock {
   permissions: string[];
   changedAt: string | null;
   previousAgentName: string | null;
+  offline?: StaffOffline;
 }
 
 export interface StaffMember {
@@ -488,6 +501,7 @@ export interface OfflineCreationRow {
 
 export interface OfflineAttemptResponse {
   ok: boolean;
+  pendingApproval?: boolean;
   creationKind?: OfflineCreationKind;
   clientRequestId?: string;
   created?: boolean;

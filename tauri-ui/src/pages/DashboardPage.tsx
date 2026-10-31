@@ -274,6 +274,11 @@ export default function DashboardPage() {
 
   return (
     <PageGrid>
+      {status.staff?.enabled && status.staff.offline?.active && status.staff.offline.role === "READER" && <Panel className="col-span-12 p-6">
+        <div className="text-[18px] font-bold text-warning-ink">Hors ligne – utilisez le PC pilote ({status.staff.offline.driverName || "nom indisponible"}) pour les modifications</div>
+        <p className="mt-2 text-[13px] text-muted-foreground">Ce poste lecteur permet toujours de rechercher un membre dans la copie locale.</p>
+        <ActionButton kind="dark" className="mt-4" onClick={() => navigate("/users")}>Rechercher un membre</ActionButton>
+      </Panel>}
       {/* ── Maintenant ─────────────────────────────────────────────────── */}
       <Panel className="col-span-8" aria-label="Maintenant">
         <PanelHeader title="Maintenant" />
@@ -415,8 +420,8 @@ export default function DashboardPage() {
       <Panel className="col-span-4" aria-label="État du poste">
         <PanelHeader title="État du poste" />
         <PanelList>
-          {status.staff?.enabled && <ListRow icon={Users} tone={status.staff.agent ? "primary" : "grey"} title="Agent Access"
-            sub={status.staff.agent ? `${status.staff.agent.name} depuis ${staffTime(status.staff.agent.since)} · suit le tableau de bord` : "Aucun agent"} />}
+          {status.staff?.enabled && <ListRow icon={Users} tone={status.staff.offline?.active ? "warning" : status.staff.agent ? "primary" : "grey"} title="Personnel Access"
+            sub={status.staff.offline?.active ? status.staff.offline.actAs ? `Hors ligne · Agir en tant que ${status.staff.offline.actAs.name}` : "Hors ligne · verrouillé" : status.staff.agent ? `${status.staff.agent.name} depuis ${staffTime(status.staff.agent.since)} · suit le tableau de bord` : "Aucun agent"} />}
           <ListRow
             icon={Router}
             tone={readerTone}

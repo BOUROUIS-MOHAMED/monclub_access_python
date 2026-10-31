@@ -1,0 +1,19 @@
+{
+  "creationKind": "account_plus_membership",
+  "body": {
+    "clientRequestId": "offline-create-fixture",
+    "membershipId": "1",
+    "firstname": "Ali",
+    "lastname": "Example",
+    "email": "ali@example.invalid",
+    "password": "fixture-password",
+    "phone": "20000000",
+    "startDate": "2026-10-31",
+    "endDate": "2026-11-29",
+    "cardId": "12345678",
+    "secondCardId": "",
+    "paymentMethod": "CASH",
+    "price": 60,
+    "payedPrice": 60
+  }
+}

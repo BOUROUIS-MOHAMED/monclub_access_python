@@ -32,10 +32,56 @@ function staffShiftDay(date: string, days: number) {
   return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, "0")}-${String(parsed.getDate()).padStart(2, "0")}`;
 }
 
-export default function RenewDialog({ member, plans, staff, gymDate, onClose, onSuccess }: {
+type RenewDialogProps = {
   member: StaffMember; plans: StaffPlan[]; staff?: StaffBlock; gymDate?: string | null;
   onClose: () => void; onSuccess: () => void;
-}) {
+};
+
+export default function RenewDialog(props: RenewDialogProps) {
+  return props.staff?.enabled && props.staff.offline?.active ? <OfflineRenewDialog {...props} /> : <OnlineRenewDialog {...props} />;
+}
+
+function OfflineRenewDialog({ member, plans, staff, onClose, onSuccess }: RenewDialogProps) {
+  const initial = plans.find((p) => String(p.id) === String(member.membershipId)) || plans[0];
+  const [planId, setPlanId] = useState(String(initial?.id || ""));
+  const [price, setPrice] = useState(String(initial?.price ?? ""));
+  const [paid, setPaid] = useState(String(initial?.price ?? ""));
+  const [payment, setPayment] = useState(staffEmptyPayment);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [requestId] = useState(() => crypto.randomUUID());
+  const hint = staffPermissionHint(staff, "ACTIVE_MEMBERSHIP_RENEWAL", "Renouveler");
+  const limit = staff?.offline?.limits.money;
+  const amount = Number(paid), cost = Number(price);
+  const valid = !hint && !!planId && price !== "" && paid !== "" && Number.isFinite(amount) && Number.isFinite(cost)
+    && amount >= 0 && cost >= amount && (amount === 0 || staffPaymentValid(payment));
+  const submit = async () => {
+    if (!valid || busy) return;
+    setBusy(true); setError("");
+    try {
+      await post("/members/renew", { activeMembershipId: Number(member.activeMembershipId), membership_id: Number(planId),
+        price: cost, payedPrice: amount, ...staffPaymentPayload(payment), clientRequestId: requestId });
+      showStaffToast("Renouvellement enregistré pour validation", `${member.fullName} · ${staffMoney(amount)} DT · dates calculées à la validation`);
+      onSuccess(); onClose();
+    } catch (e) { setError(staffError(e)); } finally { setBusy(false); }
+  };
+  return <DialogFrame open onOpenChange={(open) => { if (!open && !busy) onClose(); }} title="Renouveler · hors ligne" sub={member.fullName} width={590} lockOutside
+    footer={<><span className="mr-auto text-[12.5px] text-muted-foreground">Argent : {limit ? Math.max(0, limit.max - limit.used) : 0} sur {limit?.max ?? 0} restantes</span><ActionButton disabled={busy} onClick={onClose}>Annuler</ActionButton><ActionButton kind="primary" disabled={!valid || busy} onClick={() => void submit()}>{busy ? "Enregistrement…" : `Enregistrer pour validation · ${staffMoney(amount || 0)} DT`}</ActionButton></>}>
+    <fieldset disabled={busy} className="min-w-0 space-y-3 pb-3">
+      <legend className="sr-only">Renouvellement hors ligne</legend>
+      <div className="grid gap-2 sm:grid-cols-3" role="radiogroup" aria-label="Abonnement">{plans.map((plan) => <button key={plan.id} type="button" role="radio" aria-checked={String(plan.id) === planId}
+        className={cn("rounded-[10px] border p-3 text-left text-[13px] focus-visible:ring-2 focus-visible:ring-primary", String(plan.id) === planId ? "border-primary bg-primary/8" : "border-grey/32")}
+        onClick={() => { setPlanId(String(plan.id)); setPrice(String(plan.price ?? "")); setPaid(String(plan.price ?? "")); }}><div className="font-bold">{plan.title || `Abonnement ${plan.id}`}</div><div className="mt-1 text-muted-foreground">{plan.price == null ? "Prix à renseigner" : `${staffMoney(Number(plan.price))} DT`}</div></button>)}</div>
+      {!plans.length && <Note tone="warning">Aucun abonnement disponible dans la copie locale.</Note>}
+      <FieldGrid><FormField label="Prix (DT)"><FieldInput type="number" min="0" step="0.001" value={price} onChange={(e) => setPrice(e.target.value)} /></FormField><FormField label="Payé maintenant (DT)"><FieldInput type="number" min="0" step="0.001" max={price} value={paid} onChange={(e) => setPaid(e.target.value)} /></FormField><StaffPaymentFields value={payment} onChange={setPayment} disabled={busy} /></FieldGrid>
+      <Note tone="warning">Hors ligne : les dates seront calculées à la validation dans le tableau de bord.</Note>
+      <p className="text-[13px] text-muted-foreground">Ces questions seront posées à la personne qui valide : la dette, et l'accès entre deux périodes.</p>
+      {(hint || error) && <Note tone="error">{hint || error}</Note>}
+    </fieldset>
+  </DialogFrame>;
+}
+
+function OnlineRenewDialog({ member, plans, staff, gymDate, onClose, onSuccess }: RenewDialogProps) {
   const today = gymDate || staffToday();
   const initialPlan = plans.find((p) => String(p.id) === String(member.membershipId)) || plans[0];
   const [planId, setPlanId] = useState(String(initialPlan?.id || ""));

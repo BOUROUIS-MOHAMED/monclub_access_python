@@ -1,0 +1,8 @@
+{
+  "activeMembershipId": 10,
+  "membership_id": 1,
+  "price": 60,
+  "payedPrice": 60,
+  "paymentMethod": "CASH",
+  "note": "Offline renewal"
+}

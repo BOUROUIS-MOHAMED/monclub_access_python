@@ -70,6 +70,7 @@ export default function EnrollPage() {
 
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<string | null>(null);
+  const [pendingApproval, setPendingApproval] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
 
   // Overlay state
@@ -229,6 +230,7 @@ export default function EnrollPage() {
       const es = openSSE("/enroll/events", (type, data) => {
         // Note: on SSE reconnect, server replays full snapshot automatically
         try {
+          if (type === "enroll_started") setPendingApproval(false);
           // Structured phase events (authoritative, from enriched Python backend)
           if (type === "phase" && data?.phase) {
             const phaseMap: Record<string, EnrollPhase> = {
@@ -264,6 +266,7 @@ export default function EnrollPage() {
                     ? String(data.text)
                     : safeStringify(data, 800);
 
+            if (line === "Empreinte enregistrée pour validation dans le tableau de bord.") setPendingApproval(true);
             if (/^ERROR:/i.test(line)) {
               lastEnrollErrorRef.current = line.replace(/^ERROR:\s*/i, "").trim();
             }
@@ -377,6 +380,7 @@ export default function EnrollPage() {
 
     setRunning(true);
     setResult(null);
+    setPendingApproval(false);
     setLogs(["Demarrage..."]);
     setScanProgress(0);
     setPhase("connecting");
@@ -487,7 +491,7 @@ export default function EnrollPage() {
     sample_rejected: { title: "Échantillon rejeté", hint: "Qualité insuffisante — reposez le doigt." },
     processing: { title: "Traitement…", hint: "Fusion des échantillons en une empreinte." },
     push: { title: "Sauvegarde…", hint: "Enregistrement de l'empreinte sur le serveur MonClub." },
-    success: { title: "Empreinte enregistrée", hint: "La capture est terminée." },
+    success: { title: pendingApproval ? "Empreinte enregistrée pour validation" : "Empreinte enregistrée", hint: pendingApproval ? "Transmission au tourniquet après validation dans le tableau de bord." : "La capture est terminée." },
     failed: { title: "Échec de la capture", hint: "Consultez le journal ci-dessous." },
     cancelled: { title: "Capture annulée", hint: "Vous pouvez relancer une capture." },
   };
@@ -548,6 +552,7 @@ export default function EnrollPage() {
       errorMsg={lastEnrollErrorRef.current || undefined}
       timedOut={timedOut}
       retryAvailable={retryAvailable}
+      pendingApproval={pendingApproval}
       onCancel={handleCancel}
       onDismiss={handleOverlayDismiss}
       onRetryPush={handleRetryPush}
@@ -653,10 +658,10 @@ export default function EnrollPage() {
             className="flex-none"
             tone={result === "success" ? "success" : result === "cancelled" ? "warning" : "error"}
           >
-            {result === "success" ? "Enrôlement réussi !" : result === "cancelled" ? "Enrôlement annulé." : "Enrôlement échoué."}
+            {result === "success" ? pendingApproval ? "Empreinte enregistrée pour validation dans le tableau de bord." : "Enrôlement réussi !" : result === "cancelled" ? "Enrôlement annulé." : "Enrôlement échoué."}
           </Note>
         )}
-        {result === "success" && <EnrollTurnstileStatus className="flex-none" />}
+        {result === "success" && !pendingApproval && <EnrollTurnstileStatus className="flex-none" />}
 
         {/* Journal — the same `logs` the SSE stream fills (raw lines, not translated). */}
         <Panel className="flex min-h-[180px] flex-1 flex-col">

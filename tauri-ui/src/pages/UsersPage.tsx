@@ -4,7 +4,7 @@ import { useUsers } from "@/api/hooks";
 import { useApp } from "@/context/AppContext";
 import RenewDialog from "@/components/RenewDialog";
 import PayRestDialog from "@/components/PayRestDialog";
-import { StaffActionButton, staffPermissionHint } from "@/components/StaffChip";
+import { StaffActionButton, staffPermissionHint, staffError } from "@/components/StaffChip";
 import { get, openSSE, patch, post } from "@/api/client";
 import type {
   MemberCardResponse,
@@ -87,6 +87,9 @@ type MemberRosterRow = {
   validTo?: string;
   status?: "active" | "expired" | "pending" | string;
   offlinePending?: boolean;
+  offlineApproval?: boolean;
+  approvalPending?: boolean;
+  approvalCreated?: boolean;
   offlinePendingLocalId?: string;
   firstCardId?: string;
   secondCardId?: string;
@@ -346,6 +349,8 @@ function heldFlag(m: MemberRosterRow): { label: string; tone: Tone } | null {
 
 /** The one flag shown next to a member's name (same priority as before; a held row second). */
 function rowFlag(m: MemberRosterRow): { label: string; tone: Tone } | null {
+  if (m.approvalCreated) return { label: "Créé hors ligne · vente en attente", tone: "warning" };
+  if (m.approvalPending) return { label: "En attente de validation", tone: "warning" };
   if (m.hasConflict) return { label: "conflit", tone: "error" };
   const held = heldFlag(m);
   if (held) return held;
@@ -474,11 +479,12 @@ function DialogMessages({ error, message }: { error: string | null; message?: st
   );
 }
 
-function EnrollDialog({ member, onClose }: { member: MemberRosterRow | null; onClose: () => void }) {
+function EnrollDialog({ member, onClose, offline }: { member: MemberRosterRow | null; onClose: () => void; offline?: boolean }) {
   const [fingerId, setFingerId] = useState("0");
   const [running, setRunning] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [result, setResult] = useState<string | null>(null);
+  const [pendingApproval, setPendingApproval] = useState(false);
   const esRef = useRef<EventSource | null>(null);
 
   const closeStream = useCallback(() => {
@@ -493,6 +499,7 @@ function EnrollDialog({ member, onClose }: { member: MemberRosterRow | null; onC
     setRunning(false);
     setLogs([]);
     setResult(null);
+    setPendingApproval(false);
     closeStream();
   }, [member?.userId, closeStream]);
 
@@ -500,11 +507,16 @@ function EnrollDialog({ member, onClose }: { member: MemberRosterRow | null; onC
     if (!member) return;
     setLogs([]);
     setResult(null);
+    setPendingApproval(false);
     setRunning(true);
     closeStream();
     try {
       const es = openSSE("/enroll/events", (type, data) => {
-        if (type === "log") setLogs((l) => [...l, String(data?.line ?? "")]);
+        if (type === "log") {
+          const line = String(data?.line ?? "");
+          setLogs((l) => [...l, line]);
+          if (line === "Empreinte enregistrée pour validation dans le tableau de bord.") setPendingApproval(true);
+        }
         else if (type === "step") setLogs((l) => [...l, String(data?.step ?? "")]);
         else if (type === "success" || type === "failed" || type === "cancelled") {
           setResult(type);
@@ -515,6 +527,7 @@ function EnrollDialog({ member, onClose }: { member: MemberRosterRow | null; onC
       esRef.current = es;
       await post("/enroll/start", {
         userId: String(member.userId ?? ""),
+        activeMembershipId: String(member.activeMembershipId ?? ""),
         fingerId,
         type: "BACKEND",
         fullName: member.fullName || "",
@@ -540,7 +553,7 @@ function EnrollDialog({ member, onClose }: { member: MemberRosterRow | null; onC
       lockOutside
       width={520}
       title={`Enrôler une empreinte — ${member?.fullName || ""}`}
-      sub={member?.offlinePending
+      sub={offline ? "L'empreinte sera enregistrée pour validation dans le tableau de bord, puis transmise au tourniquet après validation." : member?.offlinePending
         ? "Membre créé hors ligne : l'empreinte est capturée maintenant et envoyée automatiquement quand il sera synchronisé avec le serveur."
         : "Posez le doigt sur le lecteur après « Démarrer » (3 captures)."}
       footer={<ActionButton kind="dark" className="px-4" onClick={() => { closeStream(); onClose(); }}>Fermer</ActionButton>}
@@ -564,7 +577,7 @@ function EnrollDialog({ member, onClose }: { member: MemberRosterRow | null; onC
       {result ? (
         <p className={cn("mt-3 text-[13.5px] font-semibold", INK[resultTone])}>
           {result === "success"
-            ? (member?.offlinePending ? "Empreinte capturée : elle sera synchronisée avec le membre." : "Empreinte enregistrée pour le membre.")
+            ? (pendingApproval ? "Empreinte enregistrée pour validation." : member?.offlinePending ? "Empreinte capturée : elle sera synchronisée avec le membre." : "Empreinte enregistrée pour le membre.")
             : result === "cancelled" ? "Annulé." : "Échec de l'enrôlement."}
         </p>
       ) : null}
@@ -699,7 +712,8 @@ export default function UsersPage() {
         money: opts?.money,
         expectedVersion: m.version ?? undefined,
       }, 30000);
-      if (res.ok) setMessage(`Changement appliqué en ligne : ${opLabel(opKind)}.`);
+      if (res.pendingApproval) setMessage(`En attente de validation : ${opLabel(opKind)}.`);
+      else if (res.ok) setMessage(`Changement appliqué en ligne : ${opLabel(opKind)}.`);
       else if (res.conflict) setQueueError("Cet abonnement a changé sur le serveur entre-temps : rien n'a été envoyé. Rechargez puis recommencez la modification.");
       else if (res.queued) setMessage(res.gated ? `Changement mis en file : ${opLabel(opKind)}. Il s'appliquera quand le serveur acceptera les opérations d'argent.` : `Changement mis en file (hors ligne) : ${opLabel(opKind)}. Il sera synchronisé automatiquement.`);
       else if (res.needsFix) setQueueError(res.error || `Changement refusé : ${opLabel(opKind)}. Corrigez les valeurs et réessayez.`);
@@ -707,7 +721,7 @@ export default function UsersPage() {
       await Promise.all([loadRoster(), loadMutations()]);
       return res;
     } catch (e: any) {
-      setQueueError(e?.message || String(e));
+      setQueueError(staffError(e));
       return { ok: false, error: String(e) };
     } finally {
       setMutBusy(false);
@@ -739,15 +753,15 @@ export default function UsersPage() {
   const submitEdit = useCallback(async () => {
     const m = editTarget;
     if (!m) return;
-    const payload: Record<string, any> = { id: m.activeMembershipId, activeMembershipId: m.activeMembershipId };
-    if (n(editForm.startDate)) payload.startDate = n(editForm.startDate);
-    if (n(editForm.endDate)) payload.endDate = n(editForm.endDate);
+    const payload: Record<string, any> = { id: m.activeMembershipId };
+    if (n(editForm.startDate) && (!staff?.offline?.active || n(editForm.startDate) !== n(m.validFrom).slice(0, 10))) payload.startDate = n(editForm.startDate);
+    if (n(editForm.endDate) && (!staff?.offline?.active || n(editForm.endDate) !== n(m.validTo).slice(0, 10))) payload.endDate = n(editForm.endDate);
     payload.cardId = n(editForm.cardId);          // partial update; prefilled = no-op
     payload.secondCardId = n(editForm.secondCardId);
     if (n(editForm.note)) payload.note = n(editForm.note);
     const res = await submitMutation("edit", m, payload);
     if (res.ok || res.queued) setEditTarget(null);
-  }, [editTarget, editForm, submitMutation]);
+  }, [editTarget, editForm, submitMutation, staff?.offline?.active]);
 
   const submitFreeze = useCallback(async () => {
     const m = freezeTarget;
@@ -956,9 +970,15 @@ export default function UsersPage() {
   };
 
   const handleAttempt = useCallback(async (creationKind: OfflineCreationKind, payload: Record<string, any>) => {
-    const attempt = await post<OfflineAttemptResponse>("/offline-creations/attempt", { creationKind, payload });
+    let attempt: OfflineAttemptResponse;
+    try {
+      attempt = await post<OfflineAttemptResponse>("/offline-creations/attempt", { creationKind, payload });
+    } catch (e) {
+      setQueueError(staffError(e));
+      return;
+    }
     if (attempt.ok) {
-      setMessage(attempt.state === "reconciled" ? "Déjà présent sur le serveur : création rapprochée." : "Créé sur le serveur.");
+      setMessage(attempt.pendingApproval ? "Créé hors ligne · vente en attente. Le membre aura accès après validation dans le tableau de bord." : attempt.state === "reconciled" ? "Déjà présent sur le serveur : création rapprochée." : "Créé sur le serveur.");
       setEditing(null);
       setMemberOpen(false);
       setDecision(null);
@@ -1147,7 +1167,7 @@ export default function UsersPage() {
   // (offlinePending / hasConflict / pendingDelete / pendingMutations).
   const railFacts = useMemo(() => {
     const conflicts = roster.filter((m) => m.hasConflict);
-    const offlineNew = roster.filter((m) => m.offlinePending);
+    const offlineNew = roster.filter((m) => m.offlinePending && !m.offlineApproval);
     const deleting = roster.filter((m) => m.pendingDelete);
     const syncing = roster.filter((m) => !m.hasConflict && !m.pendingDelete && (m.pendingMutations?.length ?? 0) > 0);
     return { conflicts, offlineNew, deleting, syncing };
@@ -1226,7 +1246,7 @@ export default function UsersPage() {
   }), [allCount, loading, queueLoading, tab, rosterQ, rosterStatus, rosterPage, createHint]);
   const rosterTotalPages = Math.max(1, Math.ceil(rosterTotal / ROSTER_SIZE));
 
-  const canMutate = (m: MemberRosterRow) => !m.offlinePending && Number(m.activeMembershipId) > 0;
+  const canMutate = (m: MemberRosterRow) => (!m.offlinePending && Number(m.activeMembershipId) > 0) || (!!m.offlineApproval && !!staff?.offline?.active);
 
   // One line of the card fed by GET /members/{id}/card: loading, honest error, or the value.
   // An offline-created member has no server id yet, so nothing is read for it.
@@ -1240,7 +1260,7 @@ export default function UsersPage() {
     let cls = "text-muted-foreground";
     let title: string | undefined;
     if (m.offlinePending || !(Number(m.activeMembershipId) > 0)) {
-      v = "après synchronisation";
+      v = m.offlineApproval ? "après validation" : "après synchronisation";
     } else if (card.error) {
       v = "indisponible";
       cls = INK.error;
@@ -1274,7 +1294,7 @@ export default function UsersPage() {
     ].filter(Boolean).join(" ");
     let body: ReactNode;
     if (m.offlinePending || !(amid > 0)) {
-      body = <div className="mt-2 text-[12.5px] text-muted-foreground">Disponible après synchronisation.</div>;
+      body = <div className="mt-2 text-[12.5px] text-muted-foreground">{m.offlineApproval ? "Disponible après validation." : "Disponible après synchronisation."}</div>;
     } else if (visits.error) {
       body = <div className={cn("mt-2 text-[12.5px]", INK.error)} title={visits.error}>Historique indisponible.</div>;
     } else if (!d) {
@@ -1414,7 +1434,7 @@ export default function UsersPage() {
               <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_FREEZING" permissionLabel="Geler" kind="outline" size="md" icon={Snowflake} disabled={mutBusy} onClick={() => openDialogFor(() => setFreezeTarget(m))}>Geler</StaffActionButton>
             </>
           ) : null}
-          <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_UPDATE" permissionLabel="Modifier les membres" kind="outline" size="md" icon={ImagePlus} disabled={photoBusy} onClick={() => pickPhoto(m)}>Photo</StaffActionButton>
+          <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_UPDATE" permissionLabel="Modifier les membres" kind="outline" size="md" icon={ImagePlus} disabled={photoBusy || !!staff?.offline?.active || !!m.offlineApproval} onClick={() => pickPhoto(m)}>Photo</StaffActionButton>
           <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_FINGERPRINTS" permissionLabel="Enrôler" kind="outline" size="md" icon={Fingerprint} onClick={() => setEnrollMember(m)}>Empreinte</StaffActionButton>
           {canMutate(m) ? (
             <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_DELETION" permissionLabel="Supprimer" kind="danger" size="md" icon={Trash2} disabled={mutBusy} onClick={() => openDialogFor(() => setDeleteTarget(m))}>Supprimer</StaffActionButton>
@@ -1785,7 +1805,7 @@ export default function UsersPage() {
 
   return (
     <div className="flex flex-col gap-[18px]">
-      {staff?.enabled && !staff.agent && <Note tone="grey" className="mb-3 flex flex-wrap items-center gap-2.5"><span className="flex-1">Connectez-vous au tableau de bord pour utiliser cette action. Les modifications de membres ont besoin d'un agent.</span><Chip tone="success">Porte, synchro et tourniquet OK</Chip></Note>}
+      {staff?.enabled && !staff.agent && !staff.offline?.active && <Note tone="grey" className="mb-3 flex flex-wrap items-center gap-2.5"><span className="flex-1">Connectez-vous au tableau de bord pour utiliser cette action. Les modifications de membres ont besoin d'un agent.</span><Chip tone="success">Porte, synchro et tourniquet OK</Chip></Note>}
       <LineTabs<UsersTab>
         className="-mt-1"
         value={tab}
@@ -1817,7 +1837,9 @@ export default function UsersPage() {
         lockOutside
         width={640}
         title={formKind === "account_plus_membership" ? "Nouveau membre" : "Nouvel abonnement"}
-        sub={formKind === "account_plus_membership"
+        sub={staff?.enabled && staff.offline?.active
+          ? "Création enregistrée pour validation dans le tableau de bord. Le membre aura accès après validation."
+          : formKind === "account_plus_membership"
           ? "Compte + premier abonnement · envoyé en ligne d'abord ; en cas d'échec, à corriger ou à garder pour plus tard"
           : "Pour un membre déjà présent dans la copie locale · envoyé en ligne d'abord ; en cas d'échec, à corriger ou à garder pour plus tard"}
         tabs={editingKind ? undefined : (
@@ -1838,11 +1860,11 @@ export default function UsersPage() {
             </ActionButton>
             {formKind === "account_plus_membership" ? (
               <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_CREATION" permissionLabel="Créer des membres" kind="primary" className="px-4" onClick={submitAccount}>
-                {editingKind ? "Enregistrer la création en attente" : "Créer le membre"}
+                {editingKind ? "Enregistrer la création en attente" : staff?.offline?.active ? "Enregistrer pour validation" : "Créer le membre"}
               </StaffActionButton>
             ) : (
               <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_CREATION" permissionLabel="Créer des membres" kind="primary" className="px-4" onClick={submitMembership}>
-                {editingKind ? "Enregistrer la création en attente" : "Créer l'abonnement"}
+                {editingKind ? "Enregistrer la création en attente" : staff?.offline?.active ? "Enregistrer pour validation" : "Créer l'abonnement"}
               </StaffActionButton>
             )}
           </>
@@ -2044,7 +2066,7 @@ export default function UsersPage() {
         {queueError ? <Note tone="error">{queueError}</Note> : null}
       </ConfirmDialog>
 
-      <EnrollDialog member={enrollMember} onClose={() => setEnrollMember(null)} />
+      <EnrollDialog member={enrollMember} offline={!!staff?.offline?.active} onClose={() => { setEnrollMember(null); void loadRoster(); }} />
       {renewTarget && <RenewDialog member={renewTarget} plans={memberships} staff={staff} gymDate={status?.session.gymDate} onClose={() => setRenewTarget(null)} onSuccess={() => { void loadRoster(); }} />}
       {payRestTarget && <PayRestDialog member={payRestTarget} staff={staff} onClose={() => setPayRestTarget(null)} onSuccess={() => { void loadRoster(); }} />}
       <input ref={photoInputRef} type="file" accept="image/*" className="hidden" onChange={onPhotoFile} />

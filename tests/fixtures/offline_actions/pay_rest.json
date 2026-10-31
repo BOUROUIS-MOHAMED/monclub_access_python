@@ -1,0 +1,7 @@
+{
+  "activeMembershipId": 10,
+  "amount": 20,
+  "paymentMethod": "CASH",
+  "termId": 1,
+  "note": "Offline payment"
+}

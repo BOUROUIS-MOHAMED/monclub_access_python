@@ -62,6 +62,7 @@ async function parse<T>(res: Response, method: string, path: string, t0: number)
   const elapsed = Date.now() - t0;
   let json: any;
   try { json = JSON.parse(txt); } catch { console.debug(`[API] ${method} ${path} ${res.status} ${elapsed}ms (non-JSON)`); throw new ApiError(txt || `HTTP ${res.status}`, res.status); }
+  if (!res.ok && json?.code === "LIMIT_REACHED") window.dispatchEvent(new CustomEvent("offline-limit", { detail: json }));
   if (!res.ok && json.ok === false) { console.debug(`[API] ${method} ${path} ${res.status} ${elapsed}ms ERR: ${json.error}`); throw new ApiError(json.error || `HTTP ${res.status}`, res.status, json); }
   if (!res.ok) { console.debug(`[API] ${method} ${path} ${res.status} ${elapsed}ms ERR`); throw new ApiError(json.error || txt, res.status, json); }
   console.debug(`[API] ${method} ${path} ${res.status} ${elapsed}ms OK`);
