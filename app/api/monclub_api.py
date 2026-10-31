@@ -133,6 +133,71 @@ class MonClubApi:
         self.logger = logger
         self._session = requests.Session()
 
+    def set_staff_cookie(self, agent_token: str | None) -> None:
+        """Replace the Access-scoped cookie, without leaving cookies from a previous gym."""
+        from urllib.parse import urlparse
+        for cookie in list(self._session.cookies):
+            if cookie.name == "currentAgentId":
+                self._session.cookies.clear(cookie.domain, cookie.path, cookie.name)
+        if agent_token:
+            host = urlparse(self.endpoints.login_url).hostname
+            if host:
+                self._session.cookies.set("currentAgentId", agent_token, domain=host, path="/",
+                                          secure=urlparse(self.endpoints.login_url).scheme == "https")
+
+    def get_staff_current(self, token: str) -> dict:
+        from app.core.app_const import STAFF_CURRENT_PATH
+        return self._lifecycle_request(method="POST", url=self._derive_api_base() + STAFF_CURRENT_PATH,
+                                       token=token, payload={}, timeout=10)
+
+    def post_staff_activity(self, token: str) -> None:
+        from app.core.app_const import STAFF_ACTIVITY_PATH
+        try:
+            self._lifecycle_request(method="POST", url=self._derive_api_base() + STAFF_ACTIVITY_PATH,
+                                    token=token, payload={}, timeout=10)
+        except Exception:
+            pass
+
+    def upload_force_opens(self, token: str, events: list[dict]) -> dict:
+        from app.core.app_const import STAFF_FORCE_OPEN_BULK_PATH
+        try:
+            response = self._session.post(
+                self._derive_api_base() + STAFF_FORCE_OPEN_BULK_PATH, json=events,
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}, timeout=25,
+            )
+        except Exception as exc:
+            raise MonClubApiError(f"force-open upload failed: {exc}") from exc
+        if not 200 <= response.status_code < 300:
+            raise MonClubApiHttpError("force-open upload refused", status_code=response.status_code,
+                                      body=response.text)
+        return response.json()
+
+    def renew_quote(self, token: str, payload: dict) -> dict:
+        from app.core.app_const import STAFF_RENEW_QUOTE_PATH
+        return self._lifecycle_request(method="POST", url=self._derive_api_base() + STAFF_RENEW_QUOTE_PATH,
+                                       token=token, payload=payload)
+
+    def renew(self, token: str, payload: dict, idempotency_key: str) -> dict:
+        from app.core.app_const import STAFF_RENEW_PATH
+        return self._lifecycle_request(method="POST", url=self._derive_api_base() + STAFF_RENEW_PATH,
+                                       token=token, payload=payload, idempotency_key=idempotency_key)
+
+    def pay_rest(self, token: str, payload: dict, idempotency_key: str) -> dict:
+        from app.core.app_const import STAFF_PAY_REST_PATH
+        return self._lifecycle_request(method="POST", url=self._derive_api_base() + STAFF_PAY_REST_PATH,
+                                       token=token, payload=payload, idempotency_key=idempotency_key)
+
+    def staff_payment_details(self, token: str, payload: dict) -> dict:
+        amid = int(payload["activeMembershipId"])
+        if amid <= 0:
+            raise ValueError("activeMembershipId must be positive")
+        base = self._derive_api_base()
+        membership = self._lifecycle_request(method="POST", token=token,
+            url=f"{base}/gym/activeMembership/getActiveMembershipById/{amid}")
+        terms = self._lifecycle_request(method="GET", token=token,
+            url=f"{base}/gym/activeMembership/{amid}/terms")
+        return {"membership": membership, "terms": terms}
+
     def _derive_api_base(self) -> str:
         """Extract scheme://host/api/v1 prefix from the login URL."""
         from urllib.parse import urlparse

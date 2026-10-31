@@ -2725,6 +2725,13 @@ def _rebuild_sync_users_without_legacy_fingerprint(conn: sqlite3.Connection) -> 
 # -----------------------------
 def init_db() -> None:
     with get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS staff_force_open_events (
+                local_id TEXT PRIMARY KEY, device_id INTEGER, door_id INTEGER,
+                occurred_at TEXT, agent_id INTEGER, created_at TEXT, synced_at TEXT,
+                attempts INTEGER DEFAULT 0, last_error TEXT
+            )
+        """)
         # -----------------------------
         # local fingerprints enroll cache (unchanged)
         # -----------------------------
@@ -11429,6 +11436,43 @@ def normalize_access_history_sync_state(v: Any) -> str:
     if s == ACCESS_HISTORY_SYNC_FAILED_RETRYABLE:
         return ACCESS_HISTORY_SYNC_FAILED_RETRYABLE
     return ACCESS_HISTORY_SYNC_PENDING
+
+
+def insert_force_open_event(*, device_id: int, door_id: int, agent_id: int | None = None,
+                            occurred_at: str | None = None) -> str:
+    local_id = str(uuid.uuid4())
+    occurred_at = occurred_at or datetime.now().isoformat(timespec="microseconds")
+    def write(conn, _profile):
+        conn.execute("INSERT INTO staff_force_open_events "
+                     "(local_id, device_id, door_id, occurred_at, agent_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                     (local_id, device_id, door_id, occurred_at, agent_id, now_iso()))
+    _run_db_write_sync("staff_force_open_insert", write, durable=True)
+    return local_id
+
+
+def list_pending_force_open_events(limit: int = 200) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM staff_force_open_events WHERE synced_at IS NULL "
+                            "ORDER BY created_at, local_id LIMIT ?", (max(1, min(500, limit)),)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def mark_force_open_events_synced(ids) -> None:
+    ids = list(ids)
+    if ids:
+        def write(conn, _profile):
+            conn.executemany("UPDATE staff_force_open_events SET synced_at = ?, attempts = attempts + 1, "
+                             "last_error = NULL WHERE local_id = ?", [(now_iso(), i) for i in ids])
+        _run_db_write_sync("staff_force_open_synced", write, durable=True)
+
+
+def mark_force_open_events_failed(ids, error: str) -> None:
+    ids = list(ids)
+    if ids:
+        def write(conn, _profile):
+            conn.executemany("UPDATE staff_force_open_events SET attempts = attempts + 1, last_error = ? "
+                             "WHERE local_id = ?", [(str(error)[:1000], i) for i in ids])
+        _run_db_write_sync("staff_force_open_failed", write)
 
 
 def access_history_exists(event_id: str) -> bool:

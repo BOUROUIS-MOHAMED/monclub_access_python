@@ -30,6 +30,14 @@ API_SYNC_ACCESS_HISTORY_URL: str = f"{_API_V1}/manager/gym/access/v1/users/bulk_
 API_LATEST_RELEASE_URL: str = f"{_API_V1}/manager/access/getLatestAccessSoftwareRelease"
 API_OPTIONAL_CONTENT_SYNC_URL: str = f"{_API_V1}/manager/gym/access/v1/content/sync"
 
+# Paths use the client's API base, including in local/test configurations.
+STAFF_CURRENT_PATH = "/manager/gym/access/v1/staff/current"
+STAFF_ACTIVITY_PATH = "/manager/gym/access/v1/staff/activity"
+STAFF_FORCE_OPEN_BULK_PATH = "/manager/gym/access/v1/force-open/bulk"
+STAFF_RENEW_QUOTE_PATH = "/gym/activeMembership/renew/quote"
+STAFF_RENEW_PATH = "/gym/activeMembership/renew"
+STAFF_PAY_REST_PATH = "/gym/activeMembership/payRest"
+
 # Per-installation identity. The gym JWT is used only for the manager endpoints;
 # the separately-minted PC JWT is used only for the heartbeat endpoint.
 API_ACCESS_PCS_URL: str = f"{_API_V1}/manager/gym/access/v1/pcs"
