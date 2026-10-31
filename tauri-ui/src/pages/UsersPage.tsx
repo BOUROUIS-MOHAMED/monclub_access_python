@@ -1,6 +1,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode } from "react";
 import { useUsers } from "@/api/hooks";
+import { useApp } from "@/context/AppContext";
+import RenewDialog from "@/components/RenewDialog";
+import PayRestDialog from "@/components/PayRestDialog";
+import { StaffActionButton, staffPermissionHint } from "@/components/StaffChip";
 import { get, openSSE, patch, post } from "@/api/client";
 import type {
   MemberCardResponse,
@@ -55,6 +59,7 @@ import {
   TriangleAlert,
   UserPlus,
   Users as UsersIcon,
+  Wallet,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -62,7 +67,7 @@ import { usePageChrome } from "@/context/PageChromeContext";
 import { aDenyCopy } from "@/pages/PopupWindow";
 import { cn } from "@/lib/utils";
 
-type MembershipChoice = { id: number | string; title?: string };
+type MembershipChoice = { id: number | string; title?: string; price?: number | string };
 
 type QueueDecision = {
   creationKind: OfflineCreationKind;
@@ -568,6 +573,14 @@ function EnrollDialog({ member, onClose }: { member: MemberRosterRow | null; onC
 }
 
 export default function UsersPage() {
+  const { status } = useApp();
+  const staff = status?.staff;
+  const createHint = staffPermissionHint(staff, "ACTIVE_MEMBERSHIP_CREATION", "Créer des membres");
+  const [renewTarget, setRenewTarget] = useState<MemberRosterRow | null>(null);
+  const [payRestTarget, setPayRestTarget] = useState<MemberRosterRow | null>(null);
+  useEffect(() => {
+    if (!staff?.enabled) { setRenewTarget(null); setPayRestTarget(null); }
+  }, [staff?.enabled]);
   const { data, loading, error, reload: reloadUsers } = useUsers();
   const users: UserDto[] = data?.users ?? [];
 
@@ -1195,7 +1208,7 @@ export default function UsersPage() {
             Envoyer maintenant
           </ActionButton>
         ) : (
-          <ActionButton kind="primary" icon={UserPlus} onClick={openNewMember}>Nouveau membre</ActionButton>
+          <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_CREATION" permissionLabel="Créer des membres" kind="primary" icon={UserPlus} onClick={openNewMember}>Nouveau membre</StaffActionButton>
         )}
       </>
     ),
@@ -1210,7 +1223,7 @@ export default function UsersPage() {
     // rosterQ / rosterStatus / rosterPage: « Recharger » calls loadRoster,
     // which is rebuilt when they change — re-publish so it never reloads a
     // previous page, filter or search.
-  }), [allCount, loading, queueLoading, tab, rosterQ, rosterStatus, rosterPage]);
+  }), [allCount, loading, queueLoading, tab, rosterQ, rosterStatus, rosterPage, createHint]);
   const rosterTotalPages = Math.max(1, Math.ceil(rosterTotal / ROSTER_SIZE));
 
   const canMutate = (m: MemberRosterRow) => !m.offlinePending && Number(m.activeMembershipId) > 0;
@@ -1393,14 +1406,18 @@ export default function UsersPage() {
         <div className="flex flex-wrap gap-2 px-[18px] pb-4 pt-3">
           {canMutate(m) ? (
             <>
-              <ActionButton kind="dark" size="md" icon={Pencil} disabled={mutBusy} onClick={() => openDialogFor(() => openEdit(m))}>Modifier</ActionButton>
-              <ActionButton kind="outline" size="md" icon={Snowflake} disabled={mutBusy} onClick={() => openDialogFor(() => setFreezeTarget(m))}>Geler</ActionButton>
+              <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_UPDATE" permissionLabel="Modifier les membres" kind="dark" size="md" icon={Pencil} disabled={mutBusy} onClick={() => openDialogFor(() => openEdit(m))}>Modifier</StaffActionButton>
+              {staff?.enabled && <>
+                <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_RENEWAL" permissionLabel="Renouveler" kind="outline" size="md" icon={RefreshCw} disabled={mutBusy} onClick={() => setRenewTarget(m)}>Renouveler</StaffActionButton>
+                <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_PAY_REMAINING" permissionLabel="Payer le reste" kind="outline" size="md" icon={Wallet} disabled={mutBusy} onClick={() => setPayRestTarget(m)}>Payer le reste</StaffActionButton>
+              </>}
+              <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_FREEZING" permissionLabel="Geler" kind="outline" size="md" icon={Snowflake} disabled={mutBusy} onClick={() => openDialogFor(() => setFreezeTarget(m))}>Geler</StaffActionButton>
             </>
           ) : null}
-          <ActionButton kind="outline" size="md" icon={ImagePlus} disabled={photoBusy} onClick={() => pickPhoto(m)}>Photo</ActionButton>
-          <ActionButton kind="outline" size="md" icon={Fingerprint} onClick={() => setEnrollMember(m)}>Empreinte</ActionButton>
+          <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_UPDATE" permissionLabel="Modifier les membres" kind="outline" size="md" icon={ImagePlus} disabled={photoBusy} onClick={() => pickPhoto(m)}>Photo</StaffActionButton>
+          <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_FINGERPRINTS" permissionLabel="Enrôler" kind="outline" size="md" icon={Fingerprint} onClick={() => setEnrollMember(m)}>Empreinte</StaffActionButton>
           {canMutate(m) ? (
-            <ActionButton kind="danger" size="md" icon={Trash2} disabled={mutBusy} onClick={() => openDialogFor(() => setDeleteTarget(m))}>Supprimer</ActionButton>
+            <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_DELETION" permissionLabel="Supprimer" kind="danger" size="md" icon={Trash2} disabled={mutBusy} onClick={() => openDialogFor(() => setDeleteTarget(m))}>Supprimer</StaffActionButton>
           ) : null}
         </div>
       </Panel>
@@ -1499,13 +1516,13 @@ export default function UsersPage() {
                   <ActionButton kind="outline" size="xs" iconOnly icon={Eye} title="Voir la fiche" onClick={() => setSelectedKey(key)}>Voir la fiche</ActionButton>
                   {canMutate(m) ? (
                     <>
-                      <ActionButton kind="outline" size="xs" iconOnly icon={Pencil} title="Modifier l'abonnement" disabled={mutBusy} onClick={() => openDialogFor(() => openEdit(m))}>Modifier l'abonnement</ActionButton>
-                      <ActionButton kind="outline" size="xs" iconOnly icon={Snowflake} title="Geler l'abonnement" disabled={mutBusy} onClick={() => openDialogFor(() => setFreezeTarget(m))}>Geler l'abonnement</ActionButton>
+                      <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_UPDATE" permissionLabel="Modifier les membres" kind="outline" size="xs" iconOnly icon={Pencil} title="Modifier l'abonnement" disabled={mutBusy} onClick={() => openDialogFor(() => openEdit(m))}>Modifier l'abonnement</StaffActionButton>
+                      <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_FREEZING" permissionLabel="Geler" kind="outline" size="xs" iconOnly icon={Snowflake} title="Geler l'abonnement" disabled={mutBusy} onClick={() => openDialogFor(() => setFreezeTarget(m))}>Geler l'abonnement</StaffActionButton>
                     </>
                   ) : null}
-                  <ActionButton kind="outline" size="xs" iconOnly icon={Fingerprint} title="Enrôler une empreinte" onClick={() => setEnrollMember(m)}>Enrôler une empreinte</ActionButton>
+                  <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_FINGERPRINTS" permissionLabel="Enrôler" kind="outline" size="xs" iconOnly icon={Fingerprint} title="Enrôler une empreinte" onClick={() => setEnrollMember(m)}>Enrôler une empreinte</StaffActionButton>
                   {canMutate(m) ? (
-                    <ActionButton kind="danger" size="xs" iconOnly icon={Trash2} title="Supprimer l'abonnement" disabled={mutBusy} onClick={() => openDialogFor(() => setDeleteTarget(m))}>Supprimer l'abonnement</ActionButton>
+                    <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_DELETION" permissionLabel="Supprimer" kind="danger" size="xs" iconOnly icon={Trash2} title="Supprimer l'abonnement" disabled={mutBusy} onClick={() => openDialogFor(() => setDeleteTarget(m))}>Supprimer l'abonnement</StaffActionButton>
                   ) : null}
                 </FlexCell>
               </FlexRow>
@@ -1768,6 +1785,7 @@ export default function UsersPage() {
 
   return (
     <div className="flex flex-col gap-[18px]">
+      {staff?.enabled && !staff.agent && <Note tone="grey" className="mb-3 flex flex-wrap items-center gap-2.5"><span className="flex-1">Connectez-vous au tableau de bord pour utiliser cette action. Les modifications de membres ont besoin d'un agent.</span><Chip tone="success">Porte, synchro et tourniquet OK</Chip></Note>}
       <LineTabs<UsersTab>
         className="-mt-1"
         value={tab}
@@ -1819,13 +1837,13 @@ export default function UsersPage() {
               {editingKind ? "Annuler la modification" : "Fermer"}
             </ActionButton>
             {formKind === "account_plus_membership" ? (
-              <ActionButton kind="primary" className="px-4" onClick={submitAccount}>
+              <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_CREATION" permissionLabel="Créer des membres" kind="primary" className="px-4" onClick={submitAccount}>
                 {editingKind ? "Enregistrer la création en attente" : "Créer le membre"}
-              </ActionButton>
+              </StaffActionButton>
             ) : (
-              <ActionButton kind="primary" className="px-4" onClick={submitMembership}>
+              <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_CREATION" permissionLabel="Créer des membres" kind="primary" className="px-4" onClick={submitMembership}>
                 {editingKind ? "Enregistrer la création en attente" : "Créer l'abonnement"}
-              </ActionButton>
+              </StaffActionButton>
             )}
           </>
         )}
@@ -1972,7 +1990,7 @@ export default function UsersPage() {
         footer={(
           <>
             <ActionButton kind="outline" className="px-4" onClick={() => setEditTarget(null)}>Annuler</ActionButton>
-            <ActionButton kind="primary" className="px-4" onClick={submitEdit} disabled={mutBusy}>Enregistrer</ActionButton>
+            <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_UPDATE" permissionLabel="Modifier les membres" kind="primary" className="px-4" onClick={submitEdit} disabled={mutBusy}>Enregistrer</StaffActionButton>
           </>
         )}
       >
@@ -1999,7 +2017,7 @@ export default function UsersPage() {
         footer={(
           <>
             <ActionButton kind="outline" className="px-4" onClick={() => setFreezeTarget(null)}>Annuler</ActionButton>
-            <ActionButton kind="primary" className="px-4" icon={Snowflake} onClick={submitFreeze} disabled={mutBusy}>Geler</ActionButton>
+            <StaffActionButton staff={staff} permission="ACTIVE_MEMBERSHIP_FREEZING" permissionLabel="Geler" kind="primary" className="px-4" icon={Snowflake} onClick={submitFreeze} disabled={mutBusy}>Geler</StaffActionButton>
           </>
         )}
       >
@@ -2020,13 +2038,15 @@ export default function UsersPage() {
         description="Retire l'abonnement et la carte du membre des tourniquets. Appliqué en ligne si possible, sinon mis en file et synchronisé automatiquement."
         confirmLabel="Supprimer"
         confirmKind="danger"
-        confirmDisabled={mutBusy}
+        confirmDisabled={mutBusy || !!staffPermissionHint(staff, "ACTIVE_MEMBERSHIP_DELETION", "Supprimer")}
         onConfirm={() => { void confirmDelete(); }}
       >
         {queueError ? <Note tone="error">{queueError}</Note> : null}
       </ConfirmDialog>
 
       <EnrollDialog member={enrollMember} onClose={() => setEnrollMember(null)} />
+      {renewTarget && <RenewDialog member={renewTarget} plans={memberships} staff={staff} gymDate={status?.session.gymDate} onClose={() => setRenewTarget(null)} onSuccess={() => { void loadRoster(); }} />}
+      {payRestTarget && <PayRestDialog member={payRestTarget} staff={staff} onClose={() => setPayRestTarget(null)} onSuccess={() => { void loadRoster(); }} />}
       <input ref={photoInputRef} type="file" accept="image/*" className="hidden" onChange={onPhotoFile} />
     </div>
   );

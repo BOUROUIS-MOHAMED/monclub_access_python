@@ -14,7 +14,7 @@
 // the Agent nav item (only when AGENT devices exist), the logout and tray-quit
 // dialogs, and the PC identity banner under the header.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Outlet, NavLink, useLocation, useNavigate } from "react-router-dom";
 import { get } from "@/api/client";
 import { useApp } from "@/context/AppContext";
@@ -23,6 +23,8 @@ import { usePageChromeValue } from "@/context/PageChromeContext";
 import { ThemeToggle } from "@/components/theme-toggle";
 import PcIdentityBanner from "@/components/PcIdentityBanner";
 import AccessWhatsNewCard from "@/components/update/AccessWhatsNewCard";
+import StaffChip from "@/components/StaffChip";
+import Toast, { showStaffToast } from "@/components/Toast";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { SOFT, type Tone } from "@/components/ui/tone";
@@ -151,6 +153,15 @@ interface FooterPill {
 
 export default function MainLayout() {
   const { status, logout } = useApp();
+  const staffSeen = useRef<{ initialized: boolean; changedAt: string | null }>({ initialized: false, changedAt: null });
+  useEffect(() => {
+    const staff = status?.staff;
+    if (!staff) return;
+    if (staffSeen.current.initialized && staff.enabled && staff.agent && staff.changedAt && staff.changedAt !== staffSeen.current.changedAt) {
+      showStaffToast(`MonClub Access utilise maintenant ${staff.agent.name}`, "Les actions suivantes porteront son nom.");
+    }
+    staffSeen.current = { initialized: true, changedAt: staff.changedAt };
+  }, [status?.staff]);
   const { quitRequested, confirmQuit, cancelQuit } = useTrayIntegration(8788);
   const { subtitle, actions, fill } = usePageChromeValue();
   const location = useLocation();
@@ -453,6 +464,7 @@ export default function MainLayout() {
             ) : null}
           </div>
           {actions && <div className="flex shrink-0 items-center gap-2.5">{actions}</div>}
+          <StaffChip staff={status?.staff} />
           {showHealth && (
             <Tooltip delayDuration={0}>
               <TooltipTrigger asChild>
@@ -504,6 +516,7 @@ export default function MainLayout() {
       )}
 
       {/* Logout dialog */}
+      <Toast />
       <ConfirmDialog
         open={logoutConfirm}
         onOpenChange={setLogoutConfirm}
