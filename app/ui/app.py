@@ -688,6 +688,11 @@ class MainApp:
         # tick's work(), so none of them ever sees yesterday's roster after a power-on.
         self._init_date_flip_state()
         self._apply_date_flips("startup")
+        try:
+            from app.core.offline_overlay import expire_overlay
+            expire_overlay(self._date_flip_now())
+        except Exception:
+            self.logger.warning("Offline pass expiry at startup failed; retried by the minute tick", exc_info=True)
         # P3b-2: the driver/reader roles cached from the last assignment, installed before the
         # first sync tick can start any worker -- a reader stays a reader at a power-on without
         # internet. Local read only; no cache (v2 off, never fetched) keeps today's behaviour.
@@ -1881,6 +1886,11 @@ class MainApp:
         def run():
             now = self._date_flip_now()
             try:
+                from app.core.offline_overlay import expire_overlay
+                expire_overlay(now)
+            except Exception:
+                self.logger.warning("Offline pass expiry failed; retried next minute", exc_info=True)
+            try:
                 needed = self._date_flip_needed(_db.gym_date_status(pc_now_epoch=now))
             except Exception:
                 needed = False
@@ -1913,6 +1923,8 @@ class MainApp:
                     if outcome == "success" and (not state["offline"] or state["manual"]):
                         from app.core.offline_actions import upload_pending, reconcile_uploaded
                         upload_pending(self, auth.token)
+                        from app.core.offline_overlay import poll_decisions
+                        poll_decisions(self, auth.token)
                         reconcile_uploaded(self, auth.token)
             except Exception:
                 self.logger.debug("Staff poll failed", exc_info=True)

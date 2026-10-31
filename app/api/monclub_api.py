@@ -184,6 +184,18 @@ class MonClubApi:
         return self._lifecycle_request(method="POST", url=self._derive_api_base() + "/manager/gym/access-offline/list",
                                        token=token, payload={"page": page, "size": 200})
 
+    def offline_action_decisions(self, token: str, local_ids: list[str]) -> list[dict]:
+        if len(local_ids) > 200:
+            raise ValueError("At most 200 offline action ids")
+        response = self._session.post(self._derive_api_base() + "/manager/gym/access/v1/offline-actions/decisions",
+            json={"localIds": local_ids}, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}, timeout=25)
+        if not 200 <= response.status_code < 300:
+            raise MonClubApiHttpError("offline decisions refused", status_code=response.status_code)
+        data = response.json()
+        if not isinstance(data, list):
+            raise ValueError("Invalid offline decisions response")
+        return data
+
     def renew_quote(self, token: str, payload: dict) -> dict:
         from app.core.app_const import STAFF_RENEW_QUOTE_PATH
         return self._lifecycle_request(method="POST", url=self._derive_api_base() + STAFF_RENEW_QUOTE_PATH,

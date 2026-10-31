@@ -1048,6 +1048,14 @@ class DeviceAttendanceMaintenanceEngine:
             if uid_fallback > 0:
                 item["userId"] = uid_fallback
 
+        if getattr(row, "offline_local_id", None):
+            # A raw temporary pin must never become a backend person identifier.
+            for key in ("userId", "mainAccountId", "activeMembership", "activeMembershipId"):
+                item[key] = None
+            identity = raw.get("offlineIdentity") or {}
+            if identity:
+                item.update(identity)
+                item["activeMembership"] = identity.get("activeMembershipId")
         return item
 
     @staticmethod
@@ -1197,6 +1205,10 @@ class DeviceAttendanceMaintenanceEngine:
         if not sync_online:
             return {"uploaded": 0, "failed": 0}
 
+        from app.core.offline_overlay import snapshot
+        if snapshot().rows:
+            from app.core.db import prepare_offline_access_history
+            prepare_offline_access_history()
         rows = list_pending_access_history_for_sync(limit=UPLOAD_BATCH_SIZE)
         if not rows:
             return {"uploaded": 0, "failed": 0}

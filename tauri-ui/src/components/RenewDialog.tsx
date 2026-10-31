@@ -74,7 +74,7 @@ function OfflineRenewDialog({ member, plans, staff, onClose, onSuccess }: RenewD
         onClick={() => { setPlanId(String(plan.id)); setPrice(String(plan.price ?? "")); setPaid(String(plan.price ?? "")); }}><div className="font-bold">{plan.title || `Abonnement ${plan.id}`}</div><div className="mt-1 text-muted-foreground">{plan.price == null ? "Prix à renseigner" : `${staffMoney(Number(plan.price))} DT`}</div></button>)}</div>
       {!plans.length && <Note tone="warning">Aucun abonnement disponible dans la copie locale.</Note>}
       <FieldGrid><FormField label="Prix (DT)"><FieldInput type="number" min="0" step="0.001" value={price} onChange={(e) => setPrice(e.target.value)} /></FormField><FormField label="Payé maintenant (DT)"><FieldInput type="number" min="0" step="0.001" max={price} value={paid} onChange={(e) => setPaid(e.target.value)} /></FormField><StaffPaymentFields value={payment} onChange={setPayment} disabled={busy} /></FieldGrid>
-      <Note tone="warning">Hors ligne : les dates seront calculées à la validation dans le tableau de bord.</Note>
+      <Note tone="warning">Hors ligne : les dates seront calculées à la validation dans le tableau de bord.<br />Le membre aura accès après validation.</Note>
       <p className="text-[13px] text-muted-foreground">Ces questions seront posées à la personne qui valide : la dette, et l'accès entre deux périodes.</p>
       {(hint || error) && <Note tone="error">{hint || error}</Note>}
     </fieldset>

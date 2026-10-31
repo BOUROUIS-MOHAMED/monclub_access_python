@@ -35,8 +35,11 @@ import { Chip } from "@/components/ui/chip";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { DialogFrame } from "@/components/ui/dialog-frame";
 import { ListRow, Note, Panel, PanelHeader, PanelList } from "@/components/ui/panel";
+import { useApp } from "@/context/AppContext";
+import OfflineFingerprintDisable from "@/components/OfflineFingerprintDisable";
 
 export default function EnrollPage() {
+  const { status } = useApp();
   const enroll = useEnroll();
   const { data: userData } = useUsers();
   const users: any[] = userData?.users ?? [];
@@ -491,7 +494,7 @@ export default function EnrollPage() {
     sample_rejected: { title: "Échantillon rejeté", hint: "Qualité insuffisante — reposez le doigt." },
     processing: { title: "Traitement…", hint: "Fusion des échantillons en une empreinte." },
     push: { title: "Sauvegarde…", hint: "Enregistrement de l'empreinte sur le serveur MonClub." },
-    success: { title: pendingApproval ? "Empreinte enregistrée pour validation" : "Empreinte enregistrée", hint: pendingApproval ? "Transmission au tourniquet après validation dans le tableau de bord." : "La capture est terminée." },
+    success: { title: pendingApproval ? "Empreinte enregistrée pour validation" : "Empreinte enregistrée", hint: pendingApproval ? "Déjà active sur le tourniquet en attendant la décision." : "La capture est terminée." },
     failed: { title: "Échec de la capture", hint: "Consultez le journal ci-dessous." },
     cancelled: { title: "Capture annulée", hint: "Vous pouvez relancer une capture." },
   };
@@ -806,6 +809,8 @@ export default function EnrollPage() {
                 tone={f?.enabled === false ? "grey" : "success"}
                 title={`Doigt ${f?.fingerId}`}
                 sub={[f?.label, f?.enabled === false ? "désactivée" : "", f?.templateSize ? `${f.templateSize} o` : ""].filter(Boolean).join(" · ") || undefined}
+                trailing={f?.enabled !== false ? <OfflineFingerprintDisable key={`${selectedUser.activeMembershipId}-${f?.id}`} staff={status?.staff}
+                  activeMembershipId={Number(selectedUser.activeMembershipId)} fingerprintId={f?.id} /> : undefined}
               />
             ))}
           </PanelList>

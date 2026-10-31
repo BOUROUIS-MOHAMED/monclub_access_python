@@ -132,4 +132,7 @@ class OfflineSession:
                 if "no such table" not in str(exc):
                     raise
         state["lastUpload"] = self.last_upload
+        if self._staff.snapshot()["enabled"]:
+            from app.core.offline_overlay import expiry_pending
+            state["expiryPending"] = expiry_pending()
         return state

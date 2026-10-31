@@ -2128,6 +2128,11 @@ class DeviceSyncEngine:
         """
         allowed_set = allowed_membership_ids(device)
 
+        from app.core.offline_overlay import snapshot as overlay_snapshot
+        overlay = overlay_snapshot()
+        if overlay.rows:
+            users = list(users or []) + overlay.temp_rows_for(device)
+
         door_ids = _norm_int_list(device.get("doorIds") or [])
         if not door_ids:
             door_ids = [int(default_door_id)]
@@ -2268,6 +2273,9 @@ class DeviceSyncEngine:
                               withheld=withheld)
                 except Exception:
                     pass
+
+        if overlay.rows:
+            overlay.patch_roster(out, users, device)
 
         if stats_out is not None:
             stats_out["pin_scheme"] = scheme
@@ -3476,6 +3484,8 @@ class DeviceSyncEngine:
             # stale pins: only delete pins that are known-from-server but no longer desired for this device
             tracked_server_pins = set(known_server_pins) | set(prev_state.keys()) | promoted_intents
             stale_pins = sorted([p for p in device_pins if p in tracked_server_pins and p not in desired_pins])
+            from app.core.offline_overlay import offline_owned_removals
+            stale_pins = offline_owned_removals(device, stale_pins)
             if roster_incomplete:
                 if stale_pins:
                     self.logger.warning(
@@ -3649,7 +3659,8 @@ class DeviceSyncEngine:
                     # nothing is removed, the per-pin state is kept (the prune below is
                     # skipped too) and the rest of the pass still runs.
                     from app.core.off_hours import held_pins_for_device, split_removals
-                    unplanned, planned = split_removals(stale_pins, held_pins_for_device(device))
+                    from app.core.offline_overlay import planned_pins_for_device
+                    unplanned, planned = split_removals(stale_pins, held_pins_for_device(device) | planned_pins_for_device(device))
                     _stale_verdict = _push_safety.check_bulk_removal(
                         count=len(unplanned), roster_count=len(desired_pins),
                         path="stale", device_id=did, protocol="ZK_PULLSDK",

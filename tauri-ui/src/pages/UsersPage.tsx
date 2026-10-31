@@ -4,6 +4,7 @@ import { useUsers } from "@/api/hooks";
 import { useApp } from "@/context/AppContext";
 import RenewDialog from "@/components/RenewDialog";
 import PayRestDialog from "@/components/PayRestDialog";
+import OfflineFingerprintDisable from "@/components/OfflineFingerprintDisable";
 import { StaffActionButton, staffPermissionHint, staffError } from "@/components/StaffChip";
 import { get, openSSE, patch, post } from "@/api/client";
 import type {
@@ -90,6 +91,7 @@ type MemberRosterRow = {
   offlineApproval?: boolean;
   approvalPending?: boolean;
   approvalCreated?: boolean;
+  offlinePassState?: "ACTIVE" | "AWAITING_REAL_PIN" | "DROPPED" | null;
   offlinePendingLocalId?: string;
   firstCardId?: string;
   secondCardId?: string;
@@ -349,7 +351,9 @@ function heldFlag(m: MemberRosterRow): { label: string; tone: Tone } | null {
 
 /** The one flag shown next to a member's name (same priority as before; a held row second). */
 function rowFlag(m: MemberRosterRow): { label: string; tone: Tone } | null {
-  if (m.approvalCreated) return { label: "Créé hors ligne · vente en attente", tone: "warning" };
+  if (m.approvalCreated) return { label: m.offlinePassState === "ACTIVE" ? "Accès jusqu'à ce soir 23:59 · vente en attente"
+    : m.offlinePassState === "AWAITING_REAL_PIN" ? "Vente validée · mise à jour du tourniquet"
+    : m.offlinePassState === "DROPPED" ? "Accès provisoire terminé · vente en attente" : "Créé hors ligne · vente en attente", tone: "warning" };
   if (m.approvalPending) return { label: "En attente de validation", tone: "warning" };
   if (m.hasConflict) return { label: "conflit", tone: "error" };
   const held = heldFlag(m);
@@ -553,7 +557,7 @@ function EnrollDialog({ member, onClose, offline }: { member: MemberRosterRow | 
       lockOutside
       width={520}
       title={`Enrôler une empreinte — ${member?.fullName || ""}`}
-      sub={offline ? "L'empreinte sera enregistrée pour validation dans le tableau de bord, puis transmise au tourniquet après validation." : member?.offlinePending
+      sub={offline ? "L'empreinte est active sur le tourniquet en attendant la décision dans le tableau de bord." : member?.offlinePending
         ? "Membre créé hors ligne : l'empreinte est capturée maintenant et envoyée automatiquement quand il sera synchronisé avec le serveur."
         : "Posez le doigt sur le lecteur après « Démarrer » (3 captures)."}
       footer={<ActionButton kind="dark" className="px-4" onClick={() => { closeStream(); onClose(); }}>Fermer</ActionButton>}
@@ -978,7 +982,7 @@ export default function UsersPage() {
       return;
     }
     if (attempt.ok) {
-      setMessage(attempt.pendingApproval ? "Créé hors ligne · vente en attente. Le membre aura accès après validation dans le tableau de bord." : attempt.state === "reconciled" ? "Déjà présent sur le serveur : création rapprochée." : "Créé sur le serveur.");
+      setMessage(attempt.pendingApproval ? "Accès jusqu'à ce soir 23:59 · vente en attente." : attempt.state === "reconciled" ? "Déjà présent sur le serveur : création rapprochée." : "Créé sur le serveur.");
       setEditing(null);
       setMemberOpen(false);
       setDecision(null);
@@ -1399,6 +1403,12 @@ export default function UsersPage() {
             const ids = d.fingerprints.map((f) => (f.fingerId != null ? `#${f.fingerId}${f.enabled ? "" : " (désactivée)"}` : "?"));
             return { v: `${d.fingerprintCount} · ${ids.join(", ")}`, title: "Copie locale du serveur" };
           })}
+          {staff?.offline?.active && Number(m.activeMembershipId) > 0 && card.data?.fingerprints.filter((f) => f.enabled && f.id).map((f) => (
+            <div key={`${m.activeMembershipId}-${f.id}`} className="mt-2 flex items-center justify-between gap-2 text-[12.5px]">
+              <span>Doigt #{f.fingerId}</span><OfflineFingerprintDisable staff={staff}
+                activeMembershipId={Number(m.activeMembershipId)} fingerprintId={f.id} />
+            </div>
+          ))}
           {cardDetailLine(Snowflake, "Gel", m, (d) => {
             const f = d.freeze;
             if (!f) {
@@ -1838,7 +1848,7 @@ export default function UsersPage() {
         width={640}
         title={formKind === "account_plus_membership" ? "Nouveau membre" : "Nouvel abonnement"}
         sub={staff?.enabled && staff.offline?.active
-          ? "Création enregistrée pour validation dans le tableau de bord. Le membre aura accès après validation."
+          ? "Accès au tourniquet tout de suite, jusqu'à ce soir 23:59. La vente attend la validation dans le tableau de bord."
           : formKind === "account_plus_membership"
           ? "Compte + premier abonnement · envoyé en ligne d'abord ; en cas d'échec, à corriger ou à garder pour plus tard"
           : "Pour un membre déjà présent dans la copie locale · envoyé en ligne d'abord ; en cas d'échec, à corriger ou à garder pour plus tard"}

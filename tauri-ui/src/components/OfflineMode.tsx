@@ -22,7 +22,7 @@ export function OfflineBanner({ staff }: { staff?: StaffBlock }) {
   const pendingError = off.pending.lastError === "UNKNOWN_AGENT" ? "La personne choisie n'est plus autorisée. Vérifiez dans le tableau de bord."
     : off.pending.lastError === "UNKNOWN_PC" ? "Ce poste doit être enregistré dans le tableau de bord."
     : off.pending.lastError;
-  if (!off.active) return pendingError ? <div role="status" className="border-b border-warning/24 bg-warning/16 px-6 py-3 text-[13px] text-warning-ink"><strong>{off.pending.count} modification(s) attendent leur envoi pour validation.</strong><div className="mt-1">{pendingError}</div></div> : null;
+  if (!off.active) return pendingError || off.expiryPending ? <div role="status" className="border-b border-warning/24 bg-warning/16 px-6 py-3 text-[13px] text-warning-ink">{pendingError && <><strong>{off.pending.count} modification(s) attendent leur envoi pour validation.</strong><div className="mt-1">{pendingError}</div></>}{off.expiryPending && <div>Expiration en attente · le tourniquet attend la confirmation de sa reprise par ce PC.</div>}</div> : null;
   const reader = off.role !== "DRIVER" && off.role !== "ALL_TURNSTILES";
   return <div className="flex flex-wrap items-center gap-3 border-b border-warning/24 bg-warning/16 px-6 py-3 text-[13px] text-warning-ink" role="status">
     <WifiOff className="h-5 w-5 shrink-0" />
@@ -31,6 +31,7 @@ export function OfflineBanner({ staff }: { staff?: StaffBlock }) {
       <div className="mt-0.5 text-[12.5px]">{reader ? "La recherche de membres reste disponible sur ce poste." : "La porte, les empreintes et les cartes continuent de fonctionner avec les données déjà sur le tourniquet."}</div>
       {off.pending.count > 0 && <div className="mt-1 text-[12px]">{off.pending.count} modification(s) à envoyer pour validation.</div>}
       {pendingError && <div className="mt-1 text-[12px] text-error-ink">{pendingError}</div>}
+      {off.expiryPending && <div className="mt-1 text-[12px] font-semibold">Expiration en attente · le tourniquet attend la confirmation de sa reprise par ce PC.</div>}
     </div>
     {!reader && <div className="flex flex-wrap items-center gap-2.5">
       {off.unlocked && <span>Porte {Math.max(0, off.limits.door.max - off.limits.door.used)}/{off.limits.door.max} · Argent {Math.max(0, off.limits.money.max - off.limits.money.used)}/{off.limits.money.max} restantes</span>}
@@ -125,8 +126,9 @@ export default function OfflineControls({ staff }: { staff?: StaffBlock }) {
         <Avatar initials={initialsOf(person.name)} tone={person.adminAgent ? "error" : "primary"} size={56} className="h-[46px] w-[46px] text-[16px]" /><span><span className="block text-[14px] font-bold">{person.name}</span><span className="text-[12px] text-muted-foreground">{person.adminAgent ? "Admin" : "Agent"}</span></span>
       </button>)}{!staff.allowedAgents.length && <Note tone="warning">Aucun membre du personnel autorisé dans la copie locale.</Note>}</div>}
       {modal === "rules" && <div className="space-y-4 pb-3 text-[13px]">
-        <Note tone="warning"><strong>En attente de validation</strong><div className="mt-2 grid grid-cols-2 gap-2">{["Nouveaux membres", "Renouvellements", "Paiements", "Gel", "Suppression", "Modification des dates", "Empreintes", "Cartes"].map((label) => <span key={label}>{label}</span>)}</div></Note>
-        <p>Un membre vendu hors ligne aura accès après validation dans le tableau de bord.</p>
+        <Note tone="success"><strong>Tout de suite sur le tourniquet</strong><div className="mt-2 grid grid-cols-2 gap-2">{["Empreintes", "Cartes", "Nouveaux membres"].map((label) => <span key={label}>{label}</span>)}</div></Note>
+        <Note tone="warning"><strong>En attente de validation</strong><div className="mt-2 grid grid-cols-2 gap-2">{["Ventes", "Renouvellements", "Paiements", "Gel", "Suppression", "Modification des dates"].map((label) => <span key={label}>{label}</span>)}</div></Note>
+        <p>Un membre vendu hors ligne a accès jusqu'à ce soir 23:59, puis après validation.</p>
         {(["door", "money"] as const).map((key) => { const lim = off.limits[key]; return <div key={key}><div className="mb-2 flex justify-between"><span>{key === "door" ? "Modifications de porte" : "Opérations d'argent"}</span><strong>{Math.max(0, lim.max - lim.used)} sur {lim.max} restantes</strong></div><progress aria-label={key === "door" ? "Porte restantes" : "Argent restantes"} className="h-2 w-full accent-warning" max={Math.max(1, lim.max)} value={Math.max(0, lim.max - lim.used)} /></div>; })}
         <Note tone="grey">La porte s'ouvre toujours, même à la limite.</Note>
       </div>}
