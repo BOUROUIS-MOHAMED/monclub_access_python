@@ -6,6 +6,16 @@ export const ACCESS_CHANGELOG: {
   items: { category: "new" | "perf" | "fix" | "acc" | "sec"; fr: string; en: string }[];
 }[] = [
   {
+    version: "1.5.0",
+    items: [
+      {
+        category: "acc",
+        fr: "Accès refusés : l’écran d’entrée montre qui est refusé par carte ou QR et pourquoi, avec la date. À activer par poste dans « Postes de réception ».",
+        en: "Refused entries: the entry screen shows who is refused by card or QR and why, with the date. Turn it on per PC in “Reception PCs”.",
+      },
+    ],
+  },
+  {
     version: "1.4.39",
     items: [
       {
