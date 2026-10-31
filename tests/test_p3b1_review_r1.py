@@ -165,9 +165,9 @@ def _world(db):
     """Evening of EVE (2026-09-19), trusted: 101 member, 202 ex-member (plan ends EVE),
     303 starter on GYM (upcoming-only account, credential stored disabled)."""
     _trusted_state()
-    _exec("INSERT INTO member_access_window VALUES (101, '2026-09-01', '2026-09-30', '[]', 0)")
-    _exec("INSERT INTO member_access_window VALUES (202, '2026-08-20', ?, '[]', 0)", (EVE,))
-    _exec("INSERT INTO sync_upcoming_users VALUES (303, ?, ?, '2026-10-19', '[]', 0, 5009)",
+    _exec("INSERT INTO member_access_window (active_membership_id, access_from, access_until, off_days_json, off_days_beyond_horizon) VALUES (101, '2026-09-01', '2026-09-30', '[]', 0)")
+    _exec("INSERT INTO member_access_window (active_membership_id, access_from, access_until, off_days_json, off_days_beyond_horizon) VALUES (202, '2026-08-20', ?, '[]', 0)", (EVE,))
+    _exec("INSERT INTO sync_upcoming_users (active_membership_id, payload_json, access_from, access_until, off_days_json, off_days_beyond_horizon, qr_account_id) VALUES (303, ?, ?, '2026-10-19', '[]', 0, 5009)",
           (json.dumps(_person(303, 5009)), GYM))
     db.upsert_delta_users([_person(101, 5001), _person(202, 5002)])
     rng = random.Random(99)
@@ -238,7 +238,7 @@ def test_a_door_whose_own_refresh_lags_uses_the_date_of_the_list_and_index_it_ch
     """No flip: 404 frozen today; the desk cancels the freeze; the next sync lists it and bumps.
     Door B refreshed first; door A's own refresh has not landed."""
     _trusted_state(server_today=GYM, applied=GYM)
-    _exec("INSERT INTO sync_upcoming_users VALUES (404, ?, '2026-09-01', '2026-09-30', ?, 0, 5004)",
+    _exec("INSERT INTO sync_upcoming_users (active_membership_id, payload_json, access_from, access_until, off_days_json, off_days_beyond_horizon, qr_account_id) VALUES (404, ?, '2026-09-01', '2026-09-30', ?, 0, 5004)",
           (json.dumps(_person(404, 5004)), json.dumps([GYM])))
     c_u = _cred(4, [404], random.Random(5))
     _store_cred("sync_gym_access_credentials", c_u, 1)
@@ -250,7 +250,7 @@ def test_a_door_whose_own_refresh_lags_uses_the_date_of_the_list_and_index_it_ch
     a._cached_state_gen = b._cached_state_gen = g0
     assert av.current_access_days().deliverable(404) is False
     _exec("DELETE FROM sync_upcoming_users WHERE active_membership_id = 404")
-    _exec("INSERT INTO member_access_window VALUES (404, '2026-09-01', '2026-09-30', '[]', 0)")
+    _exec("INSERT INTO member_access_window (active_membership_id, access_from, access_until, off_days_json, off_days_beyond_horizon) VALUES (404, '2026-09-01', '2026-09-30', '[]', 0)")
     db.upsert_delta_users([_person(404, 5004)])
     db.bump_local_state_generation()
     _run_refresh(b, db.get_local_state_generation())

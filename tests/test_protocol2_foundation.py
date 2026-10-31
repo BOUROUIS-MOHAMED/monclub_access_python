@@ -103,8 +103,8 @@ def test_the_state_reader_decodes_the_row(db):
 def test_the_access_days_snapshot_joins_today_and_upcoming_windows(db):
     _exec("INSERT INTO access_v2_state (id, trusted, applied_date, server_today, horizon_end, grace_days) "
           "VALUES (1, 1, '2026-09-20', '2026-09-19', '2026-09-26', 2)")
-    _exec("INSERT INTO member_access_window VALUES (1, '2026-09-01', '2026-09-19', '[]', 0)")
-    _exec("INSERT INTO sync_upcoming_users VALUES (3, '{}', '2026-09-20', '2026-10-19', "
+    _exec("INSERT INTO member_access_window (active_membership_id, access_from, access_until, off_days_json, off_days_beyond_horizon) VALUES (1, '2026-09-01', '2026-09-19', '[]', 0)")
+    _exec("INSERT INTO sync_upcoming_users (active_membership_id, payload_json, access_from, access_until, off_days_json, off_days_beyond_horizon, qr_account_id) VALUES (3, '{}', '2026-09-20', '2026-10-19', "
           "'[\"2026-09-22\"]', 1, 55)")
     s = db.load_access_days_snapshot()
     assert s.active and s.gym_date.isoformat() == "2026-09-20" and s.grace_days == 2
