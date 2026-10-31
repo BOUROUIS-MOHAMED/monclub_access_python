@@ -43,6 +43,9 @@ class NotificationRequest:
     device_name: str = ""
     allowed: bool = False
     reason: str = ""
+    reason_date: str = ""
+    refused_display: bool = False
+    refused_card_no: str = ""
     scan_mode: str = ""
     user_birthday: str = ""
     image_source: str = ""

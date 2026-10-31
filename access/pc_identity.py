@@ -275,6 +275,7 @@ class PcIdentityService:
         hostname_provider: Callable[[], str] = _default_hostname,
         mac_provider: Callable[[], str] = _default_mac,
         heartbeat_payload_provider: Callable[[], Mapping[str, Any]] = lambda: {},
+        heartbeat_response_handler: Callable[[Mapping[str, Any]], None] = lambda _r: None,
         clock: Callable[[], float] = time.time,
         logger: logging.Logger = _log,
     ) -> None:
@@ -285,6 +286,7 @@ class PcIdentityService:
         self._hostname_provider = hostname_provider
         self._mac_provider = mac_provider
         self._heartbeat_payload_provider = heartbeat_payload_provider
+        self._heartbeat_response_handler = heartbeat_response_handler
         self._clock = clock
         self._logger = logger
         self._lock = threading.RLock()
@@ -420,7 +422,11 @@ class PcIdentityService:
             if not token:
                 return False
             payload = dict(self._heartbeat_payload_provider())
-            self._api.send_heartbeat(pc_token=token, payload=payload)
+            response = self._api.send_heartbeat(pc_token=token, payload=payload)
+            try:
+                self._heartbeat_response_handler(response)
+            except Exception:
+                self._logger.warning("PC heartbeat response handler failed", exc_info=True)
             with self._lock:
                 self._last_heartbeat_at = self._clock()
                 self._last_error = None
@@ -792,6 +798,7 @@ def get_pc_identity_service(app: Any) -> PcIdentityService:
 
         from access.store import load_auth_token
         from app.core.app_const import MONCLUB_BASE_URL
+        from app.core import refused_info
 
         service = PcIdentityService(
             credential_store=PcCredentialStore(),
@@ -799,6 +806,7 @@ def get_pc_identity_service(app: Any) -> PcIdentityService:
             gym_token_provider=load_auth_token,
             app_version_provider=lambda: str(app._update_manager.get_current_version() or "0.0.0"),
             heartbeat_payload_provider=lambda: _heartbeat_payload_after_date_check(app),
+            heartbeat_response_handler=refused_info.on_heartbeat_response,
             logger=getattr(app, "logger", _log),
         )
         app._pc_identity_service = service

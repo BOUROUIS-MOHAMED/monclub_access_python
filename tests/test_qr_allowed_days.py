@@ -651,3 +651,63 @@ def test_the_popup_has_a_sentence_for_the_date_refusal():
     line = next(x for x in text.splitlines() if x.strip().startswith("DENY_NOT_ALLOWED_TODAY:"))
     assert "Abonnement non valable aujourd'hui" in line
     assert "action:" in line     # rule 5: a refusal always says what to do
+
+
+@pytest.mark.parametrize("reason,date,title,glyph", [
+    ("MEMBERSHIP_EXPIRED", "2026-10-15", "Votre abonnement a expiré le 15/10/2026", "eventBusy"),
+    ("MEMBERSHIP_EXPIRED", "", "Votre abonnement a expiré", "eventBusy"),
+    ("MEMBERSHIP_FROZEN", "2026-02-30", "Votre abonnement est gelé", "acUnit"),
+    ("MEMBERSHIP_NOT_STARTED", "bad", "Votre abonnement n'a pas encore commencé", "eventUpcoming"),
+    ("FEE_DUE_PASSED", "2026-10-01", "Un frais obligatoire est échu depuis le 01/10/2026", "receiptLong"),
+    ("DEBT_DUE_PASSED", "2026-10-01", "Votre échéance du 01/10/2026 est dépassée", "payments"),
+    ("DEVICE_DENIED", "", "Cet accès n'a pas pu être validé", "doNotDisturbOn"),
+    ("DENY_EXPIRED", "", "Ce code QR a expiré", "qrCode2"),
+])
+def test_refused_popup_copy_formats_real_dates(reason, date, title, glyph):
+    import json
+    import subprocess
+    root = pathlib.Path(__file__).resolve().parents[1]
+    script = r'''
+const fs = require('node:fs');
+const ts = require('./tauri-ui/node_modules/typescript');
+const source = fs.readFileSync('tauri-ui/src/pages/PopupWindow.tsx', 'utf8');
+const code = source.slice(source.indexOf('export interface DenyCopy'), source.indexOf('// ── The colour field'));
+const js = ts.transpileModule(code, {compilerOptions: {module: ts.ModuleKind.CommonJS}}).outputText;
+const copy = new Function('exports', js + ';return aDenyCopy;')({});
+process.stdout.write(JSON.stringify(copy(process.argv[1], process.argv[2])));
+'''
+    result = subprocess.run(["node", "-e", script, reason, date], cwd=root, capture_output=True,
+                            text=True, encoding="utf-8", check=True)
+    copy = json.loads(result.stdout)
+    assert copy["title"] == title
+    assert copy["glyph"] == glyph
+    assert "action" in copy
+
+
+def test_refusal_glyphs_match_approved_asset():
+    root = pathlib.Path(__file__).resolve().parents[1]
+    assert (root / "tauri-ui/src/pages/refusalGlyphs.ts").read_bytes() == (
+        root / ".plan/2026-10-31-access-refused-entry-glyphs.ts").read_bytes()
+
+
+def test_popup_filter_preserves_anonymous_collision_copy():
+    import subprocess
+    root = pathlib.Path(__file__).resolve().parents[1]
+    script = r'''
+const fs = require('node:fs');
+const ts = require('./tauri-ui/node_modules/typescript');
+const assert = require('node:assert/strict');
+const source = fs.readFileSync('tauri-ui/src/pages/PopupWindow.tsx', 'utf8');
+const code = source.slice(source.indexOf('function aDisplayable'), source.indexOf('function laneIdFor'));
+const js = ts.transpileModule(code, {}).outputText;
+const display = new Function(js + ';return aDisplayable;')();
+for (const reason of ['DENY_NO_CARD_MATCH', 'DENY_CARD_COLLISION']) {
+  assert.equal(display({allowed:false, refusedDisplay:true, reason, userFullName:''}), true);
+  assert.equal(display({allowed:false, refusedDisplay:false, reason, userFullName:''}), false);
+}
+assert.equal(display({allowed:false, refusedDisplay:true, reason:'DEVICE_DENIED', userFullName:''}), false);
+assert.equal(display({allowed:true, userFullName:'Member'}), true);
+assert.equal(display({allowed:true, userFullName:''}), false);
+'''
+    subprocess.run(["node", "-e", script], cwd=root, capture_output=True, text=True,
+                   encoding="utf-8", check=True)

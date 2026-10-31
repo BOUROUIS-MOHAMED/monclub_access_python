@@ -607,6 +607,7 @@ def _run_db_write_sync(
     *,
     durable: bool = False,
     priority: bool = False,
+    wait_until_done: bool = False,
 ) -> Any:
     """Run ``operation`` in one transaction on the DbWriter thread.
 
@@ -616,6 +617,9 @@ def _run_db_write_sync(
     normal job (never before the job already running). Only the writes a door or the
     AGENT poll loop waits on use it -- ``insert_access_history`` and
     ``save_agent_rtlog_state`` (guide §3.11).
+
+    ``wait_until_done=True`` lets background directory writes wait for the definitive
+    transaction outcome; the default keeps the existing bounded wait.
 
     ``durable=True`` commits with ``PRAGMA synchronous=FULL`` for this job only.
     Every connection here runs WAL with ``synchronous=NORMAL``: in that mode a
@@ -652,7 +656,7 @@ def _run_db_write_sync(
                       priority=bool(priority))
     lane = _DB_WRITE_LANE_DOOR if job.priority else _DB_WRITE_LANE_NORMAL
     work_q.put((lane, _next_db_write_seq(), job))
-    if not job.done.wait(timeout=_DB_WRITE_WAIT_TIMEOUT_SEC):
+    if not job.done.wait(timeout=None if wait_until_done else _DB_WRITE_WAIT_TIMEOUT_SEC):
         with job.state_lock:
             if not job.started:
                 job.abandoned = True  # the writer will skip it: nothing is written
@@ -2725,6 +2729,13 @@ def _rebuild_sync_users_without_legacy_fingerprint(conn: sqlite3.Connection) -> 
 # -----------------------------
 def init_db() -> None:
     with get_conn() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS refused_info_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1), enabled INTEGER NOT NULL DEFAULT 0,
+            directory_fetched_at TEXT)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS refused_directory (
+            user_id INTEGER PRIMARY KEY, account_id INTEGER, active_membership_id INTEGER,
+            full_name TEXT, image TEXT, card_ids_json TEXT, plan_title TEXT,
+            reason_code TEXT, reason_date TEXT)""")
         # -----------------------------
         # local fingerprints enroll cache (unchanged)
         # -----------------------------

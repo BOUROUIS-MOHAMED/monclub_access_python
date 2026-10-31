@@ -1365,6 +1365,9 @@ export interface PopupEvent {
   deviceName: string;
   allowed: boolean;
   reason: string;
+  reasonDate?: string;
+  refusedDisplay?: boolean;
+  refusedCardNo?: string;
   scanMode: string;
   popupDurationSec: number;
   popupEnabled?: boolean;

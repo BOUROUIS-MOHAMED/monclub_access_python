@@ -25,6 +25,7 @@ from typing import Any, Dict, Optional
 from app.core import card_decision as _cd
 from app.core import telemetry as _tel
 from app.core.repeat_guard import RepeatGuard
+from app.core import refused_info
 
 logger = logging.getLogger("zkapp")
 
@@ -252,10 +253,23 @@ class PcEntryMixin:
             )
             return
         self._note_pc_refusal(verdict, kind="card", door_id=door_id)
+        display = {}
+        fields = member_popup_fields(verdict.user)
+        popup_reason = verdict.reason
+        if refused_info.is_enabled() and refused_info.is_card_scan(card_no, raw_row):
+            display = {"refused_display": True}
+            if not verdict.user:
+                info = refused_info.resolve_card(card_no, users_by_card=users_by_card,
+                                                held_index=getattr(self, "_refused_held_index", None),
+                                                current_reason=verdict.reason)
+                if info is not None:
+                    popup_reason = info.reason
+                    fields.update(info.fields)
+                    display.update(reason_date=info.reason_date, refused_card_no=info.card_no)
         self._enqueue_notification(
-            event_id=event_id, allowed=False, reason=verdict.reason,
+            event_id=event_id, allowed=False, reason=popup_reason,
             scan_mode=_scan_mode_for_event(raw_row), door_id=door_id,
-            **member_popup_fields(verdict.user),
+            **fields, **display,
         )
         self._enqueue_history(
             event_id=event_id, allowed=False, reason=verdict.reason, event_type=event_type,

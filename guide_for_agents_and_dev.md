@@ -5360,6 +5360,43 @@ tests/test_profile_session_data.py]` The backend side is on branch
 
 ---
 
+### 3.16 Refused-entry info on the entry screen (2026-10-31)
+
+**Display only, off by default, per PC.** When the dashboard switch « Afficher les accès refusés » is on for
+this PC (`/access-pcs`, backend column `gym_access_pc.refused_info_enabled`), a refused **card** or **QR** scan
+appears on the entry screen with the member's name, photo, plan and a dated reason. Nothing here changes a door
+decision, a device push, the roster or the history row: history keeps its original `reason`. Fingerprint and
+face refusals are never marked (the device reports no identity for a template it no longer holds).
+`[CODE: app/core/refused_info.py; ultra_engine.py::_handle_deny and the TOTP-rescue deny branch;
+ultra_pc_entry.py PC card refusal]` `[TEST: tests/test_refused_info_store.py, tests/test_refused_info_resolve.py]`
+
+**The switch.** The heartbeat response carries `refusedInfoEnabled` (missing = off). `pc_identity.py` hands the
+response to `refused_info.on_heartbeat_response`; only a change is written to `refused_info_state` (one row).
+Turning it off clears `refused_directory` and drops the in-memory index. With the switch off, every touched
+branch takes the pre-existing code path unchanged. `[TEST: test_handle_deny_switch_off_is_unchanged]`
+
+**The directory.** `GET /manager/gym/access/v1/users/refused_directory` (gym token) lists this gym's members whose
+membership is current or ended within 365 days, with `cardIds`, `accountId`, `planTitle`, `reasonCode`,
+`reasonDate` (no phone, email or amounts). It is fetched only while the switch is on: after the first successful
+roster sync (`app.py` calls `refused_info.roster_sync_finished`), every 24 h, and at once when the switch turns
+on. A refresh replaces the table in one DbWriter transaction and swaps a new in-memory index
+(`by_card`, `by_account`; a card shared by two users maps to None = collision). A failed refresh keeps the old
+table and index. The directory is a separate table: no roster, push or `sync_users*` code reads it.
+
+**Resolution (refused path only, dict lookups only).** roster (`users_by_card` / account) → held set
+(`_refused_held_index`, rebuilt by the ULTRA background tick when the local-state generation moves;
+`held_reason` expired / not_started / frozen / off_hours → MEMBERSHIP_EXPIRED / MEMBERSHIP_NOT_STARTED /
+MEMBERSHIP_FROZEN / OFF_HOURS or ENTRY_LIMIT) → directory → `DENY_NO_CARD_MATCH` with the card number. A
+collision gives `DENY_CARD_COLLISION` with no name. QR verification failures keep their copy and show the name
+when the credential's account is known (owner decision). `_process_event` and `_handle_allow` are untouched.
+`[TEST: test_allow_path_never_calls_resolver]`
+
+**On screen.** `NotificationRequest` gains `reason_date`, `refused_display`, `refused_card_no` (payload
+`reasonDate`, `refusedDisplay`, `refusedCardNo`). `PopupWindow.tsx` shows a refused event only when
+`refusedDisplay` is true; copy, glyphs (`refusalGlyphs.ts`, inline SVG for offline TVs) and layout follow the
+approved design `Ecran d'entree - Refus.dc.html`. `[UNVERIFIED: the turnstile sending a removed member's card
+digits in the DENY event is the owner's recollection, not re-tested on hardware for this change]`
+
 ## 4. Protocol resolution — how a device gets its driver
 
 Single construction point: **`device_driver.py::get_driver(device_payload)`**. Engines
