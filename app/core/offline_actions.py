@@ -1,4 +1,4 @@
-"""Approval-only offline actions. No roster write, SDK call or legacy queue here."""
+"""Offline staff actions awaiting approval, with local door delivery."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -19,10 +19,12 @@ PERMISSIONS = {
     "FREEZE": ("ACTIVE_MEMBERSHIP_FREEZING",),
     "FREEZE_CANCEL": ("ACTIVE_MEMBERSHIP_FREEZING", "ACTIVE_MEMBERSHIP_FREEZE_CANCEL"),
     "DELETE": ("ACTIVE_MEMBERSHIP_DELETION",), "FINGERPRINT": ("ACTIVE_MEMBERSHIP_FINGERPRINTS",),
+    "FINGERPRINT_DISABLE": ("ACTIVE_MEMBERSHIP_FINGERPRINTS",),
 }
 SUMMARIES = {"CREATE": "Nouveau membre", "RENEW": "Renouvellement", "PAY_REST": "Paiement du reste",
              "EDIT": "Modification du membre", "FREEZE": "Gel de l'abonnement", "FREEZE_CANCEL": "Annulation du gel",
-             "DELETE": "Suppression du membre", "FINGERPRINT": "Enrôlement d'empreinte"}
+             "DELETE": "Suppression du membre", "FINGERPRINT": "Enrôlement d'empreinte",
+             "FINGERPRINT_DISABLE": "Empreinte désactivée ici"}
 MUTATION_KINDS = {"edit": "EDIT", "freeze_create": "FREEZE", "freeze_cancel": "FREEZE_CANCEL", "delete": "DELETE"}
 
 
@@ -67,7 +69,10 @@ def uploaded_receipts() -> list[dict]:
 
 def pending_members() -> list[dict]:
     members = [_create_projection(row) for row in db.list_offline_pending_actions(limit=100000) if row["kind"] == "CREATE"]
-    return members + [row["projection"] for row in uploaded_receipts() if row.get("projection")]
+    members += [row["projection"] for row in uploaded_receipts() if row.get("projection")]
+    from app.core.offline_overlay import snapshot
+    states = {r["local_id"]: r["state"] for r in snapshot().rows if r["kind"] == "TEMP_MEMBER"}
+    return [{**member, "offlinePassState": states.get(member["offlinePendingLocalId"])} for member in members]
 
 
 def record_if_offline(app, kind: str, payload: dict, *, target_id=None, depends_on=None, member_label="") -> dict | None:
@@ -116,7 +121,7 @@ def record_if_offline(app, kind: str, payload: dict, *, target_id=None, depends_
                 "activeMembershipId", "amount", "paymentMethod", "termId", "cheque", "bankTransfer", "note")}
         elif kind == "DELETE":
             body = {}
-        category = "DOOR" if kind == "FINGERPRINT" else "MONEY"
+        category = "DOOR" if kind in ("FINGERPRINT", "FINGERPRINT_DISABLE") else "MONEY"
         # Same classification as the backend: a card-only edit consumes the door limit.
         if kind == "EDIT" and ("cardId" in body or "secondCardId" in body) and all(body.get(k) is None for k in ("startDate", "endDate", "note")):
             category = "DOOR"
@@ -132,10 +137,14 @@ def record_if_offline(app, kind: str, payload: dict, *, target_id=None, depends_
                "manual_offline": int(app.staff_session.offline_detector.state()["manual"]),
                "occurred_at_pc": at, "clock_offset_sec": round(clock.offset()) if clock and clock.offset() is not None else None,
                "created_at": at, "local_day": local_day()}
-        result = db.insert_offline_pending_action(row, daily_limit=session.limits()[category.lower()]["max"])
+        from app.core.offline_overlay import action_overlay_factory
+        result = db.insert_offline_pending_action(row, daily_limit=session.limits()[category.lower()]["max"],
+                                                  overlay_factory=action_overlay_factory(app, row))
     if result["ok"]:
         from app.api.local_access_api_v2 import invalidate_staff_status
         invalidate_staff_status()
+        from app.core.offline_overlay import dispatch_action
+        dispatch_action(app, row)
         if row["manual_offline"]:
             try:
                 upload_soon(app)
@@ -190,7 +199,7 @@ def upload_pending(app, token: str, *, pc_uuid=None):
         receipts = {r["local_id"]: {"local_id": r["local_id"], "kind": r["kind"],
                     "target_active_membership_id": r["target_active_membership_id"],
                     "projection": _create_projection(r) if r["kind"] == "CREATE" else None} for r in rows}
-        db.finish_offline_pending_upload(accepted, rejected, receipts=receipts)
+        db.finish_offline_pending_upload(accepted, rejected, receipts=receipts, terminal_rejected=True)
         if accepted and session.recovery_pending:
             count = (session.last_upload or {}).get("count", 0) if session.recovery_upload_started else 0
             session.last_upload = {"count": count + len(accepted), "at": datetime.now().isoformat(timespec="microseconds")}

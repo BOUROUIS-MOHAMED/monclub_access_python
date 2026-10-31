@@ -1240,8 +1240,9 @@ synthetic ids, never a `mainAccountId`). No roster refresh can fill it — it is
 row — and a `blocked_auth` item waits on an operator, so counting it froze every removal on every
 ACCOUNT device for as long as the item stayed queued (review #12). Under ACCOUNT such a row is
 skipped: not emitted under any pin, counted only in `stats_out["skipped_offline_projections"]`.
-Under MEMBERSHIP its negative pin already fails the digit check, so neither scheme pushes an
-unconfirmed offline sale. `[CODE: device_sync.py::_filter_users_for_device]`
+Under MEMBERSHIP its negative pin already fails the digit check. Release 2b uses a separate
+positive temporary pin for staff offline sales (below); legacy projections still never push.
+`[CODE: device_sync.py::_filter_users_for_device]`
 `[TEST: test_account_pin_device_sites.py::test_a_queued_offline_creation_does_not_freeze_removals]`
 
 **The roster hash.** `build_device_sync_fingerprint` adds `pinScheme=ACCOUNT` to its header only
@@ -1455,6 +1456,42 @@ is why the procedure wipes BEFORE switching.
 can graft one member's fingerprints onto another member's row. Existing terminals must be cleared
 and re-pushed. `[UNVERIFIED — the wipe path itself has not been exercised on hardware]`
 **And the wipe must be MANUAL** — neither automatic removal path can do it. §3.2c says why.
+
+**Staff offline door overlay (release 2b).** `offline_turnstile_overlay` is separate from
+the legacy queues. `offline_actions.record_if_offline` writes the approval action and door
+overlay in one durable DbWriter transaction, only for driver PCs with staff login on.
+`offline_overlay.snapshot` caches rows per local-state generation; the shared
+`DeviceSyncEngine._filter_users_for_device` appends temporary members before plan filtering,
+then patches existing pins after ACCOUNT collapse, on copies. An empty overlay preserves
+the existing row objects. Every overlay write invalidates that snapshot and the sync cache.
+`[CODE; TEST: test_offline_overlay_filter.py, test_offline_overlay_write.py]`
+
+CREATE gets a never-reused nine-digit pin: `9` + `gymAccessPcId mod 1000` (000 if unknown)
++ five sequence digits. The sequence and used pins persist; device-state collisions are
+skipped. The PC id comes from the already-held PC JWT, then its local cached id. Two PCs
+can still collide if their ids match modulo 1000 AND their sequences meet. An ACCOUNT
+membership-only sale skips devices already holding that person's account pin, to avoid
+duplicating a card. The overlay uses existing worker sync requests and connections; targeted
+finger/card updates go through the same filter as full syncs. Temporary members bypass plan
+off-hours and entry limits until expiry (those holds only move server rows).
+`[CODE: offline_overlay.action_overlay_factory, ::dispatch_action; db.allocate_offline_temp_pin]`
+`[UNVERIFIED — HARDWARE-GATED: nine-digit pins and offline template matching on real terminals]`
+
+`POST /api/v2/members/{activeMembershipId}/fingerprints/{fingerprintId}/disable-here`
+records a DOOR `FINGERPRINT_DISABLE` action with the exact payload `{fingerprintId,
+activeMembershipId}`; it requires offline unlock, selected staff and fingerprint permission.
+Online it answers 409 `ONLINE_USE_DASHBOARD`. It never calls the SDK from the HTTP thread.
+`[CODE; TEST: test_offline_overlay_write.py::test_disable_here_is_offline_only_and_checks_permission]`
+
+`offline_overlay.drain_worker` replays each active entry once per worker (an HTTP request may
+have arrived before workers existed); later passes read the overlay through the filter, so it
+never queues a full pass every minute. Removal of DROPPED temporary pins is retried each
+minute until done. `expire_overlay` also deletes DROPPED entries older than seven days once no
+device state or push intent still names the temporary pin and none of its door history waits
+for upload; `used_temp_pins` keeps the pin so it is never reused.
+`[CODE: offline_overlay.drain_worker, ::expire_overlay; db.purge_offline_overlay; TEST:
+test_offline_overlay_expiry.py::test_active_entries_replayed_once_per_worker,
+::test_finished_entries_purged_after_a_week_only_when_nothing_needs_them]`
 
 ### 3.2c Neither automatic path can clear an old-scheme PIN (2026-09-12)
 
@@ -2899,6 +2936,54 @@ the standalone path uses `_run_standalone_full_sync` → `push_roster` instead.
 
 ### 3.4 ULTRA authoritative revocation — source of truth and delivery semantics
 
+Staff temporary passes expire at local midnight, on a changed gym day, future creation
+timestamp, or suspect gym clock. `AWAITING_REAL_PIN` entries never expire. Startup calls
+`offline_overlay.expire_overlay` synchronously after the date flip, before workers; the
+minute off-hours tick also runs it while overlay work exists. A DROPPED row persists as
+the removal obligation. The worker's member drain replays exact owned temp-pin removals
+over its held SDK connection, even with manual sync on, retrying each minute; no scheduler
+fallback opens a connection for `offline_overlay` requests. Both bulk removal paths union
+overlay pins with planned off-hours pins, so they do not count against the removal ceiling.
+Only temporary whole-user pins get that exemption. Existing-member patches use the normal
+finger-slot/card diff; dropping a patch cannot exempt that member's later departure from
+the whole-user ceiling. Creation targets only driven, in-service devices whose plan filter
+delivers the temporary member, and a suspect clock records it already expired before dispatch.
+Add-only, handover and erase holds still defer removal; `status.staff.offline.expiryPending`
+reports an owned dropped temp pin on an add-only turnstile. Dropped metadata stays available
+for history identity. `[CODE: offline_overlay; MainApp._off_hours_tick;
+UltraDeviceWorker._drain_member_sync_commands, ::_neutralise_revoked_pins;
+DeviceSyncEngine._sync_one_device]`
+`[TEST: test_offline_overlay_expiry.py; UNVERIFIED — real midnight/boot and device latency]`
+
+An interrupted first temp-user write can leave only a durable push intent. The overlay
+drain proves that exact dropped pin over the held connection before removing it: PullSDK
+reuses `_prove_pullsdk_intent` (one filtered card read); standalone uses the driver's existing
+`list_device_users`, with the daily read-back's name/card comparison and owned-pin trust
+check, then `promote_push_intents`. A mismatch or failed read grants no ownership and retries.
+No other intent is promoted by this overlay pass. `[CODE: offline_overlay._prove_offline_temp_intents;
+TEST: test_offline_overlay_expiry.py::test_expiry_proves_an_interrupted_first_write_before_removing]`
+The PullSDK full pass also requires affirmative ownership for overlay temp pins: a failed
+first write alone is not permission to delete a possibly foreign user. Other stale pins
+retain the existing rule in §3.3. `[CODE: offline_overlay.offline_owned_removals;
+TEST: test_offline_overlay_expiry.py::test_unproven_temp_pin_not_deleted_by_full_pullsdk_pass]`
+The standalone listing is one blocking SDK command; its duration on a real terminal remains
+unmeasured, as in §3.4a. `[UNVERIFIED — hardware timing]`
+
+Online staff ticks poll the gym-JWT `/offline-actions/decisions` endpoint in batches of
+at most 200 local ids. Upload rejection and REFUSED drop immediately; UNKNOWN drops after
+24 continuous hours from its first poll after successful upload; a separate durable upload
+proof survives retirement of the display receipt. Existing-member APPLIED patches end
+when the cached server value matches, or a completed authoritative member refresh is newer
+than `decidedAt` (a later online edit wins). A refused/malformed roster response does not
+advance that completion marker. Temporary APPLIED sales become AWAITING_REAL_PIN: once
+the real member is cached the temp card is stripped, but its pin stays desired until
+`last_ok=1` and the protocol-specific current hash match on every target device. Child
+finger/card patches also apply to the real row while awaiting, then re-key atomically at
+swap, so a pending finger is delivered before the temporary pin goes. The drop is planned.
+`[CODE: offline_overlay.reconcile_decisions, ::real_pin_hash; db.swap_offline_overlay,
+::_record_offline_roster_completed; TEST: test_offline_overlay_reconcile.py]`
+`[UNVERIFIED — hardware: duplicate-card handoff and real approve/refuse cycles]`
+
 The full standalone off-hours exception removes only exact planned pins when the REAL
 roster is empty; unrelated revocations remain refused and pending. The refusal still
 prevents pruning their ownership state. `[CODE: UltraDeviceWorker._neutralise_revoked_pins]`
@@ -3604,6 +3689,27 @@ fingerprints never land). FIELD-TEST on a bench MB2000 and C3-400: write user A 
 user B with card X, and check whether B lands.
 
 ### 3.5 Door-history upload — verdicts, the unresolved retry bound, and expiry (2026-09-12)
+
+**Temporary offline members (2b).** Temp-pin events resolve their name from the overlay
+snapshot in `_user_for_device_pin` / `_handle_allow`; the popup plan line says « Accès
+provisoire ». They persist `access_history.offline_local_id`, without synthetic person ids.
+The ULTRA live history queue does not send them. The maintenance uploader excludes undecided
+rows in SQL, so a held oldest event cannot starve later events. APPLIED rewrites the persisted
+membership/user ids and `raw_json.offlineIdentity.mainAccountId` before upload, retaining the
+original event id, raw pin and event date. REFUSED, EXPIRED, REJECTED and timed-out UNKNOWN
+events become `FAILED_TERMINAL` locally, with the drop reason; they are never posted as a
+fictitious account id. `[CODE: db._build_access_history_insert_params,
+::prepare_offline_access_history, ::list_pending_access_history_for_sync;
+device_attendance.DeviceAttendanceMaintenanceEngine; UltraDeviceWorker._write_history_item]`
+`[TEST: test_offline_overlay_history.py]`
+
+Hold lifetime is safe in the inspected backend source: `GymAccessController.bulkSaveGymAccessHistory`
+has no age/watermark check and stores the client's date; `DoorHistoryDedupeKey` keys events by
+device + event id. Local pending rows have no retention cutoff (`prune_access_history` deletes
+only SYNCED/FAILED_TERMINAL; undecided held rows receive no unresolved verdicts).
+`[CODE: backend cx-access-staff-be, 2026-10-31; db.prune_access_history;
+TEST: test_offline_overlay_history.py::test_temp_pin_history_held_then_rewritten]`
+`[UNVERIFIED — end-to-end late upload against the deployed backend]`
 
 **Where it runs.** On every sync tick that starts — logged in, no previous tick still running;
 `_sync_tick` returns early otherwise — and in every mode, the tick's `work()` calls
@@ -5351,10 +5457,12 @@ DRIVER/ALL_TURNSTILES PC records CREATE, RENEW, PAY_REST, EDIT, FREEZE, FREEZE_C
 DELETE and FINGERPRINT as approval requests. Payloads use the online DTOs (shared fixtures
 in `tests/fixtures/offline_actions`), are DPAPI-protected, and are never inserted into
 `sync_users`, the credential cache or the old queues. Capturing a fingerprint returns
-before backend save, member sync or device push. A card-only EDIT (cards supplied, no
+before backend save; release 2b queues local door delivery after the durable action/overlay save. A card-only EDIT (cards supplied, no
 date/note supplied) consumes DOOR like the backend; other edits consume MONEY. Mixed
-card/date edits consume MONEY. No fingerprint/card/new-member change takes effect at
-the turnstile before approval. Photos and fingerprint deletion require internet.
+card/date edits consume MONEY. Release 2b makes fingerprint/card/new-member door changes
+live through the overlay (§3.2b); money/profile changes and renewal still await approval.
+Photos and fingerprint deletion require internet; the new offline-only « Désactiver ici »
+records FINGERPRINT_DISABLE instead of deleting the account's template.
 The member roster API alone adds pending CREATE projections and pending markers; device
 engines never receive these projections. Dependent actions carry the CREATE local ID
 and no target membership ID. `[CODE; TEST: tests/test_offline_actions.py]`
@@ -5381,8 +5489,9 @@ tests/test_offline_actions.py::test_uploaded_create_keeps_dependency_reference_w
 
 `tauri-ui/src/components/OfflineMode.tsx` renders the manual switch, offline staff chip,
 unlock/act-as/rules/limit dialogs and reader notice. Rules open on each new offline
-period; the banner explicitly limits continued door/card/fingerprint operation to
-data already on the turnstile. Controls refresh status after requests, including
+period; the rules distinguish immediate Empreintes / Cartes / Nouveaux membres from
+money/profile changes awaiting approval, and describe today's 23:59 temporary pass.
+Controls refresh status after requests, including
 wrong-code/lock answers; the act-as picker uses the local API's unlock state.
 The recovery toast is emitted only for a new upload observed while the UI is open.
 `RenewDialog` skips all quotes offline and defers dates, debt and door questions to
@@ -5390,12 +5499,24 @@ approval; `PayRestDialog` accepts an amount without a live
 balance and defers its check. Changing mode remounts payment forms so an online balance
 or term choice cannot leak into the offline form. `UsersPage` shows pending markers
 and uses approval copy for saved actions; a newly created pending member may receive dependent edits or
-fingerprints without joining the device roster. `EnrollPage`, `EnrollOverlay` and the
+fingerprints through its temporary overlay pin. `EnrollPage`, `EnrollOverlay` and the
 member's enrolment dialog recognize the worker's exact approval-saved log line
 (`Empreinte enregistrée pour validation dans le tableau de bord.`); their successful
 offline result reports approval pending and never shows the online transmission panel,
-even if connectivity changes before the result is displayed. `[CODE; validation: npm run typecheck;
+even if connectivity changes before the result is displayed. Release 2b's successful
+offline result says the finger is active while awaiting the decision. Both the Enroll
+list and member panel offer « Désactiver ici » only offline, on synced fingerprints;
+the existing staff permission button gates it. Member-card fingerprint summaries now
+carry the fingerprint id as well as slot, label and enabled state (no template).
+Renewal says « Le membre aura accès après validation » and promises no temporary renewal
+pass. `[CODE; validation: npm run typecheck;
 visual/runtime/hardware verification UNVERIFIED]`
+
+Pending creation display reads the current `offlinePassState` from the overlay, including
+after upload: ACTIVE uses « Accès jusqu'à ce soir 23:59 · vente en attente », DROPPED says the
+temporary access ended, and a creation without an overlay promises no temporary access.
+`[CODE: offline_actions.pending_members; UsersPage.rowFlag;
+TEST: test_offline_overlay_write.py::test_member_display_does_not_promise_a_pass_after_expiry_or_upload]`
 
 Every gym records confirmed local operator opens in `staff_force_open_events` (UUID, device,
 door, local time and current staff ID or null). The ULTRA, AGENT and PullSDK connection paths

@@ -3947,6 +3947,21 @@ def _offline_action(ctx: _Ctx, kind: str, payload: dict, *, target_id=None, depe
     return True
 
 
+def _handle_member_fingerprint_disable_here(ctx: _Ctx) -> None:
+    from app.core.offline_actions import staff_enabled
+    from app.core.db import list_sync_users_by_active_membership_ids
+    if not staff_enabled(ctx.app) or not ctx.app.staff_session.offline_detector.state()["offline"]:
+        ctx.send_json(409, {"ok": False, "code": "ONLINE_USE_DASHBOARD"})
+        return
+    amid = ctx.param_int("activeMembershipId")
+    fingerprint_id = ctx.param_int("fingerprintId")
+    rows = list_sync_users_by_active_membership_ids({amid})
+    if not any(f.get("id") == fingerprint_id for u in rows for f in (u.get("fingerprints") or [])):
+        ctx.send_json(404, {"ok": False, "code": "FINGERPRINT_NOT_FOUND"})
+        return
+    _offline_action(ctx, "FINGERPRINT_DISABLE", {"fingerprintId": fingerprint_id, "activeMembershipId": amid}, target_id=amid)
+
+
 def _staff_require(ctx: _Ctx, permission: str, *, switch_required: bool = False) -> bool:
     staff = getattr(ctx.app, "staff_session", None)
     if switch_required and (not staff or not staff.snapshot()["enabled"]):

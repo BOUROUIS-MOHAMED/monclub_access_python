@@ -148,6 +148,7 @@ export interface StaffOffline {
   limits: { door: { used: number; max: number }; money: { used: number; max: number } };
   pending: { count: number; lastError: string | null };
   lastUpload: { count: number; at: string } | null;
+  expiryPending?: boolean;
 }
 
 export interface StaffBlock {
@@ -526,6 +527,7 @@ export interface OfflineQueueListResponse {
 // ─── Utilisateurs member card (GET /api/v2/members/{activeMembershipId}/card) ───
 // Read only when the card opens. Local copy of the server's data; no template, no secret.
 export interface MemberCardFingerprint {
+  id?: number | null;
   fingerId: number | null;
   label: string | null;
   enabled: boolean;

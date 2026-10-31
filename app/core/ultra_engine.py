@@ -2108,6 +2108,12 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
 
         # One off-hours command per call, then on to the normal queue: a steady stream of
         # off-hours commands must not starve the member syncs waiting behind them.
+        if include_off_hours:
+            from app.core.offline_overlay import drain_worker
+            try:
+                drain_worker(self)
+            except Exception:
+                logger.warning("Offline overlay delivery failed; retained for retry", exc_info=True)
         off_drained = self._drain_off_hours_commands() if include_off_hours else 0
         drained = 0
         while drained < limit:
@@ -5198,6 +5204,9 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             return False
         from app.core.off_hours import held_pins_for_device, split_removals
         held_pins = held_pins_for_device(self._device)
+        from app.core.offline_overlay import planned_pins_for_device
+        overlay_planned = planned_pins_for_device(self._device)
+        held_pins |= overlay_planned
         if roster_count <= 0:
             if not held_pins & set(owned):
                 # Only a pass that really skips says so; one that goes on to remove planned
@@ -5228,7 +5237,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             return False
         # The enrolment grace window, shared with MIRROR: a pin pushed seconds ago is
         # mid-flight, not departed.
-        grace = self._mirror_grace_pins() | self._mirror_allowlist_pins()
+        grace = (self._mirror_grace_pins() | self._mirror_allowlist_pins()) - overlay_planned
         # The prune keeps exactly what this step spared: a grace window expiring between
         # the two left such a pin neither removed nor kept (review R3-11).
         self._last_revoke_grace = set(grace)
@@ -5256,7 +5265,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
 
             self._last_revoke_hold_person = renewal_holds(
                 revoked, pending_persons=hold_persons,
-                exempt=required | {str(p).strip() for p in (hold_exempt or ())},
+                exempt=required | overlay_planned | {str(p).strip() for p in (hold_exempt or ())},
             )
             self._last_revoke_holds = set(self._last_revoke_hold_person)
         if self._last_revoke_holds:
@@ -6604,9 +6613,12 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         creds, users_by_am, users_by_card = self._get_cached_local_state()
 
         # Simple dict lookup -- no validation (device already decided)
-        user = None
+        from app.core.offline_overlay import snapshot
+        user = snapshot().user_for_pin(str((raw_row or {}).get("pin") or ""), self._device)
+        if user:
+            raw_row = {**(raw_row or {}), "offlineLocalId": user["offlineLocalId"]}
         hits = users_by_card.get(card_no) or []
-        if hits:
+        if hits and user is None:
             user = hits[0] if isinstance(hits, list) else hits
 
         # Fallback: for fingerprint scans the device sets cardNo=pin (F-004).
@@ -6667,6 +6679,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             user_image=user_image,
             user_membership_id=user_membership_id,
             user_membership_plan_id=(user.get("membershipId") if isinstance(user, dict) else None),
+            user_membership_title="Accès provisoire" if isinstance(user, dict) and user.get("offlineLocalId") else "",
             user_phone=user_phone,
             user_valid_from=user_valid_from,
             user_valid_to=user_valid_to,
@@ -6704,6 +6717,11 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         row represents. Cached per local-state snapshot and device dict.
         """
         from app.core.device_sync import PIN_SCHEME_ACCOUNT, device_pin_scheme
+
+        from app.core.offline_overlay import snapshot
+        temp = snapshot().user_for_pin(pin, self._device)
+        if temp:
+            return temp
 
         if device_pin_scheme(self._device) != PIN_SCHEME_ACCOUNT:
             return users_by_am.get(int(pin))
@@ -7279,6 +7297,11 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             from app.core.db import limited_user_ids
             if user_id not in limited_user_ids():
                 return
+        from app.core.offline_overlay import snapshot
+        temp = snapshot().user_for_pin(str((raw or {}).get("pin") or ""), self._device)
+        if temp:
+            raw = {**(raw or {}), "offlineLocalId": temp["offlineLocalId"]}
+            user_id = active_membership_id = None
         item = {
             "event_id": event_id,
             "door_id": door_id,
@@ -7430,6 +7453,9 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
 
         if not inserted:
             return  # duplicate, already processed
+
+        if (item.get("raw") or {}).get("offlineLocalId"):
+            return  # Held in SQLite; only the decision-aware attendance uploader may send it.
 
         try:
             rec = HistoryRecord(
@@ -8951,7 +8977,7 @@ class UltraEngine:
         needs_scheduler = bool(unresolved_device_ids)
         if broadcast_devices and not normalized_device_ids:
             needs_scheduler = True
-        if reason == "off_hours":
+        if reason in ("off_hours", "offline_overlay"):
             # The scheduler fallback can reconcile other pending diffs. Planned hours
             # must stay targeted, including in manual mode; the app retries next minute.
             return bool(normalized_device_ids and not needs_scheduler)

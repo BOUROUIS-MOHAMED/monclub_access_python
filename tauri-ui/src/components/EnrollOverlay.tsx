@@ -282,7 +282,7 @@ function PhaseText({
   pendingApproval?: boolean;
 }) {
   const { title, instruction } = phase === "success" && pendingApproval
-    ? { title: "Empreinte enregistrée pour validation", instruction: "Elle sera transmise au tourniquet après validation dans le tableau de bord." }
+    ? { title: "Empreinte enregistrée pour validation", instruction: "Déjà active sur le tourniquet en attendant la décision." }
     : PHASE_COPY[phase] ?? PHASE_COPY.idle;
   const effectiveInstruction =
     phase === "failed" ? errorMsg || "Une erreur est survenue" : instruction;

@@ -2408,7 +2408,9 @@ def off_hours_in_play() -> bool:
                 "UNION ALL SELECT 1 FROM sync_upcoming_users WHERE entry_limits_json IS NOT NULL "
                 "UNION ALL SELECT 1 FROM entry_limit_hold "
                 "UNION ALL SELECT 1 FROM off_hours_hold "
-                "UNION ALL SELECT 1 FROM off_hours_release_pending LIMIT 1").fetchone() is not None
+                "UNION ALL SELECT 1 FROM off_hours_release_pending "
+                "UNION ALL SELECT 1 FROM offline_turnstile_overlay WHERE state != 'DROPPED' OR EXISTS "
+                "(SELECT 1 FROM device_sync_state s WHERE s.pin = offline_turnstile_overlay.temp_pin) LIMIT 1").fetchone() is not None
     except Exception:
         # An unreadable input still needs the release pass.
         return True
@@ -2729,6 +2731,16 @@ def _rebuild_sync_users_without_legacy_fingerprint(conn: sqlite3.Connection) -> 
 # -----------------------------
 def init_db() -> None:
     with get_conn() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS offline_turnstile_overlay (
+            local_id TEXT PRIMARY KEY, kind TEXT, target_active_membership_id INTEGER,
+            temp_pin TEXT UNIQUE, finger_id INTEGER, fingerprint_id INTEGER,
+            template_version INTEGER, template_encoding TEXT, template_data TEXT,
+            card TEXT, full_name TEXT, membership_id INTEGER, device_ids TEXT,
+            created_at TEXT, local_day TEXT, expires_at_epoch REAL, state TEXT,
+            decision TEXT, real_active_membership_id INTEGER, real_user_id INTEGER,
+            real_main_account_id INTEGER, dropped_reason TEXT, updated_at TEXT)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS used_temp_pins (
+            pin TEXT PRIMARY KEY, used_at TEXT)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS refused_info_state (
             id INTEGER PRIMARY KEY CHECK (id = 1), enabled INTEGER NOT NULL DEFAULT 0,
             directory_fetched_at TEXT)""")
@@ -3468,6 +3480,7 @@ def init_db() -> None:
         # valid activeMembership for QR/TOTP rows (which have no device pin/card to
         # re-resolve). Without it the backend silently drops those rows.
         _ensure_column(conn, "access_history", "active_membership_id", "active_membership_id INTEGER")
+        _ensure_column(conn, "access_history", "offline_local_id", "offline_local_id TEXT")
         # Explicit "unresolved" verdicts from the backend (its failedIds), counted apart from
         # backend_attempt_count / backend_failure_count: those two also rise on every 5xx,
         # timeout and network error, so a bound on either would expire real events during an
@@ -6094,6 +6107,8 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
             pc_received_epoch=pc_received_epoch,
         )
 
+        _record_offline_roster_completed(conn)
+
     _run_db_write_sync("_save_sync_cache", _write)
 
 
@@ -7520,6 +7535,8 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                 pc_received_epoch=pc_received_epoch,
             )
         profile["protocol2"] = protocol2.get("protocol")
+        if p2_members_applied:
+            _record_offline_roster_completed(conn)
 
         return {
             "credentials": creds_summary,
@@ -8849,6 +8866,7 @@ def get_member_card_details(active_membership_id: int) -> Dict[str, Any] | None:
         if not isinstance(f, dict):
             continue
         fps.append({
+            "id": _to_int_or_none(f.get("id")),
             "fingerId": _to_int_or_none(f.get("fingerId")),
             "label": f.get("label") if isinstance(f.get("label"), str) else None,
             "enabled": f.get("enabled") is not False,
@@ -11411,6 +11429,7 @@ class AccessHistoryRow:
     # Explicit backend "unresolved" verdicts; see mark_access_history_unresolved(). Must stay
     # a defaulted field: rows are hydrated with AccessHistoryRow(**dict(row)) from SELECT *.
     backend_unresolved_count: int = 0
+    offline_local_id: Optional[str] = None
 
 
 ACCESS_HISTORY_SOURCE_AGENT = "AGENT"
@@ -11526,7 +11545,13 @@ def _build_access_history_insert_params(
     backend_sync_state: str | None,
     user_id: int | None = None,
     active_membership_id: int | None = None,
+    offline_local_id: str | None = None,
 ) -> tuple[Any, ...]:
+    from app.core.offline_overlay import snapshot
+    temp = snapshot().user_for_pin(str((raw or {}).get("pin") or ""), {"id": device_id})
+    offline_local_id = offline_local_id or (raw or {}).get("offlineLocalId") or (temp or {}).get("offlineLocalId")
+    if offline_local_id:
+        user_id = active_membership_id = None
     return (
         now_iso(),
         str(event_id),
@@ -11547,6 +11572,7 @@ def _build_access_history_insert_params(
         normalize_access_history_sync_state(backend_sync_state),
         int(user_id) if user_id is not None else None,
         int(active_membership_id) if active_membership_id is not None else None,
+        offline_local_id,
     )
 
 
@@ -11570,6 +11596,7 @@ def insert_access_history(
     backend_sync_state: str | None = None,
     user_id: int | None = None,
     active_membership_id: int | None = None,
+    offline_local_id: str | None = None,
 ) -> int:
     """
     Insert an access history row using INSERT OR IGNORE (UNIQUE on event_id).
@@ -11599,8 +11626,9 @@ def insert_access_history(
                     history_source,
                     backend_sync_state,
                     user_id,
-                    active_membership_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    active_membership_id,
+                    offline_local_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 _build_access_history_insert_params(
                     event_id=event_id,
@@ -11621,6 +11649,7 @@ def insert_access_history(
                     backend_sync_state=backend_sync_state,
                     user_id=user_id,
                     active_membership_id=active_membership_id,
+                    offline_local_id=offline_local_id,
                 ),
             )
             return int(cur.rowcount or 0)
@@ -11657,6 +11686,7 @@ def insert_access_history_batch(*, rows: Iterable[Dict[str, Any]]) -> int:
                 backend_sync_state=row.get("backend_sync_state", row.get("backendSyncState")),
                 user_id=row.get("user_id", row.get("userId")),
                 active_membership_id=row.get("active_membership_id", row.get("activeMembershipId")),
+                offline_local_id=row.get("offline_local_id", row.get("offlineLocalId")),
             )
         )
     if not batch:
@@ -11674,8 +11704,9 @@ def insert_access_history_batch(*, rows: Iterable[Dict[str, Any]]) -> int:
                 history_source,
                 backend_sync_state,
                 user_id,
-                active_membership_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                active_membership_id,
+                offline_local_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             batch,
         )
@@ -11811,6 +11842,29 @@ def get_recent_access_history(*, limit: int = 10) -> List[AccessHistoryRow]:
         return out
 
 
+def prepare_offline_access_history() -> None:
+    def write(conn, _):
+        overlays = conn.execute("SELECT * FROM offline_turnstile_overlay WHERE kind = 'TEMP_MEMBER'").fetchall()
+        for overlay in overlays:
+            if overlay["decision"] == "APPLIED" and overlay["real_user_id"] and overlay["real_active_membership_id"]:
+                rows = conn.execute("SELECT id, raw_json FROM access_history WHERE offline_local_id = ? "
+                    "AND backend_sync_state IN ('PENDING', 'FAILED_RETRYABLE') AND "
+                    "(user_id IS NULL OR user_id != ? OR active_membership_id IS NULL OR active_membership_id != ?)",
+                    (overlay["local_id"], overlay["real_user_id"], overlay["real_active_membership_id"])).fetchall()
+                for row in rows:
+                    raw = json.loads(row["raw_json"] or "{}")
+                    raw["offlineIdentity"] = {"userId": overlay["real_user_id"], "activeMembershipId": overlay["real_active_membership_id"],
+                                              "mainAccountId": overlay["real_main_account_id"]}
+                    conn.execute("UPDATE access_history SET user_id = ?, active_membership_id = ?, raw_json = ?, "
+                        "backend_next_retry_at = NULL, backend_unresolved_count = 0 WHERE id = ?",
+                        (overlay["real_user_id"], overlay["real_active_membership_id"], json.dumps(raw), row["id"]))
+            elif overlay["state"] == "DROPPED":
+                conn.execute("UPDATE access_history SET backend_sync_state = 'FAILED_TERMINAL', backend_last_error = ? "
+                    "WHERE offline_local_id = ? AND backend_sync_state IN ('PENDING', 'FAILED_RETRYABLE')",
+                    ("Offline temporary pass: " + str(overlay["dropped_reason"]), overlay["local_id"]))
+    _run_db_write_sync("offline_history_prepare", write)
+
+
 def list_pending_access_history_for_sync(*, limit: int = 200) -> List[AccessHistoryRow]:
     from app.core.zkem_rtlog_filter import BLANK_HISTORY_SQL   # stored blank MB2000 rows: never sent
     lim = max(1, min(int(limit), 1000))
@@ -11821,6 +11875,8 @@ def list_pending_access_history_for_sync(*, limit: int = 200) -> List[AccessHist
             SELECT *
             FROM access_history
             WHERE backend_sync_state IN (?, ?)
+              AND (offline_local_id IS NULL OR EXISTS (SELECT 1 FROM offline_turnstile_overlay o
+                   WHERE o.local_id = access_history.offline_local_id AND o.decision = 'APPLIED'))
               AND (backend_next_retry_at IS NULL OR backend_next_retry_at = '' OR backend_next_retry_at <= ?)
               AND NOT """ + BLANK_HISTORY_SQL + """
             ORDER BY id ASC
@@ -12377,7 +12433,119 @@ def _norm_text_l(v: Any) -> str:
     return _norm_text(v).lower()
 
 
-def insert_offline_pending_action(row: Dict[str, Any], *, daily_limit: int) -> Dict[str, Any]:
+_OVERLAY_FIELDS = ("local_id", "kind", "target_active_membership_id", "temp_pin", "finger_id",
+                   "fingerprint_id", "template_version", "template_encoding", "template_data",
+                   "card", "full_name", "membership_id", "device_ids", "created_at", "local_day",
+                   "expires_at_epoch", "state", "decision", "real_active_membership_id",
+                   "real_user_id", "real_main_account_id", "dropped_reason", "updated_at")
+
+
+def _offline_overlay_changed() -> None:
+    bump_local_state_generation()
+    invalidate_sync_cache()
+
+
+def _record_offline_roster_completed(conn) -> None:
+    if conn.execute("SELECT 1 FROM offline_turnstile_overlay WHERE state != 'DROPPED' LIMIT 1").fetchone():
+        conn.execute("INSERT INTO v2_kv (key, value_json, updated_at) VALUES ('offline_overlay_roster_completed', ?, ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                     (json.dumps(time.time()), time.time()))
+
+
+def _insert_offline_overlay(conn, row: Dict[str, Any]) -> None:
+    from shared.auth_state import protect_auth_token
+    values = {"state": "ACTIVE", "created_at": now_iso(), **row, "updated_at": now_iso()}
+    values["device_ids"] = json.dumps(values.get("device_ids") or [])
+    if values.get("template_data"):
+        values["template_data"] = protect_auth_token(values["template_data"])
+        if not values["template_data"]:
+            raise RuntimeError("Impossible de protéger l'empreinte hors ligne")
+    conn.execute("INSERT INTO offline_turnstile_overlay (" + ", ".join(_OVERLAY_FIELDS) + ") VALUES (" +
+                 ", ".join("?" for _ in _OVERLAY_FIELDS) + ")", tuple(values.get(k) for k in _OVERLAY_FIELDS))
+
+
+def insert_offline_overlay(row: Dict[str, Any]) -> None:
+    _run_db_write_sync("offline_overlay_insert", lambda conn, _: _insert_offline_overlay(conn, row), durable=True)
+    _offline_overlay_changed()
+
+
+def list_offline_overlay(*, active_only: bool = False) -> List[Dict[str, Any]]:
+    from shared.auth_state import unprotect_auth_token
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM offline_turnstile_overlay " +
+                ("WHERE state != 'DROPPED' " if active_only else "") + "ORDER BY created_at, rowid")]
+    for row in rows:
+        row["device_ids"] = json.loads(row["device_ids"] or "[]")
+        if row["template_data"]:
+            row["template_data"] = unprotect_auth_token(row["template_data"])
+            if not row["template_data"]:
+                raise RuntimeError("Impossible de déchiffrer l'empreinte hors ligne")
+    return rows
+
+
+def update_offline_overlay(local_id: str, **values) -> None:
+    if not values or not set(values).issubset(set(_OVERLAY_FIELDS) - {"local_id", "template_data", "device_ids"}):
+        raise ValueError("Invalid overlay update")
+    values["updated_at"] = now_iso()
+    def write(conn, _):
+        conn.execute("UPDATE offline_turnstile_overlay SET " + ", ".join(k + " = ?" for k in values) +
+                     " WHERE local_id = ?", (*values.values(), local_id))
+    _run_db_write_sync("offline_overlay_update", write, durable=True)
+    _offline_overlay_changed()
+
+
+def drop_offline_overlay(local_id: str, reason: str) -> None:
+    update_offline_overlay(local_id, state="DROPPED", dropped_reason=reason)
+
+
+def swap_offline_overlay(local_id: str, real_amid: int) -> None:
+    def write(conn, _):
+        conn.execute("UPDATE offline_turnstile_overlay SET target_active_membership_id = ?, updated_at = ? "
+                     "WHERE target_active_membership_id = ? AND kind != 'TEMP_MEMBER' AND state != 'DROPPED'",
+                     (real_amid, now_iso(), _synthetic_negative_id(local_id, "offline_approval")))
+        conn.execute("UPDATE offline_turnstile_overlay SET state = 'DROPPED', dropped_reason = 'SWAPPED', "
+                     "updated_at = ? WHERE local_id = ?", (now_iso(), local_id))
+    _run_db_write_sync("offline_overlay_swap", write, durable=True)
+    _offline_overlay_changed()
+
+
+def purge_offline_overlay(*, older_than: str) -> int:
+    """Delete finished entries nothing still needs: no device still holds or is mid-write of the
+    temporary pin, and none of its door history waits for upload. Temp pins stay in used_temp_pins."""
+    def write(conn, _):
+        return conn.execute(
+            "DELETE FROM offline_turnstile_overlay WHERE state = 'DROPPED' AND updated_at < ? "
+            "AND (temp_pin IS NULL OR (NOT EXISTS (SELECT 1 FROM device_sync_state s WHERE s.pin = offline_turnstile_overlay.temp_pin) "
+            "AND NOT EXISTS (SELECT 1 FROM device_push_intent i WHERE i.pin = offline_turnstile_overlay.temp_pin))) "
+            "AND NOT EXISTS (SELECT 1 FROM access_history h WHERE h.offline_local_id = offline_turnstile_overlay.local_id "
+            "AND h.backend_sync_state IN ('PENDING', 'FAILED_RETRYABLE'))", (older_than,)).rowcount or 0
+    deleted = _run_db_write_sync("offline_overlay_purge", write, durable=True)
+    if deleted:
+        _offline_overlay_changed()
+    return deleted
+
+
+def allocate_offline_temp_pin(conn, *, pc_id: int, device_ids: Iterable[int]) -> str:
+    key = "offline_temp_pin_sequence"
+    row = conn.execute("SELECT value_json FROM v2_kv WHERE key = ?", (key,)).fetchone()
+    sequence = int(json.loads(row[0])) if row else 0
+    devices = {int(d) for d in device_ids}
+    while sequence < 99999:
+        sequence += 1
+        pin = f"9{int(pc_id or 0) % 1000:03d}{sequence:05d}"
+        if conn.execute("SELECT 1 FROM used_temp_pins WHERE pin = ?", (pin,)).fetchone():
+            continue
+        if any(int(r[0]) in devices for r in conn.execute("SELECT device_id FROM device_sync_state WHERE pin = ?", (pin,))):
+            continue
+        conn.execute("INSERT INTO used_temp_pins (pin, used_at) VALUES (?, ?)", (pin, now_iso()))
+        conn.execute("INSERT INTO v2_kv (key, value_json, updated_at) VALUES (?, ?, ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                     (key, json.dumps(sequence), time.time()))
+        return pin
+    raise RuntimeError("Plus de numéros provisoires disponibles sur ce PC")
+
+
+def insert_offline_pending_action(row: Dict[str, Any], *, daily_limit: int, overlay_factory=None) -> Dict[str, Any]:
     from shared.auth_state import protect_auth_token
     protected = protect_auth_token(json.dumps(row["payload"], ensure_ascii=False))
     if not protected:
@@ -12403,8 +12571,14 @@ def insert_offline_pending_action(row: Dict[str, Any], *, daily_limit: int) -> D
                      "member_label, summary, amount, payload_json, act_as_agent_id, unlocked_with_code, manual_offline, "
                      "occurred_at_pc, clock_offset_sec, created_at, depends_on_local_id, local_day) "
                      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", tuple(values.get(k) for k in fields))
+        overlay = overlay_factory(conn) if overlay_factory else None
+        if overlay:
+            _insert_offline_overlay(conn, overlay)
         return {"ok": True, "pendingApproval": True, "localId": row["local_id"]}
-    return _run_db_write_sync("offline_pending_insert", write, durable=True)
+    result = _run_db_write_sync("offline_pending_insert", write, durable=True)
+    if result["ok"] and overlay_factory:
+        _offline_overlay_changed()
+    return result
 
 
 def list_offline_pending_actions(*, limit: int = 200, decrypt: bool = True) -> List[Dict[str, Any]]:
@@ -12430,16 +12604,21 @@ def offline_pending_status() -> Dict[str, Any]:
     return {"count": count, "lastError": error[0] if error else None}
 
 
-def finish_offline_pending_upload(accepted: List[str], rejected: Dict[str, str], *, receipts: Dict[str, Any] | None = None) -> None:
+def finish_offline_pending_upload(accepted: List[str], rejected: Dict[str, str], *, receipts: Dict[str, Any] | None = None,
+                                  terminal_rejected: bool = False) -> None:
     def write(conn, _profile):
         saved = conn.execute("SELECT value_json FROM v2_kv WHERE key = 'offline_action_receipts'").fetchone()
         references = json.loads(saved[0]) if saved else {}
+        proof = conn.execute("SELECT value_json FROM v2_kv WHERE key = 'offline_overlay_uploaded'").fetchone()
+        uploaded = json.loads(proof[0]) if proof else {}
         for local_id in accepted:
             row = conn.execute("SELECT category, local_day FROM offline_pending_actions WHERE local_id = ?", (local_id,)).fetchone()
             if not row:
                 continue
             if receipts and local_id in receipts:
                 references[local_id] = receipts[local_id]
+            if conn.execute("SELECT 1 FROM offline_turnstile_overlay WHERE local_id = ?", (local_id,)).fetchone():
+                uploaded.setdefault(local_id, time.time())
             key = "offline_uploaded_usage:" + row["local_day"]
             receipt = conn.execute("SELECT value_json FROM v2_kv WHERE key = ?", (key,)).fetchone()
             usage = json.loads(receipt[0]) if receipt else {}
@@ -12453,10 +12632,20 @@ def finish_offline_pending_upload(accepted: List[str], rejected: Dict[str, str],
             conn.execute("INSERT INTO v2_kv (key, value_json, updated_at) VALUES ('offline_action_receipts', ?, ?) "
                          "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
                          (json.dumps(references), time.time()))
+            if uploaded:
+                conn.execute("INSERT INTO v2_kv (key, value_json, updated_at) VALUES ('offline_overlay_uploaded', ?, ?) "
+                             "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                             (json.dumps(uploaded), time.time()))
         for local_id, reason in rejected.items():
             conn.execute("UPDATE offline_pending_actions SET attempts = attempts + 1, last_error = ? WHERE local_id = ?",
                          (reason, local_id))
+            if terminal_rejected:
+                conn.execute("UPDATE offline_turnstile_overlay SET state = 'DROPPED', decision = 'REJECTED', "
+                             "dropped_reason = 'REJECTED', updated_at = ? WHERE local_id = ? AND state != 'DROPPED'",
+                             (now_iso(), local_id))
     _run_db_write_sync("offline_pending_upload", write, durable=True)
+    if terminal_rejected and rejected:
+        _offline_overlay_changed()
 
 
 def retire_offline_action_receipts(local_ids: List[str]) -> None:

@@ -59,6 +59,7 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("POST", "/api/v2/members/photo", "_handle_member_photo"),
     ("GET", "/api/v2/members/{activeMembershipId}/card", "_handle_member_card"),
     ("GET", "/api/v2/members/{activeMembershipId}/history", "_handle_member_history"),
+    ("POST", "/api/v2/members/{activeMembershipId}/fingerprints/{fingerprintId}/disable-here", "_handle_member_fingerprint_disable_here"),
     ("GET", "/api/v2/sync/cache/memberships", "_handle_sync_cache_memberships"),
     ("GET", "/api/v2/sync/cache/devices", "_handle_sync_cache_devices"),
     ("GET", "/api/v2/sync/cache/infrastructures", "_handle_sync_cache_infrastructures"),
