@@ -35,6 +35,7 @@ API_OPTIONAL_CONTENT_SYNC_URL: str = f"{_API_V1}/manager/gym/access/v1/content/s
 STAFF_CURRENT_PATH = "/manager/gym/access/v1/staff/current"
 STAFF_ACTIVITY_PATH = "/manager/gym/access/v1/staff/activity"
 STAFF_FORCE_OPEN_BULK_PATH = "/manager/gym/access/v1/force-open/bulk"
+OFFLINE_ACTIONS_BULK_PATH = "/manager/gym/access/v1/offline-actions/bulk"
 STAFF_RENEW_QUOTE_PATH = "/gym/activeMembership/renew/quote"
 STAFF_RENEW_PATH = "/gym/activeMembership/renew"
 STAFF_PAY_REST_PATH = "/gym/activeMembership/payRest"

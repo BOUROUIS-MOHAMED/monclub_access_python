@@ -1908,7 +1908,12 @@ class MainApp:
             try:
                 auth = load_auth_token()
                 if auth and auth.token:
-                    self.staff_session.poll_once(self._api(), auth.token)
+                    outcome = self.staff_session.poll_once(self._api(), auth.token)
+                    state = self.staff_session.offline_detector.state()
+                    if outcome == "success" and (not state["offline"] or state["manual"]):
+                        from app.core.offline_actions import upload_pending, reconcile_uploaded
+                        upload_pending(self, auth.token)
+                        reconcile_uploaded(self, auth.token)
             except Exception:
                 self.logger.debug("Staff poll failed", exc_info=True)
             finally:
@@ -2371,6 +2376,10 @@ class MainApp:
         return str(tok or "").strip()
 
     def attempt_offline_creation(self, *, creation_kind: str, payload: Dict[str, Any], client_request_id: str | None = None) -> Dict[str, Any]:
+        from app.core.offline_actions import record_if_offline
+        pending = record_if_offline(self, "CREATE", {"creationKind": creation_kind, "body": payload})
+        if pending is not None:
+            return pending
         kind = str(creation_kind or "membership_only").strip().lower()
         if kind not in ("membership_only", "account_plus_membership"):
             kind = "membership_only"
@@ -2438,6 +2447,9 @@ class MainApp:
             }
 
     def queue_offline_creation(self, *, creation_kind: str, payload: Dict[str, Any], failure: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        from app.core.offline_actions import staff_enabled, record_if_offline, locked_result
+        if staff_enabled(self):
+            return record_if_offline(self, "CREATE", {"creationKind": creation_kind, "body": payload}) or locked_result()
         f = failure if isinstance(failure, dict) else {}
         ft = str(f.get("failureType") or f.get("failure_type") or "").strip().lower()
 
@@ -2901,12 +2913,19 @@ class MainApp:
         queued straight to pending WITHOUT a live attempt (the backend isn't idempotency-safe
         yet)."""
         kind = (op_kind or "").strip().lower()
+        from app.core.offline_actions import staff_enabled, record_if_offline, MUTATION_KINDS, locked_result
+        pending = record_if_offline(self, MUTATION_KINDS.get(kind, kind.upper()), payload,
+                                    target_id=target_id, depends_on=depends_on_local_id)
+        if pending is not None:
+            return pending
         if int(target_id) <= 0:
             return {"ok": False, "error": "invalid target id (must be a real synced member)"}
         is_money = bool(money) if money is not None else (kind in _MONEY_OP_KINDS)
         rid = str(__import__("uuid").uuid4())
 
         def _enqueue(failure: Dict[str, Any] | None = None) -> Dict[str, Any]:
+            if staff_enabled(self):
+                return locked_result()
             try:
                 row = insert_offline_mutation(
                     op_kind=kind, target_kind=target_kind, target_id=int(target_id), payload=payload,
@@ -2929,7 +2948,7 @@ class MainApp:
             return {"ok": False, "queued": True, "gated": bool((failure or {}).get("gated")),
                     "localId": row["local_id"], "state": row.get("state")}
 
-        if is_money and not self._offline_money_mutations_enabled:
+        if is_money and not self._offline_money_mutations_enabled and not staff_enabled(self):
             return _enqueue({"gated": True})
 
         attempt = self.attempt_offline_mutation(
@@ -2963,6 +2982,18 @@ class MainApp:
         if str(row.get("state")) != "conflict":
             return {"ok": False, "error": "row is not in conflict"}
         act = (action or "").strip().lower()
+        if act == "rebase":
+            from app.core.offline_actions import staff_enabled
+            if staff_enabled(self):
+                result = self.submit_offline_mutation(
+                    op_kind=str(row.get("op_kind")), target_kind=str(row.get("target_kind")),
+                    target_id=int(row.get("target_id")),
+                    payload=new_payload if isinstance(new_payload, dict) else (row.get("payload") or {}),
+                    money=bool(row.get("money")), expected_version=new_expected_version,
+                )
+                if result.get("ok"):
+                    archive_offline_mutation(local_id)
+                return result
         if act == "abort":
             cancel_offline_mutation(local_id, reason="operator aborted after conflict")
             return {"ok": True, "action": "abort"}
@@ -4536,6 +4567,10 @@ class MainApp:
 
             step("Resolving active membership...")
             active_membership_id, user_obj = self._find_user_membership(user_id)
+            from app.core.offline_actions import staff_enabled, pending_members
+            if staff_enabled(self) and active_membership_id_override is not None and active_membership_id_override < 0:
+                user_obj = next((m for m in pending_members() if m["activeMembershipId"] == active_membership_id_override), None)
+                active_membership_id = active_membership_id_override if user_obj else None
             if active_membership_id_override is not None:
                 # The caller told us exactly which membership this enrolment is for.
                 # Trust it over our own lookup, but say so, and say loudly when the two
@@ -4681,6 +4716,21 @@ class MainApp:
             else:
                 tpl_text = to_b64(tpl_bytes)
 
+            from app.core.offline_actions import record_if_offline
+            pending = record_if_offline(self, "FINGERPRINT", {
+                "activeMembershipId": active_membership_id, "fingerId": int(finger_id),
+                "templateVersion": int(tpl_ver), "templateEncoding": enc_backend,
+                "templateData": tpl_text, "label": "dashboard", "enabled": True,
+            }, target_id=active_membership_id, member_label=full_name)
+            if pending is not None:
+                if not pending.get("ok"):
+                    fail(pending.get("error") or pending.get("code"), "offline_refused")
+                    return
+                from app.api.local_access_api_v2 import _enroll_clear_tpl
+                _enroll_clear_tpl()
+                success("Empreinte enregistrée pour validation dans le tableau de bord.", "ok_pending_approval")
+                return
+
             # Capture can take long enough for the staff member or permissions to change.
             # Check before BOTH save paths, including a pending member's deferred save.
             staff = getattr(self, "staff_session", None)
@@ -4707,6 +4757,9 @@ class MainApp:
                 pending_local_id = str(user_obj.get("offlinePendingLocalId") or "").strip()
             is_pending_member = bool(pending_local_id) or (isinstance(active_membership_id, int) and active_membership_id < 0)
             if is_pending_member:
+                if staff_enabled(self):
+                    fail("Internet indisponible – passez en mode hors ligne", "offline_locked")
+                    return
                 if not pending_local_id:
                     fail("This member was created offline but its pending record is missing; "
                          "cannot defer the fingerprint.", "no_pending_record")

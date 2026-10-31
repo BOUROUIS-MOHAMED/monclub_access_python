@@ -24,6 +24,7 @@ import { ThemeToggle } from "@/components/theme-toggle";
 import PcIdentityBanner from "@/components/PcIdentityBanner";
 import AccessWhatsNewCard from "@/components/update/AccessWhatsNewCard";
 import StaffChip from "@/components/StaffChip";
+import OfflineControls, { OfflineBanner } from "@/components/OfflineMode";
 import Toast, { showStaffToast } from "@/components/Toast";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -157,7 +158,7 @@ export default function MainLayout() {
   useEffect(() => {
     const staff = status?.staff;
     if (!staff) return;
-    if (staffSeen.current.initialized && staff.enabled && staff.agent && staff.changedAt && staff.changedAt !== staffSeen.current.changedAt) {
+    if (staffSeen.current.initialized && staff.enabled && !staff.offline?.active && staff.agent && staff.changedAt && staff.changedAt !== staffSeen.current.changedAt) {
       showStaffToast(`MonClub Access utilise maintenant ${staff.agent.name}`, "Les actions suivantes porteront son nom.");
     }
     staffSeen.current = { initialized: true, changedAt: staff.changedAt };
@@ -465,6 +466,7 @@ export default function MainLayout() {
           </div>
           {actions && <div className="flex shrink-0 items-center gap-2.5">{actions}</div>}
           <StaffChip staff={status?.staff} />
+          <OfflineControls staff={status?.staff} />
           {showHealth && (
             <Tooltip delayDuration={0}>
               <TooltipTrigger asChild>
@@ -503,6 +505,7 @@ export default function MainLayout() {
         </header>
 
         <PcIdentityBanner />
+        <OfflineBanner staff={status?.staff} />
 
         <main className={cn("min-h-0 flex-1", fill ? "overflow-hidden" : "overflow-auto")}>
           <div className={cn("px-6 pb-6 pt-3.5", fill && "h-full")}>

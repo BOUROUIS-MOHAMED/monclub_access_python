@@ -2732,6 +2732,13 @@ def init_db() -> None:
         conn.execute("""CREATE TABLE IF NOT EXISTS refused_info_state (
             id INTEGER PRIMARY KEY CHECK (id = 1), enabled INTEGER NOT NULL DEFAULT 0,
             directory_fetched_at TEXT)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS offline_pending_actions (
+            local_id TEXT PRIMARY KEY, kind TEXT, category TEXT,
+            target_active_membership_id INTEGER, member_label TEXT, summary TEXT, amount TEXT,
+            payload_json TEXT, act_as_agent_id INTEGER, unlocked_with_code INTEGER,
+            manual_offline INTEGER, occurred_at_pc TEXT, clock_offset_sec INTEGER,
+            created_at TEXT, uploaded_at TEXT, attempts INTEGER DEFAULT 0, last_error TEXT,
+            depends_on_local_id TEXT, local_day TEXT)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS refused_directory (
             user_id INTEGER PRIMARY KEY, account_id INTEGER, active_membership_id INTEGER,
             full_name TEXT, image TEXT, card_ids_json TEXT, plan_title TEXT,
@@ -12368,6 +12375,99 @@ def _norm_text(v: Any) -> str:
 
 def _norm_text_l(v: Any) -> str:
     return _norm_text(v).lower()
+
+
+def insert_offline_pending_action(row: Dict[str, Any], *, daily_limit: int) -> Dict[str, Any]:
+    from shared.auth_state import protect_auth_token
+    protected = protect_auth_token(json.dumps(row["payload"], ensure_ascii=False))
+    if not protected:
+        raise RuntimeError("Impossible de protéger la modification hors ligne")
+    fields = ("local_id", "kind", "category", "target_active_membership_id", "member_label", "summary", "amount",
+              "payload_json", "act_as_agent_id", "unlocked_with_code", "manual_offline", "occurred_at_pc",
+              "clock_offset_sec", "created_at", "depends_on_local_id", "local_day")
+    values = {**row, "payload_json": protected}
+    def write(conn, _profile):
+        if conn.execute("SELECT 1 FROM offline_pending_actions WHERE local_id = ?", (row["local_id"],)).fetchone():
+            return {"ok": True, "pendingApproval": True, "localId": row["local_id"]}
+        receipt = conn.execute("SELECT value_json FROM v2_kv WHERE key = ?",
+                               ("offline_uploaded_usage:" + row["local_day"],)).fetchone()
+        usage = json.loads(receipt[0]) if receipt else {}
+        if row["local_id"] in usage.get("_localIds", []):
+            return {"ok": True, "pendingApproval": True, "localId": row["local_id"]}
+        used = int(usage.get(row["category"], 0))
+        used += conn.execute("SELECT COUNT(*) FROM offline_pending_actions WHERE local_day = ? AND category = ?",
+                             (row["local_day"], row["category"])).fetchone()[0]
+        if used >= daily_limit:
+            return {"ok": False, "code": "LIMIT_REACHED", "category": row["category"], "used": used, "max": daily_limit}
+        conn.execute("INSERT INTO offline_pending_actions (local_id, kind, category, target_active_membership_id, "
+                     "member_label, summary, amount, payload_json, act_as_agent_id, unlocked_with_code, manual_offline, "
+                     "occurred_at_pc, clock_offset_sec, created_at, depends_on_local_id, local_day) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", tuple(values.get(k) for k in fields))
+        return {"ok": True, "pendingApproval": True, "localId": row["local_id"]}
+    return _run_db_write_sync("offline_pending_insert", write, durable=True)
+
+
+def list_offline_pending_actions(*, limit: int = 200, decrypt: bool = True) -> List[Dict[str, Any]]:
+    from shared.auth_state import unprotect_auth_token
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM offline_pending_actions ORDER BY created_at, rowid LIMIT ?",
+                                            (max(1, int(limit)),)).fetchall()]
+    for row in rows:
+        protected = row.pop("payload_json", None)
+        if decrypt:
+            raw = unprotect_auth_token(protected or "")
+            if not raw:
+                raise RuntimeError("Impossible de déchiffrer une modification hors ligne")
+            row["payload"] = json.loads(raw)
+    return rows
+
+
+def offline_pending_status() -> Dict[str, Any]:
+    with get_conn() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM offline_pending_actions").fetchone()[0]
+        error = conn.execute("SELECT last_error FROM offline_pending_actions WHERE last_error IS NOT NULL "
+                             "ORDER BY created_at DESC LIMIT 1").fetchone()
+    return {"count": count, "lastError": error[0] if error else None}
+
+
+def finish_offline_pending_upload(accepted: List[str], rejected: Dict[str, str], *, receipts: Dict[str, Any] | None = None) -> None:
+    def write(conn, _profile):
+        saved = conn.execute("SELECT value_json FROM v2_kv WHERE key = 'offline_action_receipts'").fetchone()
+        references = json.loads(saved[0]) if saved else {}
+        for local_id in accepted:
+            row = conn.execute("SELECT category, local_day FROM offline_pending_actions WHERE local_id = ?", (local_id,)).fetchone()
+            if not row:
+                continue
+            if receipts and local_id in receipts:
+                references[local_id] = receipts[local_id]
+            key = "offline_uploaded_usage:" + row["local_day"]
+            receipt = conn.execute("SELECT value_json FROM v2_kv WHERE key = ?", (key,)).fetchone()
+            usage = json.loads(receipt[0]) if receipt else {}
+            usage[row["category"]] = usage.get(row["category"], 0) + 1
+            usage.setdefault("_localIds", []).append(local_id)
+            conn.execute("INSERT INTO v2_kv (key, value_json, updated_at) VALUES (?, ?, ?) "
+                         "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+                         (key, json.dumps(usage), time.time()))
+            conn.execute("DELETE FROM offline_pending_actions WHERE local_id = ?", (local_id,))
+        if accepted:
+            conn.execute("INSERT INTO v2_kv (key, value_json, updated_at) VALUES ('offline_action_receipts', ?, ?) "
+                         "ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+                         (json.dumps(references), time.time()))
+        for local_id, reason in rejected.items():
+            conn.execute("UPDATE offline_pending_actions SET attempts = attempts + 1, last_error = ? WHERE local_id = ?",
+                         (reason, local_id))
+    _run_db_write_sync("offline_pending_upload", write, durable=True)
+
+
+def retire_offline_action_receipts(local_ids: List[str]) -> None:
+    def write(conn, _profile):
+        saved = conn.execute("SELECT value_json FROM v2_kv WHERE key = 'offline_action_receipts'").fetchone()
+        references = json.loads(saved[0]) if saved else {}
+        for local_id in local_ids:
+            references.pop(local_id, None)
+        conn.execute("UPDATE v2_kv SET value_json = ?, updated_at = ? WHERE key = 'offline_action_receipts'",
+                     (json.dumps(references), time.time()))
+    _run_db_write_sync("offline_receipts_retire", write, durable=True)
 
 
 def _synthetic_negative_id(local_id: str, salt: str) -> int:

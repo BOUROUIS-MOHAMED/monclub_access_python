@@ -13,6 +13,14 @@ export function staffTime(value?: string | null) {
 
 export function staffPermissionHint(staff: StaffBlock | undefined, permission: string, label: string): string {
   if (!staff?.enabled) return "";
+  if (staff.offline?.active) {
+    if (!["DRIVER", "ALL_TURNSTILES"].includes(staff.offline.role)) return "Hors ligne : utilisez le PC pilote pour les modifications.";
+    if (!staff.offline.unlocked) return "Déverrouillez le mode hors ligne pour utiliser cette action.";
+    const actor = staff.allowedAgents.find((person) => person.id === staff.offline?.actAs?.id);
+    if (!actor) return "Choisissez la personne au nom de laquelle agir.";
+    if (actor.adminAgent || ["ACTIVE_MEMBERSHIP_MANAGEMENT", permission].every((p) => actor.permissions?.includes(p))) return "";
+    return `${actor.name} n'a pas la permission « ${label} »`;
+  }
   if (!staff.agent) return "Connectez-vous au tableau de bord pour utiliser cette action";
   if (staff.agent.adminAgent || ["ACTIVE_MEMBERSHIP_MANAGEMENT", permission].every((p) => staff.permissions.includes(p))) return "";
   return `${staff.agent.name} n'a pas la permission « ${label} »`;
@@ -31,6 +39,9 @@ export function staffError(error: unknown): string {
     if (error.code === "NO_AGENT") return "Connectez-vous au tableau de bord pour utiliser cette action.";
     if (error.code === "MISSING_PERMISSION") return "L'agent actuel n'a pas la permission d'utiliser cette action.";
     if (error.code === "OFFLINE") return String(error.payload?.error || "Internet requis pour cette action.");
+    if (error.code === "OFFLINE_LOCKED") return "Internet indisponible – passez en mode hors ligne";
+    if (error.code === "READER_OFFLINE") return "Hors ligne : utilisez le PC pilote pour les modifications.";
+    if (error.code === "LIMIT_REACHED") return "Limite atteinte pour aujourd'hui. Utilisez le tableau de bord pour continuer. La porte s'ouvre toujours.";
     const body = error.payload;
     const message = body?.errorMsg || body?.message || body?.error;
     if (typeof message === "string") return message;
@@ -44,7 +55,7 @@ export function staffResultUnknown(error: unknown): boolean {
 }
 
 export default function StaffChip({ staff }: { staff?: StaffBlock }) {
-  if (!staff?.enabled) return null;
+  if (!staff?.enabled || staff.offline?.active) return null;
   const current = staff.agent;
   return (
     <DropdownMenu>

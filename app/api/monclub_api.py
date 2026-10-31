@@ -172,6 +172,18 @@ class MonClubApi:
                                       body=response.text)
         return response.json()
 
+    def upload_offline_actions(self, token: str, events: list[dict]) -> dict:
+        from app.core.app_const import OFFLINE_ACTIONS_BULK_PATH
+        response = self._session.post(self._derive_api_base() + OFFLINE_ACTIONS_BULK_PATH, json=events,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}, timeout=25)
+        if not 200 <= response.status_code < 300:
+            raise MonClubApiHttpError("offline upload refused", status_code=response.status_code)
+        return response.json()
+
+    def list_offline_actions(self, token: str, page: int = 0) -> dict:
+        return self._lifecycle_request(method="POST", url=self._derive_api_base() + "/manager/gym/access-offline/list",
+                                       token=token, payload={"page": page, "size": 200})
+
     def renew_quote(self, token: str, payload: dict) -> dict:
         from app.core.app_const import STAFF_RENEW_QUOTE_PATH
         return self._lifecycle_request(method="POST", url=self._derive_api_base() + STAFF_RENEW_QUOTE_PATH,

@@ -50,9 +50,15 @@ type StaffPaymentDetails = {
   terms: { authoritative: boolean; terms: { termId: number; seq: number; planTitle: string; price: number; payedPrice: number; remainingPaymentDueDate?: string | null; debtState: string }[] };
 };
 
-export default function PayRestDialog({ member, staff, onClose, onSuccess }: {
+type PayRestDialogProps = {
   member: StaffMember; staff?: StaffBlock; onClose: () => void; onSuccess: () => void;
-}) {
+};
+
+export default function PayRestDialog(props: PayRestDialogProps) {
+  return <PaymentDialog key={props.staff?.enabled && props.staff.offline?.active ? "offline" : "online"} {...props} />;
+}
+
+function PaymentDialog({ member, staff, onClose, onSuccess }: PayRestDialogProps) {
   const [details, setDetails] = useState<StaffPaymentDetails | null>(null);
   const [termId, setTermId] = useState<number | null>(null);
   const [amount, setAmount] = useState("");
@@ -62,8 +68,10 @@ export default function PayRestDialog({ member, staff, onClose, onSuccess }: {
   const [resultUnknown, setResultUnknown] = useState(false);
   const [error, setError] = useState("");
   const [requestId] = useState(() => crypto.randomUUID());
+  const offline = !!staff?.enabled && !!staff.offline?.active;
   const hint = staff?.enabled ? staffPermissionHint(staff, "ACTIVE_MEMBERSHIP_PAY_REMAINING", "Payer le reste") : "La connexion du personnel est désactivée.";
   useEffect(() => {
+    if (offline) return;
     let active = true;
     post<StaffPaymentDetails>("/members/pay-rest/details", { activeMembershipId: Number(member.activeMembershipId) }, 60_000)
       .then((data) => {
@@ -76,12 +84,12 @@ export default function PayRestDialog({ member, staff, onClose, onSuccess }: {
         setDueDate(first?.remainingPaymentDueDate || data.membership.remainingPaymentDueDate || "");
       }).catch((e) => { if (active) setError(staffError(e)); });
     return () => { active = false; };
-  }, [member.activeMembershipId]);
+  }, [member.activeMembershipId, offline]);
   const terms = details?.terms.authoritative ? details.terms.terms.filter((t) => !["FORGIVEN", "VOID"].includes(t.debtState) && Number(t.price) > Number(t.payedPrice)).sort((a, b) => a.seq - b.seq) : [];
   const term = terms.find((t) => t.termId === termId);
   const remaining = details ? (details.terms.authoritative ? (term ? staffRemaining(term.price, term.payedPrice) : 0) : staffRemaining(details.membership.price, details.membership.payedPrice)) : null;
   const numericAmount = Number(amount);
-  const valid = !resultUnknown && !hint && remaining !== null && amount !== "" && Number.isFinite(numericAmount) && numericAmount > 0 && numericAmount <= remaining && numericAmount === Math.round(numericAmount * 1000) / 1000 && staffPaymentValid(payment);
+  const valid = !resultUnknown && !hint && (offline || remaining !== null) && amount !== "" && Number.isFinite(numericAmount) && numericAmount > 0 && (offline || numericAmount <= (remaining ?? 0)) && numericAmount === Math.round(numericAmount * 1000) / 1000 && staffPaymentValid(payment);
   const submit = async () => {
     if (!valid || busy) return;
     setBusy(true); setError("");
@@ -89,13 +97,13 @@ export default function PayRestDialog({ member, staff, onClose, onSuccess }: {
       await post("/members/pay-rest", { activeMembershipId: Number(member.activeMembershipId), amount: numericAmount,
         ...staffPaymentPayload(payment), remainingPaymentDueDate: dueDate || null, termId,
         clientRequestId: requestId }, 60_000);
-      showStaffToast(`${staffMoney(numericAmount)} DT encaissés pour ${member.fullName}`, `Fait par ${staff?.agent?.name || ""}`);
+      showStaffToast(offline ? "Paiement enregistré pour validation" : `${staffMoney(numericAmount)} DT encaissés pour ${member.fullName}`, offline ? `${member.fullName} · ${staffMoney(numericAmount)} DT` : `Fait par ${staff?.agent?.name || ""}`);
       onSuccess(); onClose();
     } catch (e) { setError(staffError(e)); setResultUnknown(staffResultUnknown(e)); } finally { setBusy(false); }
   };
   return <DialogFrame open onOpenChange={(open) => { if (!open && !busy) onClose(); }} title="Payer le reste" sub={member.fullName} width={500} lockOutside
-    footer={<><span className="mr-auto text-[12.5px] text-muted-foreground">Fait par {staff?.agent?.name}</span><ActionButton onClick={onClose} disabled={busy}>Annuler</ActionButton><ActionButton kind="primary" disabled={!valid || busy} onClick={() => void submit()}>{busy ? "Paiement…" : `Payer · ${staffMoney(numericAmount || 0)} DT`}</ActionButton></>}>
-    <div className="text-[14px] font-semibold">Reste à payer : {remaining === null ? "Chargement…" : `${staffMoney(remaining)} DT`}</div>
+    footer={<><span className="mr-auto text-[12.5px] text-muted-foreground">{offline ? `Argent : ${Math.max(0, (staff?.offline?.limits.money.max ?? 0) - (staff?.offline?.limits.money.used ?? 0))} restantes` : `Fait par ${staff?.agent?.name}`}</span><ActionButton onClick={onClose} disabled={busy}>Annuler</ActionButton><ActionButton kind="primary" disabled={!valid || busy} onClick={() => void submit()}>{busy ? "Paiement…" : `${offline ? "Enregistrer pour validation" : "Payer"} · ${staffMoney(numericAmount || 0)} DT`}</ActionButton></>}>
+    {offline ? <Note tone="warning">Hors ligne : indiquez le montant reçu. Le solde sera vérifié à la validation dans le tableau de bord.</Note> : <div className="text-[14px] font-semibold">Reste à payer : {remaining === null ? "Chargement…" : `${staffMoney(remaining)} DT`}</div>}
     {remaining === 0 && <Note tone="success" className="mt-3">Aucun reste à payer.</Note>}
     <FieldGrid>
       {terms.length > 1 && <FormField label="Vente à régler" full><Select disabled={busy} value={String(termId)} onValueChange={(id) => { const selected = terms.find((t) => t.termId === Number(id)); setTermId(Number(id)); if (selected) { setAmount(String(staffRemaining(selected.price, selected.payedPrice))); setDueDate(selected.remainingPaymentDueDate || ""); } }}><FieldSelectTrigger><SelectValue /></FieldSelectTrigger><SelectContent>{terms.map((t) => <SelectItem key={t.termId} value={String(t.termId)}>Vente {t.seq} · {t.planTitle} · {staffMoney(staffRemaining(t.price, t.payedPrice))} DT</SelectItem>)}</SelectContent></Select></FormField>}

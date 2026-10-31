@@ -36,6 +36,7 @@ type Props = {
   errorMsg?: string;
   timedOut?: boolean;
   retryAvailable?: boolean;
+  pendingApproval?: boolean;
   onCancel: () => void;
   onDismiss: () => void;
   onRetryPush?: () => void;
@@ -57,6 +58,7 @@ export default function EnrollOverlay({
   errorMsg,
   timedOut,
   retryAvailable,
+  pendingApproval,
   onCancel,
   onDismiss,
   onRetryPush,
@@ -107,7 +109,7 @@ export default function EnrollOverlay({
         <AnimationWithFallback phase={phase} />
 
         {/* Title + instruction */}
-        <PhaseText phase={phase} errorMsg={errorMsg} />
+        <PhaseText phase={phase} errorMsg={errorMsg} pendingApproval={pendingApproval} />
 
         {/* Timeout warning */}
         {timedOut && (
@@ -273,11 +275,15 @@ const TITLE_COLOR: Partial<Record<EnrollPhase, string>> = {
 function PhaseText({
   phase,
   errorMsg,
+  pendingApproval,
 }: {
   phase: EnrollPhase;
   errorMsg?: string;
+  pendingApproval?: boolean;
 }) {
-  const { title, instruction } = PHASE_COPY[phase] ?? PHASE_COPY.idle;
+  const { title, instruction } = phase === "success" && pendingApproval
+    ? { title: "Empreinte enregistrée pour validation", instruction: "Elle sera transmise au tourniquet après validation dans le tableau de bord." }
+    : PHASE_COPY[phase] ?? PHASE_COPY.idle;
   const effectiveInstruction =
     phase === "failed" ? errorMsg || "Une erreur est survenue" : instruction;
 

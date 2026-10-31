@@ -807,6 +807,64 @@ def invalidate_staff_status() -> None:
         _status_payload_cache = (0, None, None)
 
 
+def _staff_status(app) -> dict:
+    staff = app.staff_session
+    return {**staff.snapshot(), "offline": staff.offline_session.status()}
+
+
+def _handle_offline_control(ctx: _Ctx, action: str) -> None:
+    staff = getattr(ctx.app, "staff_session", None)
+    if not staff or not staff.snapshot()["enabled"]:
+        ctx.send_json(403, {"ok": False, "code": "STAFF_DISABLED"})
+        return
+    body = ctx.body() or {}
+    session = staff.offline_session
+    if action == "manual":
+        if not isinstance(body.get("on"), bool):
+            ctx.send_json(400, {"ok": False, "error": "on must be boolean"})
+            return
+        staff.offline_detector.set_manual(body["on"])
+        session.relock()
+        result = {"ok": True}
+    elif action == "lock":
+        session.relock()
+        result = {"ok": True}
+    else:
+        if not staff.offline_detector.state()["offline"]:
+            ctx.send_json(409, {"ok": False, "code": "NOT_OFFLINE"})
+            return
+        if session.status()["role"] not in ("DRIVER", "ALL_TURNSTILES"):
+            ctx.send_json(409, {"ok": False, "code": "READER_OFFLINE"})
+            return
+        if action == "unlock":
+            result = session.unlock(body.get("code"))
+        else:
+            try:
+                agent_id = int(body.get("agentId"))
+            except (TypeError, ValueError):
+                ctx.send_json(400, {"ok": False, "code": "NO_AGENT"})
+                return
+            result = session.act_as(agent_id)
+    invalidate_staff_status()
+    ctx.send_json(200 if result["ok"] else 409, result)
+
+
+def _handle_offline_unlock(ctx: _Ctx) -> None:
+    _handle_offline_control(ctx, "unlock")
+
+
+def _handle_offline_act_as(ctx: _Ctx) -> None:
+    _handle_offline_control(ctx, "act-as")
+
+
+def _handle_offline_lock(ctx: _Ctx) -> None:
+    _handle_offline_control(ctx, "lock")
+
+
+def _handle_offline_manual(ctx: _Ctx) -> None:
+    _handle_offline_control(ctx, "manual")
+
+
 def _pc_drives_ultra_turnstiles(mode: Any) -> bool:
     """Whether this PC is meant to connect to at least one ULTRA turnstile.
 
@@ -999,7 +1057,7 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
         "ultra": ultra,
         "updates": updates,
         "popup": popup,
-        "staff": app.staff_session.snapshot() if getattr(app, "staff_session", None) else {
+        "staff": _staff_status(app) if getattr(app, "staff_session", None) else {
             "enabled": False, "agent": None, "allowedAgents": [], "permissions": [],
             "changedAt": None, "previousAgentName": None,
         },
@@ -2065,14 +2123,33 @@ def _handle_members_roster(ctx: _Ctx) -> None:
     limit = ctx.q_int("limit", default=25)
     offset = ctx.q_int("offset", default=0)
 
+    from app.core.offline_actions import staff_enabled, pending_members, uploaded_receipts
+    approval = staff_enabled(ctx.app)
     rows, total, counts = list_members_roster(
-        q=q,
-        status=status,
-        limit=limit,
-        offset=offset,
+        q="" if approval else q,
+        status="all" if approval else status,
+        limit=100000 if approval else limit,
+        offset=0 if approval else offset,
         sort_by=sort_by,
         sort_dir=sort_dir,
     )
+    if approval:
+        from app.core.db import list_offline_pending_actions
+        pending = list_offline_pending_actions(limit=100000, decrypt=False)
+        targets = {r["target_active_membership_id"] for r in pending + uploaded_receipts()}
+        for row in rows:
+            row["approvalPending"] = row.get("activeMembershipId") in targets
+        rows += pending_members()
+        counts = {key: sum(1 for r in rows if key == "all" or r.get("status") == key)
+                  for key in ("all", "active", "expired", "pending")}
+        counts["held"] = sum(1 for r in rows if r.get("heldReason"))
+        rows = [r for r in rows if (status == "all" or r.get("status") == status) and
+                (not q or any(q.lower() in str(r.get(k) or "").lower() for k in
+                              ("fullName", "phone", "email", "accountUsernameId", "firstCardId", "secondCardId", "membershipTitle")))]
+        key = {"validTo": "validTo", "membership": "membershipTitle", "status": "status"}.get(sort_by, "fullName")
+        rows.sort(key=lambda r: str(r.get(key) or "").lower(), reverse=sort_dir == "desc")
+        total = len(rows)
+        rows = rows[max(0, offset):max(0, offset) + max(1, limit)]
     ctx.send_json(200, {
         "ok": True,
         "rows": rows,
@@ -2170,6 +2247,10 @@ def _handle_member_photo(ctx: _Ctx) -> None:
     """Attach a member photo. For a SYNCED member (real activeMembershipId) it uploads
     immediately via the managed-media presign flow; for an OFFLINE-PENDING member
     (offlinePendingLocalId) it stores the photo and defers the upload until reconcile."""
+    from app.core.offline_actions import check_offline, staff_enabled
+    if check_offline(ctx.app, "PHOTO") is not None:
+        ctx.send_json(409, {"ok": False, "code": "OFFLINE_UNSUPPORTED", "error": "La photo nécessite internet"})
+        return
     if not _staff_require(ctx, "ACTIVE_MEMBERSHIP_UPDATE"):
         return
     body = ctx.body()
@@ -2182,6 +2263,9 @@ def _handle_member_photo(ctx: _Ctx) -> None:
     content_type = _safe_str(body.get("contentType") or body.get("content_type"), "image/jpeg")
     file_name = _safe_str(body.get("fileName") or body.get("file_name"), "member.jpg")
     local_id = _safe_str(body.get("offlinePendingLocalId") or body.get("localId") or body.get("local_id"), "").strip()
+    if local_id and staff_enabled(ctx.app):
+        ctx.send_json(409, {"ok": False, "code": "OFFLINE_UNSUPPORTED", "error": "La photo nécessite un membre validé"})
+        return
     am_raw = body.get("activeMembershipId")
     if am_raw is None:
         am_raw = body.get("active_membership_id")
@@ -3669,6 +3753,10 @@ def _handle_offline_creation_get(ctx: _Ctx) -> None:
 
 
 def _handle_offline_creation_attempt(ctx: _Ctx) -> None:
+    body = ctx.body()
+    if _offline_action(ctx, "CREATE", {"creationKind": body.get("creationKind") or body.get("creation_kind") or "membership_only",
+                                        "body": _queue_payload_from_body(body)}):
+        return
     if not _staff_require(ctx, "ACTIVE_MEMBERSHIP_CREATION"):
         return
     body = ctx.body()
@@ -3688,6 +3776,14 @@ def _handle_offline_creation_attempt(ctx: _Ctx) -> None:
 
 
 def _handle_offline_creation_queue(ctx: _Ctx) -> None:
+    body = ctx.body()
+    if _offline_action(ctx, "CREATE", {"creationKind": body.get("creationKind") or body.get("creation_kind") or "membership_only",
+                                        "body": _queue_payload_from_body(body)}):
+        return
+    from app.core.offline_actions import staff_enabled, locked_result
+    if staff_enabled(ctx.app):
+        ctx.send_json(409, locked_result())
+        return
     if not _staff_require(ctx, "ACTIVE_MEMBERSHIP_CREATION"):
         return
     body = ctx.body()
@@ -3774,6 +3870,10 @@ def _handle_offline_creation_cancel(ctx: _Ctx) -> None:
 
 
 def _handle_offline_creation_duplicate(ctx: _Ctx) -> None:
+    from app.core.offline_actions import staff_enabled, locked_result
+    if staff_enabled(ctx.app):
+        ctx.send_json(409, locked_result())
+        return
     from access.store import duplicate_offline_creation
 
     local_id = ctx.param("localId")
@@ -3833,6 +3933,20 @@ _STAFF_MUTATION_PERMISSIONS = {
 }
 
 
+def _offline_action(ctx: _Ctx, kind: str, payload: dict, *, target_id=None, depends_on=None) -> bool:
+    from app.core.offline_actions import record_if_offline
+    try:
+        result = record_if_offline(ctx.app, kind, payload, target_id=target_id, depends_on=depends_on)
+    except Exception:
+        ctx.send_json(400, {"ok": False, "error": "Impossible d'enregistrer la modification hors ligne"})
+        return True
+    if result is None:
+        return False
+    status = 200 if result.get("ok") else 403 if result.get("code") in ("MISSING_PERMISSION", "NO_AGENT") else 409
+    ctx.send_json(status, result)
+    return True
+
+
 def _staff_require(ctx: _Ctx, permission: str, *, switch_required: bool = False) -> bool:
     staff = getattr(ctx.app, "staff_session", None)
     if switch_required and (not staff or not staff.snapshot()["enabled"]):
@@ -3856,6 +3970,15 @@ def _staff_activity(app) -> None:
 
 
 def _staff_online_action(ctx: _Ctx, method: str, permission: str) -> None:
+    payload = ctx.body()
+    from app.core.offline_actions import check_offline
+    if method in ("renew", "pay_rest"):
+        if _offline_action(ctx, "RENEW" if method == "renew" else "PAY_REST", payload,
+                           target_id=payload.get("activeMembershipId")):
+            return
+    elif check_offline(ctx.app, "RENEW" if method == "renew_quote" else "PAY_REST") is not None:
+        ctx.send_json(409, {"ok": False, "code": "OFFLINE", "error": "Ces informations nécessitent internet"})
+        return
     if not _staff_require(ctx, permission, switch_required=True):
         return
     from access.store import load_auth_token
@@ -3879,7 +4002,12 @@ def _staff_online_action(ctx: _Ctx, method: str, permission: str) -> None:
             error = {"ok": False, "error": str(exc)}
         ctx.send_json(exc.status_code, error)
         return
-    except MonClubApiError:
+    except MonClubApiError as exc:
+        from app.core.offline_mode import is_network_error
+        if is_network_error(exc):
+            from app.core.offline_actions import locked_result
+            ctx.send_json(409, locked_result())
+            return
         ctx.send_json(503, {"code": "OFFLINE", "error": "Internet requis pour renouveler" if method not in ("pay_rest", "staff_payment_details")
                            else "Internet requis pour payer le reste"})
         return
@@ -3916,6 +4044,11 @@ def _handle_member_mutation(ctx: _Ctx) -> None:
     Always replies HTTP 200 with an outcome (ok/queued/conflict/needsFix) so the UI decides."""
     body = ctx.body()
     op_kind = _safe_str(body.get("opKind") or body.get("op_kind"), "").strip().lower()
+    from app.core.offline_actions import MUTATION_KINDS
+    if _offline_action(ctx, MUTATION_KINDS.get(op_kind, op_kind.upper()), body.get("payload") or {},
+                       target_id=body.get("targetId", body.get("target_id")),
+                       depends_on=body.get("dependsOnLocalId") or body.get("depends_on_local_id")):
+        return
     permission = _STAFF_MUTATION_PERMISSIONS.get(op_kind)
     if permission and not _staff_require(ctx, permission):
         return
@@ -6357,6 +6490,16 @@ def _enroll_set_phase(data: Dict[str, Any]) -> None:
 
 
 def _handle_enroll_start(ctx: _Ctx) -> None:
+    from app.core.offline_actions import check_offline
+    check = check_offline(ctx.app, "FINGERPRINT")
+    if check is not None:
+        if not check["ok"]:
+            ctx.send_json(409, check)
+            return
+        limit = ctx.app.staff_session.offline_session.limits()["door"]
+        if limit["used"] >= limit["max"]:
+            ctx.send_json(409, {"ok": False, "code": "LIMIT_REACHED", "category": "DOOR", **limit})
+            return
     if not _staff_require(ctx, "ACTIVE_MEMBERSHIP_FINGERPRINTS"):
         return
     body = ctx.body()
@@ -6500,6 +6643,15 @@ def _handle_enroll_retry_push(ctx: _Ctx) -> None:
             staff = getattr(_app_ref, "staff_session", None)
             if staff and not staff.has_permission("ACTIVE_MEMBERSHIP_MANAGEMENT", "ACTIVE_MEMBERSHIP_FINGERPRINTS"):
                 raise RuntimeError("Permission d'enrôlement retirée")
+            from app.core.offline_actions import record_if_offline
+            pending = record_if_offline(_app_ref, "FINGERPRINT", payload, target_id=payload["activeMembershipId"])
+            if pending is not None:
+                if not pending.get("ok"):
+                    raise RuntimeError(pending.get("code"))
+                _enroll_add_log("Empreinte enregistrée pour validation dans le tableau de bord.")
+                _enroll_set_result("success")
+                _enroll_clear_tpl()
+                return
             resp = api.create_user_fingerprint(token=_token_snapshot, payload=payload)
             _staff_activity(_app_ref)
             _enroll_add_log(f"Push OK: {resp}")
@@ -6643,6 +6795,10 @@ def _handle_fingerprints_list(ctx: _Ctx) -> None:
 
 
 def _handle_fingerprints_delete(ctx: _Ctx) -> None:
+    from app.core.offline_actions import check_offline
+    if check_offline(ctx.app, "FINGERPRINT_DELETE") is not None:
+        ctx.send_json(409, {"ok": False, "code": "OFFLINE_UNSUPPORTED", "error": "La suppression d'empreinte nécessite internet"})
+        return
     if not _staff_require(ctx, "ACTIVE_MEMBERSHIP_FINGERPRINTS"):
         return
     fp_id = ctx.param_int("id")

@@ -5305,6 +5305,26 @@ path; it does not enable the offline money queue. `[CODE]`
 
 ### 3.14a Staff login, online renewal and force-opens (1.5.0)
 
+The staff poll feeds `offline_mode.py::OfflineDetector`: four consecutive transport
+failures enter automatic offline mode; two successful staff snapshots leave it. HTTP
+4xx/5xx never count as transport failures and break both streaks. A separate manual
+override keeps offline mode on while the backend is reachable. `/status.staff.offline`
+exposes this state only as active for staff-login gyms. It does not gate or change
+door-open calls or turnstile connections. `[CODE; TEST: tests/test_offline_mode.py]`
+
+`offline_session.py::OfflineSession` verifies the cached PBKDF2-SHA256 code locally
+(210000 iterations, 16-byte salt, 32-byte hash). Its verifier is DPAPI-protected in
+`v2_kv.staff_session.offline`, excluded from public snapshots. Five wrong attempts
+persist a five-minute lock in `v2_kv.offline_unlock`; restarting cannot reset it.
+Unlock and the selected staff member are memory-only; leaving offline mode, logout,
+changing the offline config or « Changer » relocks. Offline permissions come from
+the selected `allowedAgents` row, with the admin override. The four `/offline/*`
+controls require staff login; unlock/act-as also require a DRIVER/ALL_TURNSTILES
+lease. Limits use the gym date (server clock/offset, PC local date before that is
+known) and this installation's pending counts plus uploaded daily usage receipts
+(counts and processed local IDs, without payloads).
+`[CODE; TEST: tests/test_offline_session.py]`
+
 `app/core/staff_session.py::StaffSession` polls `/manager/gym/access/v1/staff/current`
 every 10 s on a daemon thread (`app.py::_staff_tick`). The snapshot and DPAPI-protected
 Access-scoped token are stored in `v2_kv.staff_session`; every API client made by `App._api`
@@ -5314,15 +5334,68 @@ no staff cookie, no staff UI and no new permission refusal on existing actions. 
 `[TEST: tests/test_staff_session.py]`
 
 With the switch on, the local API checks MANAGEMENT plus the action's own permission for
-create, edit, freeze, delete, photo and fingerprint capture/save/delete. New online-only
-`/members/renew/quote`, `/members/renew`, `/members/pay-rest` routes bypass the offline queues
-and money gate. The dialogs use backend-computed quotes, debt choices (including term IDs,
+create, edit, freeze, delete, photo and fingerprint capture/save/delete. Online
+`/members/renew/quote`, `/members/renew`, `/members/pay-rest` routes bypass the legacy queues
+and money gate. Online dialogs use backend-computed quotes, debt choices (including term IDs,
 totals seen and kept due dates), and door/start-inside-period confirmations. Pay-rest reads
 live membership and terms via `/members/pay-rest/details`, because the local roster has no
 balance. Real successful staff actions send a background activity ping at most once/minute;
 polls, quotes and queue drains do not count as activity. Existing offline edit/freeze/delete/
-creation queues retain their automatic upload behaviour and use staff current at send time.
+creation queues retain their automatic upload behaviour and use staff current at send time;
+from release 2a, new actions in staff-login gyms never feed those queues. Staff-login OFF
+keeps the old paths unchanged.
 `[CODE; TEST: tests/test_staff_gate.py]`
+
+Release 2a (`offline_actions.py`, `db.py::insert_offline_pending_action`): an unlocked
+DRIVER/ALL_TURNSTILES PC records CREATE, RENEW, PAY_REST, EDIT, FREEZE, FREEZE_CANCEL,
+DELETE and FINGERPRINT as approval requests. Payloads use the online DTOs (shared fixtures
+in `tests/fixtures/offline_actions`), are DPAPI-protected, and are never inserted into
+`sync_users`, the credential cache or the old queues. Capturing a fingerprint returns
+before backend save, member sync or device push. A card-only EDIT (cards supplied, no
+date/note supplied) consumes DOOR like the backend; other edits consume MONEY. Mixed
+card/date edits consume MONEY. No fingerprint/card/new-member change takes effect at
+the turnstile before approval. Photos and fingerprint deletion require internet.
+The member roster API alone adds pending CREATE projections and pending markers; device
+engines never receive these projections. Dependent actions carry the CREATE local ID
+and no target membership ID. `[CODE; TEST: tests/test_offline_actions.py]`
+
+`App._staff_tick` uploads at most 200 actions after a successful online poll, including
+manual offline mode. Manual actions also request an immediate background upload. Failed
+uploads and rejected rows stay locally with an error; accepted/duplicate rows are deleted
+in the same SQLite transaction that retains their daily counts and local IDs in `v2_kv`.
+Thus upload cannot reset the limit; payload secrets are removed on acceptance. The
+limit is also checked inside the DB writer transaction. `lastUpload` reports recovery
+uploads for the UI toast. The backend bulk stores PENDING requests; upload does not
+apply them. Real backend interoperability is `[UNVERIFIED]`.
+`[CODE; TEST: tests/test_offline_actions.py]`
+
+An uploaded action retains only a template-free receipt in
+`v2_kv.offline_action_receipts`: its IDs and, for CREATE, the roster display fields.
+This preserves the synthetic member ID for later dependencies after the encrypted row
+is deleted. On successful staff polls with an online staff cookie, the desk reads one
+page of the existing offline list contract (200 rows, advancing while `hasNext`) and
+retires APPLIED/REFUSED receipts. No cookie/list failure leaves the receipt intact;
+no decision is inferred from a time limit. `[CODE; TEST:
+tests/test_offline_actions.py::test_uploaded_create_keeps_dependency_reference_without_secrets,
+::test_server_decision_retires_uploaded_marker]`
+
+`tauri-ui/src/components/OfflineMode.tsx` renders the manual switch, offline staff chip,
+unlock/act-as/rules/limit dialogs and reader notice. Rules open on each new offline
+period; the banner explicitly limits continued door/card/fingerprint operation to
+data already on the turnstile. Controls refresh status after requests, including
+wrong-code/lock answers; the act-as picker uses the local API's unlock state.
+The recovery toast is emitted only for a new upload observed while the UI is open.
+`RenewDialog` skips all quotes offline and defers dates, debt and door questions to
+approval; `PayRestDialog` accepts an amount without a live
+balance and defers its check. Changing mode remounts payment forms so an online balance
+or term choice cannot leak into the offline form. `UsersPage` shows pending markers
+and uses approval copy for saved actions; a newly created pending member may receive dependent edits or
+fingerprints without joining the device roster. `EnrollPage`, `EnrollOverlay` and the
+member's enrolment dialog recognize the worker's exact approval-saved log line
+(`Empreinte enregistrée pour validation dans le tableau de bord.`); their successful
+offline result reports approval pending and never shows the online transmission panel,
+even if connectivity changes before the result is displayed. `[CODE; validation: npm run typecheck;
+visual/runtime/hardware verification UNVERIFIED]`
 
 Every gym records confirmed local operator opens in `staff_force_open_events` (UUID, device,
 door, local time and current staff ID or null). The ULTRA, AGENT and PullSDK connection paths
