@@ -22,6 +22,7 @@ _API_V1: str = f"{MONCLUB_BASE_URL}/api/v1"
 # ── Access / shared endpoints ─────────────────────────────────────────────────
 API_LOGIN_URL: str = f"{_API_V1}/public/access/v1/gym/login"
 API_SYNC_URL: str = f"{_API_V1}/manager/gym/access/v1/users/get_gym_users"
+API_REFUSED_DIRECTORY_URL: str = f"{_API_V1}/manager/gym/access/v1/users/refused_directory"
 API_CREATE_USER_FINGERPRINT_URL: str = f"{_API_V1}/manager/userFingerprint/create"
 API_REPORT_FINGERPRINT_PUSH_RESULT_URL: str = f"{_API_V1}/manager/userFingerprint/reportPushResult"
 API_ACCESS_CREATE_MEMBERSHIP_URL: str = f"{_API_V1}/manager/gym/access/v1/activeMembership/create"

@@ -54,6 +54,7 @@ from app.core import desk_alerts as _desk_alerts
 from app.core import removal_requests as _removal_requests
 from app.core.ultra_pc_entry import PcEntryMixin, _scan_mode_for_event, _uid_for_alert
 from app.core import ultra_worker_pool as _worker_pool
+from app.core import refused_info
 
 logger = logging.getLogger("zkapp")
 
@@ -6904,27 +6905,45 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                 f"user={user_name!r} totp_failures={self._totp_failures}"
             )
 
-        self._enqueue_notification(
-            event_id=event_id,
-            allowed=allowed,
-            reason=reason,
-            scan_mode="QR_TOTP",
-            user_full_name=user_name,
-            user_image=user_image,
-            user_membership_id=user_membership_id,
-            user_membership_plan_id=(user.get("membershipId") if isinstance(user, dict) else None),
-            user_phone=user_phone,
-            user_valid_from=user_valid_from,
-            user_valid_to=user_valid_to,
-            user_birthday=(str(user.get("birthday") or "") if isinstance(user, dict) else ""),
-            image_source=image_source,
-            user_image_status=user_image_status,
-            user_profile_image=user_profile_image,
-            user_fees=(user.get("fees") if isinstance(user, dict) else None),
-            # for the frequent-pass visual alert only
-            user_id=_uid_for_alert(user),
-            door_id=door_id,
-        )
+        if not allowed and refused_info.is_enabled():
+            from app.core.ultra_pc_entry import member_popup_fields
+            fields = member_popup_fields(user)
+            popup_reason, reason_date = reason, ""
+            if not user_name:
+                account = refused_info.verification_account(result, creds, totp_index, code)
+                info = refused_info.resolve_account(account, users_by_am=users_by_am,
+                                                    held_index=getattr(self, "_refused_held_index", None),
+                                                    current_reason=reason)
+                if info is not None:
+                    fields.update(info.fields)
+                    # Membership failures use the directory reason; verification failures keep their copy.
+                    if reason in ("DENY_NOT_IN_LOCAL_ROSTER", "DENY_NOT_ALLOWED_TODAY"):
+                        popup_reason, reason_date = info.reason, info.reason_date
+            self._enqueue_notification(event_id=event_id, allowed=False, reason=popup_reason,
+                                       scan_mode="QR_TOTP", refused_display=True, reason_date=reason_date,
+                                       door_id=door_id, **fields)
+        else:
+            self._enqueue_notification(
+                event_id=event_id,
+                allowed=allowed,
+                reason=reason,
+                scan_mode="QR_TOTP",
+                user_full_name=user_name,
+                user_image=user_image,
+                user_membership_id=user_membership_id,
+                user_membership_plan_id=(user.get("membershipId") if isinstance(user, dict) else None),
+                user_phone=user_phone,
+                user_valid_from=user_valid_from,
+                user_valid_to=user_valid_to,
+                user_birthday=(str(user.get("birthday") or "") if isinstance(user, dict) else ""),
+                image_source=image_source,
+                user_image_status=user_image_status,
+                user_profile_image=user_profile_image,
+                user_fees=(user.get("fees") if isinstance(user, dict) else None),
+                # for the frequent-pass visual alert only
+                user_id=_uid_for_alert(user),
+                door_id=door_id,
+            )
         # Persist the resolved member + tag the raw with scanMode so the backend
         # uploader can (a) classify this as QR_CODE and (b) re-resolve the member.
         # A TOTP row's card_no is a rotating token (absent from users_by_card, no
@@ -7040,19 +7059,33 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             f"{self._prefix} rtlog DENY: card={card_no!r} reason=DEVICE_DENIED "
             f"event_type={event_type!r} door={door_id} event_id={event_id}"
         )
-        self._enqueue_notification(
-            event_id=event_id,
-            allowed=False,
-            reason="DEVICE_DENIED",
-            scan_mode=_scan_mode_for_event(raw_row),
-            user_full_name="",
-            user_image="",
-            user_membership_id=None,
-            user_phone="",
-            user_valid_from="",
-            user_valid_to="",
-            user_profile_image="",
-        )
+        info = None
+        if refused_info.is_enabled() and refused_info.is_card_scan(card_no, raw_row):
+            _creds, _users, cards = self._get_cached_local_state()
+            info = refused_info.resolve_card(card_no, users_by_card=cards,
+                                            held_index=getattr(self, "_refused_held_index", None),
+                                            current_reason="DEVICE_DENIED")
+        if info is not None:
+            from app.core.ultra_pc_entry import member_popup_fields
+            fields = member_popup_fields(None)
+            fields.update(info.fields)
+            self._enqueue_notification(event_id=event_id, allowed=False, reason=info.reason,
+                                       scan_mode=_scan_mode_for_event(raw_row), reason_date=info.reason_date,
+                                       refused_display=True, refused_card_no=info.card_no, **fields)
+        else:
+            self._enqueue_notification(
+                event_id=event_id,
+                allowed=False,
+                reason="DEVICE_DENIED",
+                scan_mode=_scan_mode_for_event(raw_row),
+                user_full_name="",
+                user_image="",
+                user_membership_id=None,
+                user_phone="",
+                user_valid_from="",
+                user_valid_to="",
+                user_profile_image="",
+            )
         self._enqueue_history(
             event_id=event_id,
             allowed=False,
@@ -7097,6 +7130,10 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         door_id: Optional[int] = None,
         # Member fees F3c: the member's cached fee lines, for the entry screen only (guide §3.12).
         user_fees: Optional[List[Dict[str, Any]]] = None,
+        user_membership_title: str = "",
+        reason_date: str = "",
+        refused_display: bool = False,
+        refused_card_no: str = "",
     ):
         t0 = time.monotonic()
         # The desk alerts (desk_alerts.py: Windows toast, daily pass alert, repeat-block sound),
@@ -7111,7 +7148,6 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             return
 
         # Resolve membership plan name + type for the scan-popup badge (best-effort).
-        user_membership_title = ""
         user_members_type = ""
         if user_membership_plan_id is not None:
             try:
@@ -7175,6 +7211,9 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                 device_name=self._device_name,
                 allowed=allowed,
                 reason=reason,
+                reason_date=reason_date,
+                refused_display=refused_display,
+                refused_card_no=refused_card_no,
                 scan_mode=scan_mode,
                 image_source=image_source,
                 user_image_status=user_image_status,
@@ -7493,6 +7532,17 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             except Exception:
                 pass
             # Hourly QR roster-check totals (§3.1b); a no-op until due.
+            if refused_info.is_enabled():
+                try:
+                    gen = get_local_state_generation()
+                    if getattr(self, "_refused_held_gen", None) != gen:
+                        self._refused_held_index = refused_info.load_held_index()
+                        self._refused_held_gen = gen
+                except Exception:
+                    logger.warning("Refused held index refresh failed", exc_info=True)
+            else:
+                self._refused_held_index = None
+                self._refused_held_gen = None
             maybe_log_totp_roster_summary()
             # Every tick (≤5s): pre-warm the staff-ids + membership-brief caches
             # HERE on the bg thread (warm connection) so their 60s-TTL/gen DB

@@ -5,18 +5,18 @@
 // popup_duration_sec regardless of other arrivals. New events fill the
 // first free lane; when all lanes are busy the oldest entry is evicted so
 // the freshest scan is always visible. There is no global MIN_SHOW lock
-// and no per-person dedupe — duplicate events are already filtered
-// upstream by the access_history INSERT-OR-IGNORE constraint, so this UI
-// trusts the backend stream.
+// and allowed entries keep their event-ID dedupe. Repeated refused scans
+// collapse by reason and member or card inside the existing dedupe window.
 //
 // The presentation layer is the "Écran d'entrée — direction A" design: one
 // screen-level component (EntryScreen) that shows an idle standby, a single
 // full-field verdict (1 scan), or a wall of verdict fields (2+ scans).
-// All data/lifecycle plumbing below the SOURCE banner is unchanged.
+// The engine marks which refused scans may appear on this screen.
 
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type CSSProperties, type ReactNode } from "react";
 import { getApiBaseUrl, openSSE, get } from "@/api/client";
 import type { PopupEvent } from "@/api/types";
+import { REFUSAL_GLYPHS, REFUSAL_GLYPH_VIEWBOX, type RefusalGlyphName } from "./refusalGlyphs";
 import { LOCAL_API_PREFIX } from "@/config/appConst";
 import { buildPopupImageCandidates, toPopupCachedImageUrl } from "@/lib/popupImages";
 import { feeDueSoonDays, feeLinesView, parseFees, type FeeLine, type FeeLineKind, type PopupFee } from "@/lib/feeAlerts";
@@ -34,13 +34,6 @@ const MAX_LANES = 5;
 const DEFAULT_DURATION_SEC = 5; // TV-friendly default; backend overrides
 const MIN_DURATION_MS = 2500;
 const FADE_OUT_MS = 350;
-
-// Direction A draws the refusal states in full (section 01 of the design calls
-// "Autorisé · Refusé" the two states that are 99% of the day, and rules 1 and 5
-// are both about the refusal). The popup wall nevertheless still shows GRANTED
-// entries for identified members only — unchanged behaviour. Flip this to true
-// to actually surface refusals on the entry screen; nothing else needs editing.
-const SHOW_DENIED_ENTRIES = false;
 
 // ── Types ─────────────────────────────────────────────────────────────────
 interface ActiveLane {
@@ -75,6 +68,9 @@ function toPopupEvent(raw: any): PopupEvent {
     deviceName: String(raw?.deviceName ?? ""),
     allowed: Boolean(raw?.allowed),
     reason: String(raw?.reason ?? ""),
+    reasonDate: String(raw?.reasonDate ?? ""),
+    refusedDisplay: raw?.refusedDisplay === true,
+    refusedCardNo: String(raw?.refusedCardNo ?? ""),
     scanMode: String(raw?.scanMode ?? ""),
     popupDurationSec: Number.isFinite(popupDurationSec) && popupDurationSec > 0 ? popupDurationSec : DEFAULT_DURATION_SEC,
     popupEnabled: raw?.popupEnabled !== false,
@@ -94,6 +90,13 @@ function toPopupEvent(raw: any): PopupEvent {
     fees: parseFees(raw?.fees),
     feeDueSoonDays: feeDueSoonDays(raw?.feeDueSoonDays),
   };
+}
+
+function aDisplayable(evt: PopupEvent): boolean {
+  const knownUser = !!evt.userFullName && evt.userFullName.trim().length > 0;
+  return evt.allowed ? knownUser : evt.refusedDisplay === true && (
+    knownUser || evt.reason === "DENY_NO_CARD_MATCH" || evt.reason === "DENY_CARD_COLLISION"
+  );
 }
 
 function laneIdFor(eventId: string): string {
@@ -182,6 +185,9 @@ interface EntryScan {
   imgUrl: string | null;
   granted: boolean;
   reason: string;
+  reasonDate: string;
+  refusedDisplay: boolean;
+  refusedCardNo: string;
   plan: string | null;
   memberNo: string | null;
   category: ScanCategory;
@@ -261,7 +267,9 @@ function mapLaneToScan(lane: ActiveLane): EntryScan {
   const e = lane.event;
   const title = e.userMembershipTitle && String(e.userMembershipTitle).trim() ? String(e.userMembershipTitle) : null;
   const cat: ScanCategory = A_MEMBERS_TYPE_CAT[String(e.userMembersType || "").toUpperCase()] ?? "standard";
-  const full = e.userFullName || "Membre";
+  const unknownCard = !e.allowed && e.reason === "DENY_NO_CARD_MATCH" && !e.userFullName.trim();
+  const collision = !e.allowed && e.reason === "DENY_CARD_COLLISION" && !e.userFullName.trim();
+  const full = collision ? aDenyCopy(e.reason).short : unknownCard ? "Carte inconnue" : e.userFullName || "Membre";
   const { first, last } = aSplitName(full);
   return {
     laneId: lane.laneId,
@@ -271,6 +279,9 @@ function mapLaneToScan(lane: ActiveLane): EntryScan {
     imgUrl: lane.imgUrl,
     granted: !!e.allowed,
     reason: e.reason || "",
+    reasonDate: e.reasonDate || "",
+    refusedDisplay: e.refusedDisplay === true,
+    refusedCardNo: e.refusedCardNo || "",
     plan: title,
     memberNo: e.userMembershipId != null ? String(e.userMembershipId) : null,
     category: cat,
@@ -307,46 +318,66 @@ function aIsReentryDeny(reason: string): boolean {
 // ── Rule 5: a refusal always says what to do ────────────────────────────────
 // The engines emit SCREAMING_SNAKE codes (app/core/access_verification.py,
 // realtime_agent.py, ultra_engine.py). Each becomes a sentence plus an action.
-export interface DenyCopy { title: string; action: string; short: string }
+export interface DenyCopy { title: string; noDate?: string; action: string; short: string; glyph: RefusalGlyphName }
 const A_DENY_FALLBACK: DenyCopy = {
   title: "Cet accès n'a pas pu être validé",
   action: "Présentez-vous à l'accueil — nous réglons ça tout de suite.",
   short: "Accès refusé",
+  glyph: "doNotDisturbOn",
 };
 const A_DENY: Record<string, DenyCopy> = {
-  ENTRY_LIMIT: { title: "Limite d'entrées atteinte", action: "Revenez quand votre limite se libère ou présentez-vous à l'accueil.", short: "Limite atteinte" },
-  OFF_HOURS: { title: "Hors horaires de votre formule", action: "Revenez pendant les horaires de votre formule ou présentez-vous à l'accueil.", short: "Hors horaires" },
-  DENY_NO_CARD_MATCH: { title: "Cette carte n'est pas reconnue", action: "Présentez-vous à l'accueil — nous la réassocierons en un instant.", short: "Carte non reconnue" },
-  DENY_NO_MATCH: { title: "Ce badge n'est pas reconnu", action: "Présentez-vous à l'accueil — nous le réassocierons en un instant.", short: "Badge non reconnu" },
-  INVALID_CARD_FORMAT: { title: "Carte illisible", action: "Représentez-la bien à plat sur le lecteur.", short: "Carte illisible" },
-  INVALID_CARD_LENGTH: { title: "Carte illisible", action: "Représentez-la bien à plat sur le lecteur.", short: "Carte illisible" },
-  INVALID_FORMAT: { title: "Lecture illisible", action: "Représentez votre carte ou votre code.", short: "Lecture illisible" },
-  DENY_CARD_COLLISION: { title: "Cette carte est associée à plusieurs comptes", action: "Présentez-vous à l'accueil pour la régulariser.", short: "Carte en double" },
-  DENY_COLLISION: { title: "Ce code correspond à plusieurs comptes", action: "Présentez-vous à l'accueil pour le régulariser.", short: "Code en double" },
-  DENY_EXPIRED: { title: "Ce code QR a expiré", action: "Régénérez-le dans l'application MonClub, puis représentez-le.", short: "Code QR expiré" },
-  DENY_NOT_IN_LOCAL_ROSTER: { title: "Aucun abonnement actif trouvé pour ce code", action: "Présentez-vous à l'accueil pour vérifier votre abonnement.", short: "Abonnement non trouvé" },
-  DENY_NOT_ALLOWED_TODAY: { title: "Abonnement non valable aujourd'hui", action: "Présentez-vous à l'accueil pour vérifier votre abonnement.", short: "Abonnement non valable aujourd'hui" },
-  DENY_TOTP_FAILED: { title: "Ce code QR n'est pas valide", action: "Régénérez-le dans l'application MonClub, puis représentez-le.", short: "Code QR invalide" },
-  DENY_AMBIGUOUS_COUNTER: { title: "Ce code QR a déjà été utilisé", action: "Régénérez-le dans l'application MonClub.", short: "Code QR déjà utilisé" },
-  DENY_FUTURE_SKEW: { title: "L'heure de votre téléphone est décalée", action: "Activez l'heure automatique, puis représentez votre code.", short: "Heure du téléphone décalée" },
-  DENY_ANTI_FRAUD_CARD: { title: "Vous venez déjà de passer", action: "Patientez un instant avant de représenter votre carte.", short: "Passage déjà enregistré" },
-  DENY_ANTI_FRAUD_QR: { title: "Vous venez déjà de passer", action: "Patientez un instant avant de représenter votre code.", short: "Passage déjà enregistré" },
-  DENY_RFID_DISABLED: { title: "Le badge n'est pas activé sur cette entrée", action: "Utilisez votre code QR, ou présentez-vous à l'accueil.", short: "Badge désactivé ici" },
-  DENY_HANDLE_SLOW: { title: "Le tourniquet n'a pas répondu à temps", action: "Représentez votre carte — si cela persiste, voyez l'accueil.", short: "Tourniquet sans réponse" },
-  DOOR_CMD_FAILED: { title: "Le tourniquet n'a pas répondu", action: "Représentez votre carte — si cela persiste, voyez l'accueil.", short: "Tourniquet sans réponse" },
+  MEMBERSHIP_EXPIRED: { title: "Votre abonnement a expiré le {date}", noDate: "Votre abonnement a expiré", action: "Renouvelez-le à l'accueil.", short: "Abonnement expiré", glyph: "eventBusy" },
+  DEBT_DUE_PASSED: { title: "Votre échéance du {date} est dépassée", noDate: "Une échéance est dépassée", action: "Merci de la régler à l'accueil.", short: "Échéance dépassée", glyph: "payments" },
+  FEE_DUE_PASSED: { title: "Un frais obligatoire est échu depuis le {date}", noDate: "Un frais obligatoire est échu", action: "Merci de le régler à l'accueil.", short: "Frais échu", glyph: "receiptLong" },
+  MEMBERSHIP_FROZEN: { title: "Votre abonnement est gelé, retour le {date}", noDate: "Votre abonnement est gelé", action: "Présentez-vous à l'accueil pour le réactiver.", short: "Abonnement gelé", glyph: "acUnit" },
+  MEMBERSHIP_NOT_STARTED: { title: "Votre abonnement commence le {date}", noDate: "Votre abonnement n'a pas encore commencé", action: "Présentez-vous à l'accueil pour toute question.", short: "Pas encore commencé", glyph: "eventUpcoming" },
+  PLAN_NO_ENTRY: { title: "Votre formule ne donne pas accès à la salle", action: "Présentez-vous à l'accueil.", short: "Formule sans accès salle", glyph: "block" },
+  PHOTO_REQUIRED: { title: "Une photo est nécessaire pour entrer", action: "Passez à l'accueil pour la prendre.", short: "Photo manquante", glyph: "noPhotography" },
+  NOT_ALLOWED_NOW: { title: "Accès non autorisé pour le moment", action: "Présentez-vous à l'accueil.", short: "Accès refusé", glyph: "doNotDisturbOn" },
+  ENTRY_LIMIT: { title: "Limite d'entrées atteinte", action: "Revenez quand votre limite se libère ou présentez-vous à l'accueil.", short: "Limite atteinte", glyph: "doNotDisturbOn" },
+  OFF_HOURS: { title: "Hors horaires de votre formule", action: "Revenez pendant les horaires de votre formule ou présentez-vous à l'accueil.", short: "Hors horaires", glyph: "scheduleOutline" },
+  DENY_NO_CARD_MATCH: { title: "Cette carte n'est pas reconnue", action: "Présentez-vous à l'accueil — nous la réassocierons en un instant.", short: "Carte non reconnue", glyph: "help" },
+  DENY_NO_MATCH: { title: "Ce badge n'est pas reconnu", action: "Présentez-vous à l'accueil — nous le réassocierons en un instant.", short: "Badge non reconnu", glyph: "qrCode2" },
+  INVALID_CARD_FORMAT: { title: "Carte illisible", action: "Représentez-la bien à plat sur le lecteur.", short: "Carte illisible", glyph: "doNotDisturbOn" },
+  INVALID_CARD_LENGTH: { title: "Carte illisible", action: "Représentez-la bien à plat sur le lecteur.", short: "Carte illisible", glyph: "doNotDisturbOn" },
+  INVALID_FORMAT: { title: "Lecture illisible", action: "Représentez votre carte ou votre code.", short: "Lecture illisible", glyph: "doNotDisturbOn" },
+  DENY_CARD_COLLISION: { title: "Cette carte est associée à plusieurs comptes", action: "Présentez-vous à l'accueil pour la régulariser.", short: "Carte en double", glyph: "doNotDisturbOn" },
+  DENY_COLLISION: { title: "Ce code correspond à plusieurs comptes", action: "Présentez-vous à l'accueil pour le régulariser.", short: "Code en double", glyph: "qrCode2" },
+  DENY_EXPIRED: { title: "Ce code QR a expiré", action: "Régénérez-le dans l'application MonClub, puis représentez-le.", short: "QR expiré", glyph: "qrCode2" },
+  DENY_NOT_IN_LOCAL_ROSTER: { title: "Aucun abonnement actif trouvé pour ce code", action: "Présentez-vous à l'accueil pour vérifier votre abonnement.", short: "Abonnement non trouvé", glyph: "qrCode2" },
+  DENY_NOT_ALLOWED_TODAY: { title: "Abonnement non valable aujourd'hui", action: "Présentez-vous à l'accueil pour vérifier votre abonnement.", short: "Abonnement non valable aujourd'hui", glyph: "qrCode2" },
+  DENY_TOTP_FAILED: { title: "Ce code QR n'est pas valide", action: "Régénérez-le dans l'application MonClub, puis représentez-le.", short: "Code QR invalide", glyph: "qrCode2" },
+  DENY_AMBIGUOUS_COUNTER: { title: "Ce code QR a déjà été utilisé", action: "Régénérez-le dans l'application MonClub.", short: "Code QR déjà utilisé", glyph: "qrCode2" },
+  DENY_FUTURE_SKEW: { title: "L'heure de votre téléphone est décalée", action: "Activez l'heure automatique, puis représentez votre code.", short: "Heure du téléphone décalée", glyph: "qrCode2" },
+  DENY_ANTI_FRAUD_CARD: { title: "Vous venez déjà de passer", action: "Patientez un instant avant de représenter votre carte.", short: "Passage déjà enregistré", glyph: "doNotDisturbOn" },
+  DENY_ANTI_FRAUD_QR: { title: "Vous venez déjà de passer", action: "Patientez un instant avant de représenter votre code.", short: "Passage déjà enregistré", glyph: "qrCode2" },
+  DENY_RFID_DISABLED: { title: "Le badge n'est pas activé sur cette entrée", action: "Utilisez votre code QR, ou présentez-vous à l'accueil.", short: "Badge désactivé ici", glyph: "doNotDisturbOn" },
+  DENY_HANDLE_SLOW: { title: "Le tourniquet n'a pas répondu à temps", action: "Représentez votre carte — si cela persiste, voyez l'accueil.", short: "Tourniquet sans réponse", glyph: "doNotDisturbOn" },
+  DOOR_CMD_FAILED: { title: "Le tourniquet n'a pas répondu", action: "Représentez votre carte — si cela persiste, voyez l'accueil.", short: "Tourniquet sans réponse", glyph: "doNotDisturbOn" },
 };
 // Exported for the Dashboard feed (v5): its refused rows show the same `short`
 // text. The table stays in this file — tests/test_qr_allowed_days.py and
 // tests/test_p3b1_setting_and_status.py read it here.
-export function aDenyCopy(raw: string): DenyCopy {
+export function aDenyCopy(raw: string, date?: string): DenyCopy {
   const trimmed = String(raw || "").trim();
   if (!trimmed) return A_DENY_FALLBACK;
   const hit = A_DENY[trimmed.toUpperCase()];
-  if (hit) return hit;
+  if (hit) {
+    const parts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date || "");
+    let formatted = "";
+    if (parts) {
+      const [y, m, d] = parts.slice(1).map(Number);
+      const parsed = new Date(y, m - 1, d);
+      if (parsed.getFullYear() === y && parsed.getMonth() === m - 1 && parsed.getDate() === d) {
+        formatted = `${parts[3]}/${parts[2]}/${parts[1]}`;
+      }
+    }
+    return { ...hit, title: formatted ? hit.title.replace("{date}", formatted) : hit.noDate || hit.title };
+  }
   // Some paths already emit a human sentence rather than a code — show it, but
   // still append an action so rule 5 holds.
   if (/\s/.test(trimmed) && trimmed !== trimmed.toUpperCase()) {
-    return { title: trimmed, action: A_DENY_FALLBACK.action, short: trimmed };
+    return { title: trimmed, action: A_DENY_FALLBACK.action, short: trimmed, glyph: "doNotDisturbOn" };
   }
   return A_DENY_FALLBACK;
 }
@@ -441,13 +472,28 @@ function AWordmark({ size, color, opacity }: { size: number; color: string; opac
 }
 
 // ── Rule 4: the photo is a verification, not the subject ────────────────────
+function ARefusalGlyph({ name, size, color }: { name: RefusalGlyphName; size: number; color: string }) {
+  return <svg aria-hidden="true" viewBox={REFUSAL_GLYPH_VIEWBOX} fill="currentColor" width={size} height={size} style={{ color, flex: "none" }}><path d={REFUSAL_GLYPHS[name]} /></svg>;
+}
+
+function aUnknownCard(scan: EntryScan): boolean {
+  return !scan.granted && scan.reason === "DENY_NO_CARD_MATCH" && scan.fullName === "Carte inconnue";
+}
+
+function aRefusedFirstSize(s: string): number { return s.length <= 9 ? 132 : s.length <= 14 ? 92 : 72; }
+function aRefusedLastSize(s: string): number { return s.length > 16 ? 52 : 60; }
+
 // A white-ringed medallion. The design crops with `cover` at 22% from the top
 // (faces sit high in a portrait); this replaces the previous `contain` fit,
 // which cannot look right inside a circle.
 function APhoto({ scan, field, size, ring, onImageError }: { scan: EntryScan; field: Field; size: number; ring: number; onImageError: (laneId: string) => void }) {
+  const refused = !scan.granted && !aIsReentryDeny(scan.reason);
+  const unknown = aUnknownCard(scan) || (!scan.granted && scan.reason === "DENY_CARD_COLLISION" && scan.fullName === aDenyCopy(scan.reason).short);
   return (
-    <div style={{ position: "relative", width: size + "px", height: size + "px", flex: "none", borderRadius: "50%", overflow: "hidden", background: "#101010", boxShadow: "0 0 0 " + ring + "px " + field.ring }}>
-      {scan.imgUrl ? (
+    <div style={{ position: "relative", width: size + "px", height: size + "px", flex: "none", borderRadius: "50%", overflow: "hidden", background: unknown ? "rgba(0,0,0,.18)" : refused && !scan.imgUrl ? "rgba(255,255,255,.16)" : "#101010", boxShadow: "0 0 0 " + ring + "px " + field.ring }}>
+      {unknown ? (
+        <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center" }}><ARefusalGlyph name="creditCardOff" size={size === 268 ? 132 : size / 2} color="#fff" /></div>
+      ) : scan.imgUrl ? (
         <img
           src={scan.imgUrl}
           alt=""
@@ -455,7 +501,7 @@ function APhoto({ scan, field, size, ring, onImageError }: { scan: EntryScan; fi
           style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", objectPosition: "center 22%", filter: scan.granted ? "none" : "grayscale(1) contrast(1.05)" }}
         />
       ) : (
-        <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "rgba(255,255,255,.92)", fontWeight: 800, fontSize: Math.round(size * 0.34) + "px", letterSpacing: "-.03em" }}>
+        <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: refused ? "#fff" : "rgba(255,255,255,.92)", fontWeight: 800, fontSize: Math.round(size * (refused ? 104 / 268 : 0.34)) + "px", letterSpacing: refused ? "-.04em" : "-.03em" }}>
           {aInitials(scan.fullName)}
         </div>
       )}
@@ -536,8 +582,9 @@ function AVerdict({ scan, now, onImageError }: { scan: EntryScan; now: Date; onI
   // Member fees F3c: granted scans only; empty for nearly every member.
   const fee = scan.granted ? feeLinesView(scan.fees, now, scan.feeDueSoonDays) : null;
 
-  const firstSize = aFirstSize(scan.firstName, 132);
-  const lastSize = aLastSize(firstSize, scan.lastName);
+  const refused = !scan.granted && !aIsReentryDeny(scan.reason);
+  const firstSize = refused ? aRefusedFirstSize(scan.firstName) : aFirstSize(scan.firstName, 132);
+  const lastSize = refused ? aRefusedLastSize(scan.lastName) : aLastSize(firstSize, scan.lastName);
   // Frequent-pass VISUAL alert. `repeatCount` is only ever non-zero when the
   // engine actually crossed the threshold, so this is inert on a normal scan.
   const repeat = scan.repeatCount > 1;
@@ -549,7 +596,7 @@ function AVerdict({ scan, now, onImageError }: { scan: EntryScan; now: Date; onI
     : scan.granted
       ? (birthday ? "Joyeux anniversaire" : "Accès autorisé")
       : "Accès refusé";
-  const deny = scan.granted ? null : aDenyCopy(scan.reason);
+  const deny = scan.granted ? null : aDenyCopy(scan.reason, scan.reasonDate);
 
   return (
     <div style={{ position: "absolute", inset: 0, background: f.bg, color: f.ink, display: "flex", overflow: "hidden" }}>
@@ -589,13 +636,22 @@ function AVerdict({ scan, now, onImageError }: { scan: EntryScan; now: Date; onI
               {eyebrow}
             </div>
             <div style={{ ...A_NAME, fontSize: firstSize + "px", marginBottom: "2px", color: f.ink }}>{scan.firstName}</div>
-            {!!scan.lastName && <div style={{ ...A_NAME, fontSize: lastSize + "px", color: f.sub }}>{scan.lastName}</div>}
+            {!!scan.lastName && <div style={{ ...A_NAME, fontSize: lastSize + "px", color: f.sub, ...(refused ? { lineHeight: 1.02 } : {}) }}>{scan.lastName}</div>}
+            {refused && (
+              aUnknownCard(scan) ? <div style={{ marginTop: "22px", font: "600 20px ui-monospace, SFMono-Regular, Menlo, monospace", color: A_RED_SUB }}>{"Carte n° " + scan.refusedCardNo}</div> :
+              <div style={{ marginTop: "22px", display: "flex", alignItems: "center", gap: "12px", fontSize: "20px", fontWeight: 600, color: A_RED_SUB }}>
+                {!!scan.plan && <><span>{scan.plan}</span><span style={{ width: "5px", height: "5px", borderRadius: "50%", background: A_RED_SUB }} /></>}
+                <ARefusalGlyph name={scan.method === "qr" ? "qrCode2" : "creditCard"} size={22} color={A_RED_SUB} />
+                <span>{aMethodLabel(scan.method)}</span>
+              </div>
+            )}
           </div>
         </div>
 
         {/* footer — one of four states */}
         {deny ? (
-          <div style={{ flex: "none", display: "flex", alignItems: "stretch", gap: "20px", padding: "22px 26px", borderRadius: "18px", background: "rgba(0,0,0,.26)" }}>
+          <div style={{ flex: "none", display: "flex", alignItems: reentryDeny ? "stretch" : "center", gap: "20px", padding: "22px 26px", borderRadius: "18px", background: "rgba(0,0,0,.26)" }}>
+            {!reentryDeny && <ARefusalGlyph name={deny.glyph} size={40} color="#fff" />}
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: "27px", fontWeight: 700, marginBottom: "6px", color: "#fff" }}>{deny.title}</div>
               <div style={{ fontSize: "20px", fontWeight: 500, color: "#fff" }}>{deny.action}</div>
@@ -693,8 +749,8 @@ function AVerdict({ scan, now, onImageError }: { scan: EntryScan; now: Date; onI
 
 // ── 03 · Simultaneous scans — every lane is its own full-height field ───────
 // The design draws three. `popup_lanes` may be up to MAX_LANES (5), so 4-5
-// wrap onto a second row (2×2, then 3+2) and the type steps down — five 256px
-// columns cannot carry a 62px first name.
+// wrap onto a second row (2×2, then 3+2), with horizontal photo/name rows
+// inside the denser tiles.
 function aMultiGrid(n: number): { columns: string; rows: string; span: (i: number) => number } {
   if (n === 4) return { columns: "repeat(2,1fr)", rows: "repeat(2,1fr)", span: () => 1 };
   if (n >= 5) return { columns: "repeat(6,1fr)", rows: "repeat(2,1fr)", span: (i) => (i < 3 ? 2 : 3) };
@@ -708,7 +764,7 @@ function AMulti({ scans, now, onImageError }: { scans: EntryScan[]; now: Date; o
   const photo = dense ? 78 : 104;
   const photoRing = dense ? 4 : 5;
   const ebSize = dense ? 12 : 14;
-  const firstBase = dense ? 44 : 62;
+  const firstBase = dense ? 40 : 62;
   const footSize = dense ? 15 : 17;
   const watermark = dense ? 200 : 280;
 
@@ -726,9 +782,9 @@ function AMulti({ scans, now, onImageError }: { scans: EntryScan[]; now: Date; o
         {scans.map((scan, i) => {
           const f = aFieldFor(scan, now);
           const birthday = f.glyph === "cake";
-          const deny = scan.granted ? null : aDenyCopy(scan.reason);
-          const firstSize = aFirstSize(scan.firstName, firstBase);
-          const lastSize = aLastSize(firstSize, scan.lastName);
+          const deny = scan.granted ? null : aDenyCopy(scan.reason, scan.reasonDate);
+          const firstSize = dense ? 40 : aFirstSize(scan.firstName, firstBase);
+          const lastSize = dense ? 22 : aLastSize(firstSize, scan.lastName);
           const feeMark = scan.granted ? feeLinesView(scan.fees, now, scan.feeDueSoonDays).mark : null;
           return (
             <div
@@ -743,36 +799,40 @@ function AMulti({ scans, now, onImageError }: { scans: EntryScan[]; now: Date; o
                 color: f.ink,
                 display: "flex",
                 flexDirection: "column",
-                padding: dense ? "20px 20px" : "26px 24px",
+                padding: dense ? "18px" : "26px 24px",
+                gap: dense ? "12px" : undefined,
                 animation: "aRise .3s cubic-bezier(.4,0,.2,1) " + (i * 0.06).toFixed(2) + "s both",
               }}
             >
               <AGlyph name={f.glyph} size={watermark} color={f.ink} opacity={f.glyphOpacity + 0.01} style={{ position: "absolute", right: "-52px", bottom: "-52px" }} />
-              <div style={{ position: "relative", marginBottom: dense ? "16px" : "22px" }}>
+              <div style={{ display: dense ? "flex" : "contents", alignItems: dense ? "center" : undefined, gap: dense ? "18px" : undefined, flex: dense ? 1 : undefined, minHeight: 0 }}>
+              <div style={{ position: "relative", flex: "none", marginBottom: dense ? 0 : "22px" }}>
                 <APhoto scan={scan} field={f} size={photo} ring={photoRing} onImageError={onImageError} />
                 {feeMark && <AFeeMark kind={feeMark} size={dense ? 28 : 34} left={photo - (dense ? 22 : 26)} top={photo - (dense ? 22 : 26)} />}
               </div>
               <div style={{ position: "relative", flex: 1, minHeight: 0 }}>
-                <div style={{ ...A_EYEBROW, fontSize: ebSize + "px", color: f.soft, marginBottom: dense ? "9px" : "12px" }}>
-                  {scan.granted ? (birthday ? "Anniversaire" : "Autorisé") : "Refusé"}
+                <div style={{ ...A_EYEBROW, fontSize: ebSize + "px", color: f.soft, marginBottom: dense ? "8px" : "12px" }}>
+                  {scan.granted ? (birthday ? "Anniversaire" : "Autorisé") : (aIsReentryDeny(scan.reason) ? "Deuxième passage" : "Refusé")}
                 </div>
                 <div style={{ ...A_NAME, fontSize: firstSize + "px", marginBottom: "2px", color: f.ink }}>{scan.firstName}</div>
                 {!!scan.lastName && (
                   <div style={{ ...A_NAME, fontSize: lastSize + "px", color: f.sub, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{scan.lastName}</div>
                 )}
               </div>
+              </div>
               {deny ? (
-                <div style={{ position: "relative", flex: "none", padding: "14px 16px", borderRadius: "14px", background: "rgba(0,0,0,.26)" }}>
-                  <div style={{ fontSize: (footSize + 1) + "px", fontWeight: 700, marginBottom: "3px", color: "#fff" }}>{deny.short}</div>
-                  <div style={{ fontSize: (footSize - 2) + "px", fontWeight: 500, color: "#fff" }}>Voyez l'accueil</div>
+                <div style={{ position: "relative", flex: "none", padding: dense ? "11px 13px" : "14px 16px", borderRadius: "14px", background: "rgba(0,0,0,.26)" }}>
+                  <div style={{ fontSize: (dense ? 16 : 18) + "px", fontWeight: 700, marginBottom: "3px", color: "#fff" }}>{deny.short}</div>
+                  <div style={{ fontSize: (dense ? 13 : 15) + "px", fontWeight: 500, color: "#fff" }}>Présentez-vous à l'accueil</div>
                 </div>
               ) : (
                 <div style={{ position: "relative", flex: "none", fontSize: footSize + "px", fontWeight: 600, color: f.soft }}>
+                  {dense ? <div style={{ display: "flex", alignItems: "center", gap: "8px" }}><span>{scan.plan || "Membre"}</span><span>·</span><AMethodGlyph m={scan.method} size={18} /><span>{aMethodLabel(scan.method)}</span></div> : <>
                   <div style={{ marginBottom: "5px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{scan.plan || (scan.memberNo ? "nº " + scan.memberNo : "Membre")}</div>
                   <div style={{ display: "flex", alignItems: "center", gap: "9px" }}>
                     <AMethodGlyph m={scan.method} size={footSize + 3} />
                     {aMethodLabel(scan.method) + " · " + aClock(scan.at)}
-                  </div>
+                  </div></>}
                 </div>
               )}
             </div>
@@ -1103,13 +1163,9 @@ export default function PopupWindow() {
   // Add a new event into the lane grid (latest-N policy)
   const enqueue = useCallback(
     (evt: PopupEvent) => {
-      // Show ONLY granted entries for identified members. Denied scans and
-      // unidentified ("Inconnu") cards are not surfaced on the popup wall.
-      // (History/audit still records everything via the drawer — this filter is
-      // popup-display only.) See SHOW_DENIED_ENTRIES.
-      const knownUser = !!evt.userFullName && evt.userFullName.trim().length > 0;
-      if ((!evt.allowed && !SHOW_DENIED_ENTRIES) || !knownUser) {
-        console.debug("[popup] skip (not a granted+known entry)", {
+      // Refusals show only when the PC's switch is on (the engine marks them).
+      if (!aDisplayable(evt)) {
+        console.debug("[popup] skip (entry is not displayable)", {
           eventId: evt.eventId, allowed: evt.allowed,
           user: evt.userFullName, reason: evt.reason,
         });
@@ -1122,9 +1178,10 @@ export default function PopupWindow() {
       // anti-fraud cooldown and is much shorter than the old per-person 8s
       // dedupe (which was actually blocking distinct rapid entries).
       const now = Date.now();
-      const seenAt = seenEventIdsRef.current.get(evt.eventId);
+      const dedupeKey = evt.allowed ? evt.eventId : evt.reason + "|" + (evt.userFullName || evt.refusedCardNo);
+      const seenAt = seenEventIdsRef.current.get(dedupeKey);
       if (seenAt && now - seenAt < 30_000) return;
-      seenEventIdsRef.current.set(evt.eventId, now);
+      seenEventIdsRef.current.set(dedupeKey, now);
       // periodic cleanup of the dedupe map
       if (seenEventIdsRef.current.size > 200) {
         const cutoff = now - 60_000;
