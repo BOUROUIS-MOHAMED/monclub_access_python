@@ -126,8 +126,8 @@ class TestFingerprintCount:
 
         assert d["fingerprintCount"] == 2
         assert d["fingerprints"] == [
-            {"fingerId": 0, "label": None, "enabled": True},
-            {"fingerId": 3, "label": "index", "enabled": False},
+            {"id": 160, "fingerId": 0, "label": None, "enabled": True},
+            {"id": 163, "fingerId": 3, "label": "index", "enabled": False},
         ]
         assert d["userId"] == 100 and d["held"] is False
         assert _TEMPLATE_DATA not in json.dumps(d)

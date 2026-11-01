@@ -13,7 +13,7 @@ def enqueue(worker, uid, event="pass"):
 def test_history_off_records_limited_member_and_skips_unlimited(db):
     seed(db, users=[row(), row(2, entryLimits=None, entryUsage=None)])
     recorded = []
-    worker = SimpleNamespace(_settings={"save_history": False}, _poll_ema_ms=0,
+    worker = SimpleNamespace(_settings={"save_history": False}, _poll_ema_ms=0, _device={},
                              _write_history_item=recorded.append)
     enqueue(worker, 7001)
     enqueue(worker, 7002, "unlimited")
@@ -25,7 +25,7 @@ def test_history_off_records_limited_member_and_skips_unlimited(db):
 def test_history_on_still_records_every_member(db):
     seed(db, users=[row(entryLimits=None, entryUsage=None)])
     recorded = []
-    worker = SimpleNamespace(_settings={"save_history": True}, _poll_ema_ms=0,
+    worker = SimpleNamespace(_settings={"save_history": True}, _poll_ema_ms=0, _device={},
                              _write_history_item=recorded.append)
     enqueue(worker, 7001)
     assert len(recorded) == 1
