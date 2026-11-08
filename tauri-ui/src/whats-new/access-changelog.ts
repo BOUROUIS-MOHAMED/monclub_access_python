@@ -6,7 +6,7 @@ export const ACCESS_CHANGELOG: {
   items: { category: "new" | "perf" | "fix" | "acc" | "sec"; fr: string; en: string }[];
 }[] = [
   {
-    version: "1.5.1",
+    version: "1.5.2",
     items: [
       {
         category: "acc",
