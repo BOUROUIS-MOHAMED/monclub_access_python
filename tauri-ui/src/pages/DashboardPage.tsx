@@ -97,7 +97,11 @@ function isDevicePin(cardNo: string): boolean {
 /** Primary label for a feed row — the member, or the credential when unresolved. */
 function rowTitle(it: DashboardFeedItem): string {
   if (it.userFullName.trim()) return it.userFullName;
-  if (!it.cardNo) return "Badge inconnu";
+  // A panel that matches a finger to nobody reports card "0" (Square Fit inBio, 2026-11-09):
+  // "Carte 0" read as a real card. It is an unrecognised finger, or an unknown badge.
+  if (!it.cardNo || /^0+$/.test(it.cardNo)) {
+    return methodLabel(it.method) === "empreinte" ? "Empreinte non reconnue" : "Badge inconnu";
+  }
   // Unresolved AND no card: the device PIN matched no member in the local roster.
   return isDevicePin(it.cardNo)
     ? `PIN ${it.cardNo.slice(ZKPIN_PREFIX.length)} — membre inconnu`
