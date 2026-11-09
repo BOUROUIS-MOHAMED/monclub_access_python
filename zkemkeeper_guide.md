@@ -413,10 +413,26 @@ Every zkemkeeper call the driver makes. Machine number is hard-coded `1` through
 ```python
 zk.SetCommPassword(int(self.comm_key) if self.comm_key.isdigit() else self.comm_key)
 zk.Connect_Net(self.ip, self.port)          # -> bool
+zk.GetPlatform(1, "")                       # -> (ok, platform); access-panel guard
 zk.RegEvent(1, _REGEVENT_ATT_TRANSACTION)   # bitmask 1 = OnAttTransaction(Ex)
 ```
 `SetCommPassword` runs **only when a comm key is configured**, and **before**
 `Connect_Net`; a failure only warns and does not abort the connect. `[CODE]`
+
+**An inBio access panel is refused before `RegEvent`.** If `GetPlatform` contains
+`inbio` (any case), `_do_connect` logs an ERROR naming the fix (set the device to
+`ZK_PULLSDK`), emits `ZKEM_ACCESS_PANEL_REFUSED`, calls `Disconnect` and returns
+`False`; `RegEvent` and `EnableDevice` are never called. An unreadable platform
+refuses nothing. `[CODE]` `[TEST: tests/test_zk_standalone_access_panel_guard.py]`
+Why: `[FIELD: 2026-11-09, panel GetPlatform "ZEM560_InBIO", product ACP-260, firmware
+"AC Ver 5.2.4 Apr 19 2016", configured as ZK_STANDALONE — in plain 32-bit PowerShell
+with no MonClub code, Connect_Net + RegEvent(1, 1) + ReadRTLog(1) ended the process
+with 0xC0000374; Connect_Net + ReadRTLog(1) without RegEvent did not. In the app the
+engine died seconds after every connect (window white, "Failed to fetch"). Switched
+to ZK_PULLSDK the same panel connected and pushed.]` Only `inbio` is matched because
+it is the one platform proven to crash; an MB2000's platform string is `[UNKNOWN]`,
+and refusing a real terminal would stop its roster. Other C2/C3 panels set to
+ZK_STANDALONE are `[UNVERIFIED]` — they may crash the same way and are not caught.
 
 After a successful connect, in this order: read the fingerprint algorithm version, then
 the device status, then log, then run the fullness warning. `[CODE]`

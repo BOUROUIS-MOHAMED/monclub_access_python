@@ -145,6 +145,21 @@ def _preload_transport_dlls(sdk_dir: Optional[str] = None, loader: Optional[Call
         return report
 
 
+def access_panel_reason(platform: str) -> Optional[str]:
+    """Why a device on ZK_STANDALONE must be refused, or None.
+
+    [FIELD 2026-11-09] An inBio panel (GetPlatform "ZEM560_InBIO", product ACP-260,
+    firmware "AC Ver 5.2.4 Apr 19 2016") set to ZK_STANDALONE: in plain 32-bit
+    PowerShell with no MonClub code, Connect_Net + RegEvent(1, 1) + ReadRTLog(1)
+    ended the process with 0xC0000374; without RegEvent, ReadRTLog returned True.
+    Only "inbio" is matched: it is the one platform proven to crash, and refusing a
+    real MB2000 would stop its roster. The MB2000's own platform string is [UNKNOWN].
+    """
+    if "inbio" in str(platform or "").lower():
+        return "an inBio access panel, not a standalone terminal"
+    return None
+
+
 _DEFAULT_CMD_TIMEOUT_SEC = 10.0
 _CONNECT_TIMEOUT_SEC = 20.0
 _EVENT_QUEUE_MAX = 4096
@@ -1713,6 +1728,23 @@ class ZKStandaloneDevice:
                 continue
         return ""
 
+    def _read_platform(self, zk: Any) -> str:
+        """The device's platform string (GetPlatform), e.g. "ZEM560_InBIO".
+
+        Read BEFORE RegEvent so _do_connect can refuse an access panel (see
+        access_panel_reason). makepy returns the BSTR* out-param as (ok, value), the
+        shape _read_fp_version's working fallback reads (its VARIANT branch cannot
+        run: pywintypes has no VT_BYREF). Best-effort: "" when unreadable, and ""
+        never refuses.
+        """
+        try:
+            res = zk.GetPlatform(1, "")
+        except Exception:
+            return ""
+        if isinstance(res, (tuple, list)) and len(res) >= 2 and res[0]:
+            return str(res[1] or "").strip()
+        return ""
+
     def _warn_if_device_full(self) -> None:
         """Say it plainly when the terminal has no room for more fingerprints.
 
@@ -1751,6 +1783,29 @@ class ZKStandaloneDevice:
                 self.logger.warning("%s SetCommPassword failed: %s", self._prefix, exc)
         ok = bool(zk.Connect_Net(self.ip, self.port))
         if ok:
+            # ---- Refuse an access panel BEFORE RegEvent. ----
+            # RegEvent followed by ReadRTLog on an inBio panel kills the process
+            # (0xC0000374, heap corruption inside the vendor SDK), so the engine and
+            # the window behind it die seconds after every connect. Not catchable.
+            platform = self._read_platform(zk)
+            reason = access_panel_reason(platform)
+            if reason:
+                self.logger.error(
+                    "%s REFUSED: ip=%s reports platform=%r -- %s. This device is set to "
+                    "protocol ZK_STANDALONE (MB2000 terminals); set it to ZK_PULLSDK "
+                    "(C2/C3/C4/inBio panels) in the MonClub dashboard.",
+                    self._prefix, self.ip, platform, reason,
+                )
+                try:
+                    _tel.warn("ZKEM_ACCESS_PANEL_REFUSED", worker=self._tel_wid,
+                              platform=platform)
+                except Exception:
+                    pass
+                try:
+                    zk.Disconnect()
+                except Exception:
+                    pass
+                return False
             try:
                 zk.RegEvent(1, _REGEVENT_ATT_TRANSACTION)
             except Exception as exc:
