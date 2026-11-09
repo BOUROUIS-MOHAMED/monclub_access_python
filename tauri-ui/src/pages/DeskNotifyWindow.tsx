@@ -33,6 +33,13 @@ function staffCopy(e: PopupEvent) {
     const previous = /[T ](\d{2}:\d{2})/.exec(e.previousEntryAt || "")?.[1];
     return { ...fallback, title: "Déjà passé" + (previous ? ` à ${previous}` : ""), action: "La porte reste fermée quelques secondes : rien à faire." };
   }
+  if (!e.allowed && !(e.refusedDisplay === true && e.userFullName?.trim()) && e.reason !== "DENY_NO_CARD_MATCH") {
+    // The turnstile matched the scan to nobody: no member, so no reason of theirs to show.
+    const method = aMethodFor(e.scanMode);
+    if (method === "fingerprint") return { ...fallback, title: "Empreinte non reconnue par le tourniquet",
+      action: "Doigt mal posé, ou membre retiré du tourniquet (abonnement terminé). Demandez-lui son nom." };
+    if (method === "qr") return { ...fallback, title: "Code QR non reconnu", action: "Demandez-lui son nom et cherchez-le dans Access." };
+  }
   const hit = copy[e.reason];
   return { ...fallback, title: hit?.[0] || fallback.title, action: hit?.[1] || "Ouvrez sa fiche pour voir pourquoi." };
 }
@@ -58,7 +65,11 @@ function DeskTile({ tile, full, settings, remove, pause, imageError, act }: {
   const reentry = deskReentry(e);
   const eyebrow = !e.allowed ? reentry ? "Deuxième passage" : "Accès refusé" : birthday ? "Joyeux anniversaire" : "Accès autorisé";
   const shortEyebrow = !e.allowed ? reentry ? "Deuxième passage" : "Refusé" : birthday ? "Anniversaire" : "Autorisé";
-  const name = showIdentity && e.userFullName ? e.userFullName : unknown ? "Carte inconnue" : "Carte";
+  const method = aMethodFor(e.scanMode);
+  // Nobody behind the scan: name the credential, never a member (an inBio reports finger "card 0").
+  const anonymous = !(showIdentity && e.userFullName?.trim());
+  const name = !anonymous ? e.userFullName : unknown ? "Carte inconnue"
+    : method === "fingerprint" ? "Empreinte non reconnue" : method === "qr" ? "Code non reconnu" : "Badge non reconnu";
   const days = e.allowed ? deskDaysLeft(e.userValidTo, now) : null;
   const ending = days !== null && days >= 0 && days <= 7;
   const fees = e.allowed ? feeLinesView(parseFees(e.fees), now, feeDueSoonDays(e.feeDueSoonDays)) : null;
@@ -70,9 +81,9 @@ function DeskTile({ tile, full, settings, remove, pause, imageError, act }: {
   // An unknown card belongs to nobody: only its number is worth showing.
   const meta = unknown ? (e.refusedCardNo ? `Carte n° ${e.refusedCardNo}` : "")
     : [showIdentity ? e.userMembershipTitle : "", showIdentity && e.userValidTo ? `jusqu’au ${dateText(e.userValidTo)}` : "",
-      showIdentity ? aMethodLabel(aMethodFor(e.scanMode)) : e.refusedCardNo ? `Carte n° ${e.refusedCardNo}` : ""].filter(Boolean).join(" · ");
+      showIdentity || !e.refusedCardNo || /^0+$/.test(e.refusedCardNo) ? aMethodLabel(method) : `Carte n° ${e.refusedCardNo}`].filter(Boolean).join(" · ");
   const medallion = <div className="desk-medallion" style={{ margin: full ? 5 : 0 }}>
-    {!showIdentity || unknown ? <div className="desk-card-photo" style={{ width: size, height: size, boxShadow: `0 0 0 ${full ? 5 : 3}px ${field.ring}` }}><AGlyph name="card" size={size / 2} /></div>
+    {!showIdentity || unknown ? <div className="desk-card-photo" style={{ width: size, height: size, boxShadow: `0 0 0 ${full ? 5 : 3}px ${field.ring}` }}><AGlyph name={method === "fingerprint" ? "fingerprint" : method === "qr" ? "qr" : "card"} size={size / 2} /></div>
       : <APhoto scan={scan} field={field} size={size} ring={full ? 5 : 3} onImageError={imageError} />}
     {full && repeat && <span className="desk-repeat"><AGlyph name="history" size={15} />{e.repeatCount}<sup>e</sup></span>}
   </div>;
@@ -93,7 +104,7 @@ function DeskTile({ tile, full, settings, remove, pause, imageError, act }: {
   </div>);
   const buttons: { label: string; action: DeskNotifyAction["action"]; primary?: boolean }[] = unknown
     ? [{ label: "Associer à un membre", action: "assignCard", primary: true }]
-    : [{ label: "Ouvrir la fiche", action: "open" }];
+    : anonymous || !e.userMembershipId ? [{ label: "Chercher le membre", action: "open" }] : [{ label: "Ouvrir la fiche", action: "open" }];
   // Fees can only be managed on the dashboard: never offer a collection button here.
   if (!unknown && e.reason !== "FEE_DUE_PASSED" && !fees?.shown.length) {
     if (settings.renewButton && ((!e.allowed && e.reason === "MEMBERSHIP_EXPIRED") || ending)) buttons.push({ label: "Renouveler", action: "renew", primary: true });
