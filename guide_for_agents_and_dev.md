@@ -70,6 +70,7 @@ This file is only useful while it is true. If you change any of the following, y
 | Which sync run a push batch answers -- the `push_batch_sync_run` link and what carries its ids (`db.py::insert_push_batch(sync_run_ids=)`, `::list_push_batches_for_sync_run`; `app.py::_request_running_ultra_sync(sync_run_id=)` and its two calls in the sync tick; `ultra_engine.py::UltraEngine.request_sync_now(sync_run_ids=)`, `::_worker_full_sync_accepted_or_pending`, `UltraDeviceWorker.request_full_sync(sync_run_ids=)`, `::_drain_full_sync_commands`'s `run_kw`, `::_run_standalone_full_sync`, `::_maybe_mirror_reconcile`; `device_sync.py::run_one_device_on_connected_sdk` / `::_run_single_device_sync` / `::_sync_one_device`) -- or the history and Base locale figures (`db.py::push_batch_hourly`, `::local_db_kpis`) | §3.13 |
 | The Utilisateurs member card data and the mutation-queue names (`db.py::get_member_card_details`, `::_member_row_for_card`, `::_member_freeze_facts`, `::_list_held_users_for_roster` and its call in `::list_members_roster`, `::list_member_access_history`, `::annotate_offline_mutation_targets`, `local_access_api_v2.py::_handle_member_card`, `::_handle_mutations_list`'s names, `::_handle_member_history`, `tauri-ui/src/pages/UsersPage.tsx` `cardDetailLine`) | §3.14 |
 | The test / verification commands | §9 Verifying this guide |
+| Per-PC desk notifications (`app/core/desk_notify.py`, heartbeat callback, local settings/test endpoints, popup event flags, `DeskNotifyWindow.tsx`, native desk commands and member action links) | §3.17 |
 
 **Rules for editing this file:**
 
@@ -5626,6 +5627,87 @@ when the credential's account is known (owner decision). `_process_event` and `_
 `refusedDisplay` is true; copy, glyphs (`refusalGlyphs.ts`, inline SVG for offline TVs) and layout follow the
 approved design `Ecran d'entree - Refus.dc.html`. `[UNVERIFIED: the turnstile sending a removed member's card
 digits in the DENY event is the owner's recollection, not re-tested on hardware for this change]`
+
+### 3.17 Desk notifications on the staff PC (2026-11-09)
+
+**Settings, per PC, off by default.** `access/pc_identity.py::get_pc_identity_service` handles
+`deskNotify` beside `refusedInfoEnabled` in the existing heartbeat callback. The heartbeat API
+client returns its JSON mapping; unknown keys are not rejected. `app/core/desk_notify.py::normalize`
+accepts only the contract's exact types and values; missing/invalid fields take defaults. Its
+`on_heartbeat_response` stores `desk_notify_settings` in `v2_kv` through `kv_put(durable=True)`
+(DbWriter, FULL synchronous commit), and keeps the previous value if the field is absent (older
+backend). Defaults: disabled; REFUSALS_AND_ALERTS; BOTTOM_RIGHT; primary monitor (0); 8 seconds;
+3 visible; sound off; renewal/pay-rest buttons on; nonce 0. The API serves the normalized object
+at `GET /api/v2/desk-notify/settings`. `[CODE; TEST: tests/test_desk_notify.py]`
+
+**Stream, no door decision.** The desk subscribes directly to the same
+`GET /api/v2/agent/events?replayLast=0` SSE as `PopupWindow.tsx`/`usePopupStream`.
+`NotificationRequest.desk_only` → `deskOnly` marks hidden refusals and ULTRA notifications whose
+device TV popup is off. `_enqueue_notification` still returns early for a TV-disabled device
+when desk notifications are disabled; with them enabled it queues a presentation event.
+`PopupWindow.tsx::aDisplayable` rejects `deskOnly` and `deskTest` before lane insertion, and the
+main hook does not broadcast those to the TV or its fallback. Existing non-test scan history
+collection is retained. Only `_enqueue_notification` changed in `ultra_engine.py`; decisions,
+`_process_event`, `_open_door_with_retry`, rescue handlers and history writers are unchanged.
+`[CODE; TEST: tests/test_desk_notify.py::test_ultra_hidden_refusal_is_delivered_when_tv_popup_is_off,
+tests/test_ultra_desk_alerts.py, tests/test_refused_info_resolve.py]`
+
+**Tests.** A growing heartbeat `testNonce` queues an allowed `Test MonClub` event with both
+`deskTest: true` and `deskOnly: true`. `POST /api/v2/desk-notify/test` queues the same event
+(409 with the dashboard-enablement instruction when disabled). The Access Dashboard button
+uses that POST. SSE sends tests even with no running device engine. The test-only replay ring
+is bounded to 32 events and one minute; the desk deduplicates event IDs. `DeskTestInbox` holds
+incoming tests until the next successful settings poll, so an enable-and-test heartbeat cannot
+be dropped against the page's previous disabled settings. These fake entries
+never enter a door or history queue. `[CODE; TEST: tests/test_desk_notify.py]`
+
+**Native lifetime and focus.** `lib.rs::create_desk_notify_window` creates `desk_notify` at
+startup (Access role only), route `/desk-notify`, hidden, transparent, undecorated, fixed size,
+topmost, no taskbar entry or native shadow, `focused(false)` and `focusable(false)`. The main
+app-level listener recreates it when enabled if missing. The page polls settings every 2 s,
+clears and hides when disabled, and hides an empty stack. Tauri is locked to **2.10.3**:
+its local `WebviewWindowBuilder::focusable` exists; tao 0.34.6 maps false to `WS_EX_NOACTIVATE`.
+`show_desk_notify_window` uses Windows `SW_SHOWNOACTIVATE` directly; it never focuses/unminimizes
+the desk. Only a staff-initiated action invokes `show_main_for_desk_notify`, which reuses the
+tray's `show_main_window` (show/unminimize/focus). `[CODE; CHECK: cargo check --offline]`
+
+**Layout and actions.** `DeskNotifyWindow.tsx` imports the TV's actual colour fields, glyphs,
+photo/initials mapping and bundled Hanken Grotesk. The 400 px latest tile sits nearest the
+chosen corner; older visible cards are 64 px strips, then a dark overflow row. Each tile owns
+its timer (refusal ×2, zero indefinite); hover pauses it and shows the white frame/En pause.
+The mode filter, optional refusal sound and buttons read the normalized settings. Fees have
+only Ouvrir la fiche: Access offers no fee collection action. The page converts measured CSS
+dimensions using the selected monitor's scale, then Rust sets physical size/position against
+that monitor's work area with a 12 physical-pixel margin. Monitor 0 is the primary, 1/2 are
+other enumerated monitors, an absent monitor falls back to primary. A bottom-positioned
+stack scrolls to its bottom after layout/viewport resizing so the newest tile remains visible
+when the native window is capped by a short work area. `[CODE; TEST:
+tauri-ui/src/lib/deskNotify.test.ts (filter, date, timer, action-path rules)]`
+
+`desk-notify-action` carries `{action: open|renew|payRest|assignCard, activeMembershipId?, cardNo?}`.
+The app-level main listener navigates to `/users?member=...` (plus `action=renew|payRest`) or
+`/users?assignCard=...`. Users resolves the membership from the existing template-free roster
+endpoint, including held rows and rows outside the selected page, and opens the existing card
+or `RenewDialog`/`PayRestDialog`; their own staff/offline/permission gates remain in force.
+A new notification action closes previous action dialogs; renewal/payment dialogs are keyed
+by navigation and membership so another member never inherits the previous payment form. The
+assignment banner proposes the number in the first card field only after staff choose Modifier;
+the ordinary submit/confirmation and API gates still apply. `[CODE: useDeskNotifyActions.ts,
+UsersPage.tsx, RenewDialog.tsx, PayRestDialog.tsx, StaffChip.tsx]`
+
+**Limits / unverified.** `[CODE]` A refusal without `refusedDisplay` never draws the name or
+photo in the desk. With refused-info off, existing device-denial events can carry only
+`DEVICE_DENIED`, no card digits/date/member ID; the desk shows the available reason and a
+card glyph, and cannot invent the missing data. The refused directory is not enabled or
+looked up by this feature. Existing AGENT emission switches/rate limiting are retained: the
+desk can only show the AGENT events actually emitted. The fee wire has no amount, so the
+panel uses the actual fee name/status/date rather than a fabricated amount. `[UNVERIFIED]`
+Windows 10/11 no-focus-steal while staff type, native button clicks with a non-focusable
+WebView2, mixed-DPI/multiple-monitor work areas and monitor removal, real member photos,
+sound playback/autoplay, visual comparison to all design boards, end-to-end deep-link dialogs,
+and backend/dashboard heartbeat interoperability require a real PC. The automated browser
+and native UI hosts were unavailable in the implementation session; compilation alone does
+not establish any of those claims.
 
 ## 4. Protocol resolution — how a device gets its driver
 

@@ -5791,6 +5791,19 @@ def _handle_agent_device_disable(ctx: _Ctx) -> None:
     ctx.send_json(200, {"ok": True})
 
 
+def _handle_desk_notify_settings(ctx: _Ctx) -> None:
+    from app.core import desk_notify
+    ctx.send_json(200, desk_notify.settings())
+
+
+def _handle_desk_notify_test(ctx: _Ctx) -> None:
+    from app.core import desk_notify
+    if not desk_notify.queue_test():
+        ctx.send_json(409, {"ok": False, "error": "Activez les notifications de ce PC dans le tableau de bord."})
+        return
+    ctx.send_json(200, {"ok": True})
+
+
 def _handle_agent_events_sse(ctx: _Ctx) -> None:
     """SSE stream: agent events (access decisions, device status, popups)."""
     client_addr = getattr(ctx.handler, "client_address", ("?", "?"))
@@ -5860,6 +5873,7 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
         )
 
     last_snap: Dict[int, Dict[str, Any]] = {}
+    last_desk_seq = 0
     # Heartbeat: without periodic writes the handler can't detect a dead client
     # during idle periods (no popups, no status changes). The native EventSource
     # silently reconnects every ~7-30s, leaving this thread orphaned and leaking
@@ -5890,6 +5904,14 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
             ultra_running = bool(ultra_eng and ultra_eng.running)
 
             wrote_event = False
+
+            # Display-only tests also work with no running turnstile engine.
+            from app.core import desk_notify
+            for desk_seq, payload in desk_notify.events_since(last_desk_seq):
+                if not ctx.send_sse_event("popup", payload):
+                    return
+                last_desk_seq = desk_seq
+                wrote_event = True
 
             if not agent_running and not ultra_running:
                 alive = ctx.send_sse_event("status", {"running": False})

@@ -147,6 +147,22 @@ export default function DashboardPage() {
   const [resetOpen, setResetOpen] = useState(false);
   const [overview, setOverview] = useState<DashboardOverview | null>(null);
   const [now, setNow] = useState<Date>(() => new Date());
+  const [deskTestMessage, setDeskTestMessage] = useState("");
+  const [deskTestBusy, setDeskTestBusy] = useState(false);
+  const testDeskNotification = async () => {
+    setDeskTestBusy(true);
+    try {
+      await post("/desk-notify/test", {});
+      setDeskTestMessage("Notification de test envoyée.");
+    } catch (error) {
+      setDeskTestMessage(error instanceof Error ? error.message : String(error));
+    } finally { setDeskTestBusy(false); }
+  };
+  useEffect(() => {
+    if (!deskTestMessage) return;
+    const timer = window.setTimeout(() => setDeskTestMessage(""), 6000);
+    return () => window.clearTimeout(timer);
+  }, [deskTestMessage]);
 
   // Tray "Scanner carte"
   useEffect(() => {
@@ -469,6 +485,7 @@ export default function DashboardPage() {
               <>
                 <ActionButton kind="outline" size="sm" icon={ExternalLink} onClick={openPopupWindow}>Ouvrir</ActionButton>
                 <ActionButton kind="outline" size="sm" icon={Play} onClick={sendTestNotification}>Tester</ActionButton>
+                <ActionButton kind="outline" size="sm" disabled={deskTestBusy} onClick={() => void testDeskNotification()}>Tester la notification du PC</ActionButton>
               </>
             }
           />
@@ -500,6 +517,7 @@ export default function DashboardPage() {
       </ConfirmDialog>
 
       <ScanCardModal open={scanOpen} onClose={() => setScanOpen(false)} />
+      {deskTestMessage && <div className="col-span-full" role="status"><Note tone="info">{deskTestMessage}</Note></div>}
     </PageGrid>
   );
 }

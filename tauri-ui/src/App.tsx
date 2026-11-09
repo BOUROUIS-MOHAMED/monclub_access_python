@@ -6,6 +6,7 @@ import { AppProvider, useApp } from "./context/AppContext";
 import { PcIdentityProvider, usePcIdentity } from "./context/PcIdentityContext";
 import { EnrollmentProvider } from "./context/EnrollmentContext";
 import { useEnrollmentListener } from "./hooks/useEnrollmentListener";
+import { useDeskNotifyActions } from "./hooks/useDeskNotifyActions";
 import { Loader2 } from "lucide-react";
 import MainLayout from "./layouts/MainLayout";
 import { PageChromeProvider } from "./context/PageChromeContext";
@@ -26,6 +27,7 @@ import UpdatePage from "./pages/UpdatePage";
 import RestrictedPage from "./pages/RestrictedPage";
 import PcSetupPage from "./pages/PcSetupPage";
 import PopupWindow from "./pages/PopupWindow";
+import DeskNotifyWindow from "./pages/DeskNotifyWindow";
 import TrayPanelPage from "./pages/TrayPanelPage";
 import FavoritesOverlayPage from "./pages/FavoritesOverlayPage";
 import ScanResultPage from "./pages/ScanResultPage";
@@ -36,6 +38,7 @@ function AppRoutes() {
   const loggedIn = status?.session?.loggedIn ?? false;
   const restricted = status?.session?.restricted ?? false;
   useEnrollmentListener();
+  useDeskNotifyActions();
 
   if (loading && !status) {
     return (
@@ -103,6 +106,7 @@ export default function App() {
         <BrowserRouter>
           <Routes>
             <Route path="/popup" element={<PopupWindow />} />
+            <Route path="/desk-notify" element={<DeskNotifyWindow />} />
             <Route path="/scan-result" element={<ScanResultPage />} />
             <Route path="/tray-panel" element={<AppProvider><TrayPanelPage /></AppProvider>} />
             <Route path="/favorites-overlay" element={<FavoritesOverlayPage />} />

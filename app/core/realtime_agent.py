@@ -395,6 +395,8 @@ def _popup_payload_from_request(req: NotificationRequest) -> Dict[str, Any]:
         "reasonDate": req.reason_date,
         "refusedDisplay": req.refused_display,
         "refusedCardNo": req.refused_card_no,
+        "deskOnly": req.desk_only or (not req.allowed and not req.refused_display),
+        "deskTest": req.desk_test,
         "scanMode": req.scan_mode,
         "popupDurationSec": req.popup_duration_sec,
         "popupEnabled": req.popup_enabled,

@@ -1,7 +1,7 @@
 {
   "identifier": "default",
   "description": "Default capability for all windows",
-  "windows": ["main", "access_popup", "favorites-overlay", "access-panel"],
+  "windows": ["main", "access_popup", "favorites-overlay", "access-panel", "desk_notify"],
   "permissions": [
     "core:default",
     "shell:allow-open",

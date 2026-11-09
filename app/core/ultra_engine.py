@@ -7163,7 +7163,9 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         )
         popup_enabled = self._settings.get("popup_enabled", True)
         if not popup_enabled:
-            return
+            from app.core import desk_notify
+            if not desk_notify.is_enabled():
+                return
 
         # Resolve membership plan name + type for the scan-popup badge (best-effort).
         user_members_type = ""
@@ -7232,13 +7234,14 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                 reason_date=reason_date,
                 refused_display=refused_display,
                 refused_card_no=refused_card_no,
+                desk_only=not popup_enabled or (not allowed and not refused_display),
                 scan_mode=scan_mode,
                 image_source=image_source,
                 user_image_status=user_image_status,
                 user_profile_image=user_profile_image,
                 fees=list(user_fees or []),
                 popup_duration_sec=int(self._settings.get("popup_duration_sec", 3)),
-                popup_enabled=True,
+                popup_enabled=bool(popup_enabled),
                 win_notify_enabled=bool(self._settings.get("win_notify_enabled", False)),
                 **rep,
             )

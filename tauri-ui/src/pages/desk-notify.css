@@ -1,0 +1,48 @@
+html.desk-notify-document, .desk-notify-document body, .desk-notify-document #root { background: transparent !important; margin: 0; min-height: 0; overflow: hidden; }
+.desk-window { width: 424px; padding: 12px; box-sizing: border-box; max-height: 100vh; overflow-y: auto; scrollbar-width: none; font-family: 'Hanken Grotesk',sans-serif; line-height: normal; }
+.desk-stack { width: 400px; display: flex; flex-direction: column; gap: 8px; }
+.desk-tile { width: 400px; position: relative; overflow: hidden; border-radius: 14px; box-shadow: 0 16px 36px rgba(0,0,0,.22); flex-shrink: 0; cursor: pointer; }
+.desk-tile button { cursor: pointer; font-family: inherit; }
+.desk-paused { box-shadow: 0 0 0 3px #fff,0 20px 40px rgba(0,0,0,.26); }
+.desk-header { position: relative; padding: 14px 10px 0 18px; display: flex; align-items: center; gap: 10px; }
+.desk-wordmark { font-size: 16px; font-weight: 800; letter-spacing: -.045em; flex-grow: 1; }
+.desk-device { font-size: 12px; font-weight: 600; max-width: 120px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.desk-clock { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.desk-close { position: relative; width: 28px; height: 28px; flex-shrink: 0; border: 0; border-radius: 8px; background: transparent; color: inherit; display: flex; align-items: center; justify-content: center; }
+.desk-paused .desk-close { background: rgba(255,255,255,.3); }
+.desk-pause { font-size: 12px; font-weight: 800; padding: 3px 10px; border-radius: 999px; background: rgba(255,255,255,.4); }
+.desk-person { position: relative; padding: 14px 18px; display: flex; align-items: center; gap: 18px; }
+.desk-medallion { position: relative; flex-shrink: 0; }
+.desk-card-photo { border-radius: 50%; background: rgba(0,0,0,.18); display: flex; align-items: center; justify-content: center; }
+.desk-names { min-width: 0; flex-grow: 1; overflow-wrap: anywhere; }
+.desk-eyebrow { font-size: 11px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; margin-bottom: 6px; }
+.desk-first { font-weight: 800; line-height: .95; letter-spacing: -.035em; }
+.desk-last { font-weight: 800; line-height: 1.05; letter-spacing: -.03em; color: var(--desk-sub); }
+.desk-meta { font-size: 12.5px; font-weight: 600; color: var(--desk-sub); margin-top: 6px; }
+.desk-panel { position: relative; margin: 0 14px 12px; padding: 12px 14px; border-radius: 12px; display: flex; gap: 12px; align-items: center; }
+.desk-panel > div { min-width: 0; }
+.desk-panel strong { display: block; font-size: 15px; font-weight: 700; }
+.desk-panel p { margin: 0; font-size: 12.5px; font-weight: 500; }
+.desk-deny { background: rgba(0,0,0,.26); color: #fff; }
+.desk-ending { background: #3A2A05; color: #fff; }
+.desk-ending p { color: #E7BB4E; }
+.desk-fee { background: #fff; color: #121A1C; }
+.desk-fee p { color: #4A5056; }
+.desk-more-fees { position: relative; margin: 0 18px 12px; font-size: 12.5px; font-weight: 600; }
+.desk-plan { position: relative; padding: 0 18px 12px; display: flex; gap: 8px; align-items: center; font-size: 13px; font-weight: 600; }
+.desk-age { padding: 2px 10px; border-radius: 999px; background: rgba(58,42,5,.14); font-weight: 700; white-space: nowrap; }
+.desk-buttons { position: relative; display: flex; gap: 8px; padding: 0 14px 14px; }
+.desk-buttons button { flex: 1 1 0; height: 36px; border-radius: 10px; border: 0; background: var(--desk-button-bg); color: inherit; font-size: 13.5px; font-weight: 700; }
+.desk-buttons button.desk-primary { background: #fff; color: var(--desk-button-ink); }
+.desk-timer { position: relative; height: 4px; background: rgba(0,0,0,.14); }
+.desk-timer > div { height: 4px; opacity: .55; }
+.desk-repeat { position: absolute; right: -8px; bottom: -2px; height: 30px; padding: 0 10px; border-radius: 999px; background: #fff; color: #A8320F; font-size: 14px; font-weight: 800; display: flex; align-items: center; gap: 5px; box-shadow: 0 4px 12px rgba(0,0,0,.2); }
+.desk-repeat sup { font-size: 9px; }
+.desk-strip { height: 64px; border-radius: 12px; display: flex; align-items: center; gap: 12px; padding: 0 8px 0 10px; box-sizing: border-box; box-shadow: 0 10px 24px rgba(0,0,0,.18); }
+.desk-strip-name { position: relative; min-width: 0; flex-grow: 1; }
+.desk-strip-name .desk-eyebrow { font-size: 10.5px; letter-spacing: .1em; margin-bottom: 0; }
+.desk-strip-name > div:last-child { font-size: 19px; font-weight: 800; letter-spacing: -.03em; line-height: 1.1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.desk-overflow { height: 44px; border-radius: 12px; background: #1C252E; color: #fff; display: flex; align-items: center; gap: 8px; padding: 0 8px 0 14px; box-shadow: 0 10px 24px rgba(0,0,0,.2); flex-shrink: 0; }
+.desk-overflow .desk-wordmark { font-size: 14px; flex-grow: 0; }
+.desk-overflow > span:nth-child(2) { font-size: 13px; font-weight: 600; flex-grow: 1; color: #DFE3E8; }
+.desk-overflow button { height: 30px; padding: 0 10px; border: 0; border-radius: 8px; background: rgba(255,255,255,.12); color: #fff; font-size: 12.5px; font-weight: 700; font-family: inherit; cursor: pointer; }

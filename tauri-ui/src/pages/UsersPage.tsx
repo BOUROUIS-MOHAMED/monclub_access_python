@@ -1,6 +1,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode } from "react";
 import { useUsers } from "@/api/hooks";
+import { useLocation, useSearchParams } from "react-router-dom";
 import { useApp } from "@/context/AppContext";
 import RenewDialog from "@/components/RenewDialog";
 import PayRestDialog from "@/components/PayRestDialog";
@@ -590,6 +591,10 @@ function EnrollDialog({ member, onClose, offline }: { member: MemberRosterRow | 
 }
 
 export default function UsersPage() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const location = useLocation();
+  const assignCard = /^\d+$/.test(searchParams.get("assignCard") || "") ? searchParams.get("assignCard")! : "";
+  const [linkedMember, setLinkedMember] = useState<MemberRosterRow | null>(null);
   const { status } = useApp();
   const staff = status?.staff;
   const createHint = staffPermissionHint(staff, "ACTIVE_MEMBERSHIP_CREATION", "Créer des membres");
@@ -748,11 +753,11 @@ export default function UsersPage() {
     setEditForm({
       startDate: n(m.validFrom).slice(0, 10),
       endDate: n(m.validTo).slice(0, 10),
-      cardId: n(m.firstCardId),
+      cardId: assignCard || n(m.firstCardId),
       secondCardId: n(m.secondCardId),
       note: "",
     });
-  }, []);
+  }, [assignCard]);
 
   const submitEdit = useCallback(async () => {
     const m = editTarget;
@@ -764,8 +769,11 @@ export default function UsersPage() {
     payload.secondCardId = n(editForm.secondCardId);
     if (n(editForm.note)) payload.note = n(editForm.note);
     const res = await submitMutation("edit", m, payload);
-    if (res.ok || res.queued) setEditTarget(null);
-  }, [editTarget, editForm, submitMutation, staff?.offline?.active]);
+    if (res.ok || res.queued) {
+      setEditTarget(null);
+      if (assignCard) { const next = new URLSearchParams(searchParams); next.delete("assignCard"); setSearchParams(next, { replace: true }); }
+    }
+  }, [editTarget, editForm, submitMutation, staff?.offline?.active, assignCard, searchParams, setSearchParams]);
 
   const submitFreeze = useCallback(async () => {
     const m = freezeTarget;
@@ -1134,7 +1142,32 @@ export default function UsersPage() {
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   // Looked up in the current page so the card refreshes after a change and
   // falls back to the default rail when the row leaves the page.
-  const selected = selectedKey ? roster.find((m) => memberKey(m) === selectedKey) ?? null : null;
+  const selected = selectedKey ? roster.find((m) => memberKey(m) === selectedKey) ?? (linkedMember && memberKey(linkedMember) === selectedKey ? linkedMember : null) : null;
+
+  useEffect(() => {
+    const id = Number(searchParams.get("member"));
+    if (!Number.isSafeInteger(id) || id <= 0) return;
+    let stopped = false;
+    // The linked member may be outside the current page/filter, including a held membership.
+    void get<{ rows: MemberRosterRow[] }>("/members", { status: "all", limit: "100000", offset: "0" }).then((answer) => {
+      if (stopped) return;
+      const member = answer.rows.find((row) => Number(row.activeMembershipId) === id);
+      if (!member) { setQueueError("Ce membre n'est pas disponible dans la copie locale de ce PC."); return; }
+      setLinkedMember(member);
+      setSelectedKey(memberKey(member));
+      setTab("roster");
+      setRenewTarget(null);
+      setPayRestTarget(null);
+      setEditTarget(null);
+      setFreezeTarget(null);
+      setDeleteTarget(null);
+      setMemberOpen(false);
+      const action = searchParams.get("action");
+      if (action === "renew") setRenewTarget(member);
+      if (action === "payRest") setPayRestTarget(member);
+    }).catch((error) => { if (!stopped) setQueueError(staffError(error)); });
+    return () => { stopped = true; };
+  }, [location.key, searchParams]);
 
   // The card's extra lines (prints, …) come from GET /members/{id}/card, read once when a
   // card opens and again after each roster reload — never per roster row. Keyed by the
@@ -1832,6 +1865,7 @@ export default function UsersPage() {
       />
 
       {error ? <Note tone="error">Impossible de charger la copie locale des membres : {error}</Note> : null}
+      {assignCard && <Note tone="info">Carte n° {assignCard} : choisissez le membre, puis Modifier. La carte sera proposée.</Note>}
       {queueError ? <Note tone="error">{queueError}</Note> : null}
       {message ? <Note tone="success">{message}</Note> : null}
 
@@ -2077,8 +2111,8 @@ export default function UsersPage() {
       </ConfirmDialog>
 
       <EnrollDialog member={enrollMember} offline={!!staff?.offline?.active} onClose={() => { setEnrollMember(null); void loadRoster(); }} />
-      {renewTarget && <RenewDialog member={renewTarget} plans={memberships} staff={staff} gymDate={status?.session.gymDate} onClose={() => setRenewTarget(null)} onSuccess={() => { void loadRoster(); }} />}
-      {payRestTarget && <PayRestDialog member={payRestTarget} staff={staff} onClose={() => setPayRestTarget(null)} onSuccess={() => { void loadRoster(); }} />}
+      {renewTarget && <RenewDialog key={`${location.key}:${renewTarget.activeMembershipId}`} member={renewTarget} plans={memberships} staff={staff} gymDate={status?.session.gymDate} onClose={() => setRenewTarget(null)} onSuccess={() => { void loadRoster(); }} />}
+      {payRestTarget && <PayRestDialog key={`${location.key}:${payRestTarget.activeMembershipId}`} member={payRestTarget} staff={staff} onClose={() => setPayRestTarget(null)} onSuccess={() => { void loadRoster(); }} />}
       <input ref={photoInputRef} type="file" accept="image/*" className="hidden" onChange={onPhotoFile} />
     </div>
   );

@@ -47,7 +47,7 @@ interface ActiveLane {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
-function toPopupEvent(raw: any): PopupEvent {
+export function toPopupEvent(raw: any): PopupEvent {
   const eventId = String(raw?.eventId ?? raw?.id ?? `evt-${Date.now()}-${Math.random()}`);
   const popupDurationSec = Number(raw?.popupDurationSec ?? raw?.durationSec ?? raw?.duration ?? DEFAULT_DURATION_SEC);
   return {
@@ -71,6 +71,8 @@ function toPopupEvent(raw: any): PopupEvent {
     reasonDate: String(raw?.reasonDate ?? ""),
     refusedDisplay: raw?.refusedDisplay === true,
     refusedCardNo: String(raw?.refusedCardNo ?? ""),
+    deskOnly: raw?.deskOnly === true,
+    deskTest: raw?.deskTest === true,
     scanMode: String(raw?.scanMode ?? ""),
     popupDurationSec: Number.isFinite(popupDurationSec) && popupDurationSec > 0 ? popupDurationSec : DEFAULT_DURATION_SEC,
     popupEnabled: raw?.popupEnabled !== false,
@@ -93,6 +95,7 @@ function toPopupEvent(raw: any): PopupEvent {
 }
 
 function aDisplayable(evt: PopupEvent): boolean {
+  if (evt.deskOnly || evt.deskTest) return false;
   const knownUser = !!evt.userFullName && evt.userFullName.trim().length > 0;
   return evt.allowed ? knownUser : evt.refusedDisplay === true && (
     knownUser || evt.reason === "DENY_NO_CARD_MATCH" || evt.reason === "DENY_CARD_COLLISION"
@@ -151,6 +154,12 @@ const A_GOLD_INK_SOFT = "#5A4108";
 const A_DARK = "#181818";
 const A_DARK_SUB = "#C9CED2";
 const A_DARK_FAINT = "#4A5056";
+
+// Shared entry-screen presentation. The desk imports these exact pieces so TV pixels stay unchanged.
+export { A_GREEN, A_GREEN_INK, A_GREEN_DOT, A_RED, A_RED_SUB, A_ORANGE, A_ORANGE_SUB,
+  A_ORANGE_INK_DEEP, A_GOLD, A_GOLD_INK, A_GOLD_INK_SOFT, AGlyph, ARefusalGlyph, APhoto,
+  aInitials, aSplitName, aClock, aParseDate, aAgeToday, aIsReentryDeny, aMethodLabel, aMethodFor,
+  aFieldFor, mapLaneToScan };
 
 const A_MONTHS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"];
 const A_DAYS = ["dimanche", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi"];

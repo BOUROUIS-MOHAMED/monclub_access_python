@@ -799,6 +799,11 @@ def get_pc_identity_service(app: Any) -> PcIdentityService:
         from access.store import load_auth_token
         from app.core.app_const import MONCLUB_BASE_URL
         from app.core import refused_info
+        from app.core import desk_notify
+
+        def heartbeat_response(response):
+            refused_info.on_heartbeat_response(response)
+            desk_notify.on_heartbeat_response(response)
 
         service = PcIdentityService(
             credential_store=PcCredentialStore(),
@@ -806,7 +811,7 @@ def get_pc_identity_service(app: Any) -> PcIdentityService:
             gym_token_provider=load_auth_token,
             app_version_provider=lambda: str(app._update_manager.get_current_version() or "0.0.0"),
             heartbeat_payload_provider=lambda: _heartbeat_payload_after_date_check(app),
-            heartbeat_response_handler=refused_info.on_heartbeat_response,
+            heartbeat_response_handler=heartbeat_response,
             logger=getattr(app, "logger", _log),
         )
         app._pc_identity_service = service
