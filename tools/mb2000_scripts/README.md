@@ -31,6 +31,11 @@ folder is self-contained - no ZKTeco software required on the PC:
   at connect time; without `tcpcomm.dll` every `Connect_Net` returns False (fresh gym PC,
   2026-10-26). `sdk\` on PATH lets the scripts find them.
 - `libzkfpcsharp.dll`, `libzkfp.dll`, `fpslib.dll`, `ZKFPCap.dll` - ZK9500 capture
+- `zkfpslibLow.dll`, `fppswsk12.dll` (matching engine) and `libiomp5md.dll` (Intel OpenMP,
+  x86) - `fppswsk12.dll` imports `libiomp5md.dll`; without it `ZKFPM_Init` returns -1
+  ("Failed to initialize the algorithm library") on a PC that never had the ZKFinger
+  driver package (2026-11-09). The Access app ships and preloads it too
+  (`app/sdk/zkfinger.py::_RUNTIME_LOADED_VENDOR_DLLS`).
 
 `_common.ps1` prepends `sdk\` to PATH so the COM object and the .NET wrapper's
 native deps resolve locally. Script 1 auto-registers the bundled `zkemkeeper.dll`;

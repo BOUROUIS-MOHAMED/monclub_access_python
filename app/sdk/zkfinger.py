@@ -187,7 +187,16 @@ def _read_c_string(pe: bytes, off: int) -> str:
 # Preloading them by ABSOLUTE path fixes it: once a module is in the process, Windows
 # resolves a later bare-name LoadLibrary to the already-loaded module of the same base
 # name. Absent files are skipped silently -- this list is best-effort, never a gate.
+#
+# libiomp5md.dll (Intel OpenMP runtime, x86) comes FIRST: fppswsk12.dll imports it
+# statically (PE import table, 2026-11-09), and Access did not ship it. PCs that once had
+# the ZKFinger driver package carry it in SysWOW64, so enrolment worked there; on a fresh PC
+# (user "hp", 2026-11-09) fppswsk12.dll failed to load and ZKFPM_Init returned -1 while the
+# diagnostics said nothing was missing. Loaded first by absolute path, the static import of
+# fppswsk12.dll then resolves to it. The copy shipped in app/sdk is the 32-bit one
+# (machine 0x14c) from a PC where enrolment works.
 _RUNTIME_LOADED_VENDOR_DLLS: tuple[str, ...] = (
+    "libiomp5md.dll",
     "zkfpslibLow.dll",
     "fppswsk12.dll",
 )
@@ -291,6 +300,8 @@ class ZKFinger:
         # IMPORTANT: keep these alive (do not let them be GC'ed)
         self._dll_dir_handle = None  # os.add_dll_directory() handle
         self._preloaded: Dict[str, ctypes.WinDLL] = {}
+        # dll name -> the OSError text of a preload that FAILED (file present, load refused).
+        self._preload_errors: Dict[str, str] = {}
 
         self._log = logger or log
         # Correlation key for telemetry, set by the caller before init().
@@ -431,6 +442,9 @@ class ZKFinger:
             else:
                 self._log.info("ZKFinger: preloaded %s", dll_name)
         except OSError as e:
+            if not hasattr(self, "_preload_errors"):
+                self._preload_errors = {}
+            self._preload_errors[key] = str(e)
             self._log.warning("ZKFinger: preload failed for %s: %s", dll_name, e)
 
     def _vendor_imports(self, rt: ZKFingerRuntime) -> List[str]:
@@ -680,12 +694,16 @@ class ZKFinger:
         if rc == -1 and rt:
             loaded = ", ".join(sorted(self._preloaded.keys())) or "(none)"
             missing = [n for n in _RUNTIME_LOADED_VENDOR_DLLS if not (rt.dll_dir / n).exists()]
+            # A file that is present but would not load (one of ITS imports missing) is the
+            # case the "MISSING" line cannot show: name it with the loader's own error.
+            failed = "; ".join(f"{k}: {v}" for k, v in sorted(getattr(self, "_preload_errors", {}).items())) or "none"
             hint = (
                 "\nMost common causes for rc=-1:\n"
                 "1) A runtime-loaded dependency could not be resolved. The chain is\n"
-                "   libzkfp.dll -> fpslib.dll -> zkfpslibLow.dll -> fppswsk12.dll, and only\n"
-                "   the FIRST hop is a static import; the rest are loaded by bare name and\n"
-                "   are NOT searched for in the sdk folder unless preloaded (we now do).\n"
+                "   libzkfp.dll -> fpslib.dll -> zkfpslibLow.dll -> fppswsk12.dll\n"
+                "   (-> libiomp5md.dll), and only the FIRST hop is a static import; the rest\n"
+                "   are loaded by bare name and are NOT searched for in the sdk folder unless\n"
+                "   preloaded (we now do, libiomp5md.dll first).\n"
                 "2) Missing companion DLLs (algorithm module) from the SAME SDK build.\n"
                 "3) Mixed DLL versions (fpslib/ZKFPCap/libzkfp not from the same SDK) due to\n"
                 "   duplicate copies shadowing each other.\n"
@@ -693,6 +711,7 @@ class ZKFinger:
                 f"\nDiagnostics: dll_dir={rt.dll_dir}\n"
                 f"  preloaded+pinned: {loaded}\n"
                 f"  runtime-dep files MISSING from dll_dir: {missing or 'none'}\n"
+                f"  present but FAILED to load: {failed}\n"
                 "Fix:\n"
                 f"- Put ALL x86 SDK DLLs in ONE folder: {rt.dll_dir}\n"
                 "- Ensure only ONE effective copy exists (avoid duplicates in other folders / cwd).\n"
@@ -716,6 +735,7 @@ class ZKFinger:
             self.db_handle = None
             self._cached_params = None
             self._preloaded.clear()
+            getattr(self, "_preload_errors", {}).clear()
 
             # remove DLL directory hook if possible
             try:
