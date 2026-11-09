@@ -347,10 +347,20 @@ if ($E2ETestKeys) {
 if ($SkipTests) {
   Write-Host "-SkipTests given: the test suite was NOT run; the release file will say so." -ForegroundColor Yellow
 } else {
-  Write-Host "Gate: test suite (pytest tests/ -q --ignore=tests/_pydeps)..." -ForegroundColor Yellow
   Invoke-NativeProbe { python -c "import pytest" } | Out-Null
   if ($LASTEXITCODE -ne 0) { python -m pip install -r .\requirements-dev.txt }
-  python -m pytest tests/ -q --ignore=tests/_pydeps
+  # Parallel when pytest-xdist is there (requirements-dev.txt): the same tests on 8 workers
+  # (not every core: this PC rebooted under several heavy jobs at once). tests/conftest.py
+  # keeps the updater/watchdog script files on ONE worker: they see each other's processes.
+  # Measured 2026-11-09: 12:46 serial -> 7:39 parallel, same 4,964 tests.
+  Invoke-NativeProbe { python -c "import xdist" } | Out-Null
+  if ($LASTEXITCODE -eq 0) {
+    Write-Host "Gate: test suite, parallel (pytest tests/ -n 8 --dist loadgroup)..." -ForegroundColor Yellow
+    python -m pytest tests/ -q --ignore=tests/_pydeps -n 8 --dist loadgroup
+  } else {
+    Write-Host "Gate: test suite, serial (pytest-xdist not installed)..." -ForegroundColor Yellow
+    python -m pytest tests/ -q --ignore=tests/_pydeps
+  }
   if ($LASTEXITCODE -ne 0) {
     # Any non-zero, including 5 (no tests collected), refuses the build.
     throw "Test suite FAILED (pytest exit $LASTEXITCODE). Fix it, or pass -SkipTests for a non-publishable build."

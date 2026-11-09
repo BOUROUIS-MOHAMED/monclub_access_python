@@ -137,3 +137,65 @@ def _never_fetch_or_cache_popup_images_in_the_data_root(tmp_path_factory):
     pic._cache_dir_cached = str(tmp_path_factory.mktemp("suite-popup-images"))
     pic.requests = _NoNetworkRequests()
     yield
+
+
+# --------------------------------------------------------------------------------------------
+# Parallel runs (pytest-xdist, `-n N --dist loadgroup`, used by build_release.ps1).
+#
+# These files start real PowerShell scripts or look at machine-wide state (every running
+# process, a global lock, the data-root ACL). Run at the same time they see each other:
+# the watchdog script treats any process named monclub_access_<x> as "an installer is
+# running" and stands down, while the updater tests start fake Setups with exactly that
+# name; the install helper in turn sees the other tests' Setups and answers 22 instead of
+# 20 (measured 2026-11-09: 5 failures at -n 8, all in these files; all pass serially).
+# One xdist group = one worker, one file after another; the rest of the suite fills the
+# other workers. Without xdist the marker is inert.
+# --------------------------------------------------------------------------------------------
+_MACHINE_WIDE_TEST_FILES = frozenset({
+    # Only the files that actually collide (measured 2026-11-09): the watchdog script and the
+    # updater scripts look at every running process; the updater tests start fake Setups.
+    # Other files that start PowerShell ran in parallel cleanly and stay out of the group,
+    # which is the slowest chain of the run.
+    "test_watchdog_script.py",
+    "test_updater_v2_files_and_wrapper.py",
+    "test_updater_v2_installer_scripts.py",
+    "test_updater_v2_install_helper.py",
+    "test_updater_v2_startup_journal.py",
+    "test_updater_v2_user_rollback.py",
+    "test_updater_v2_watchdog_journal.py",
+})
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "xdist_group(name): run every test of the group on one xdist worker"
+    )
+
+
+# tryfirst: xdist's own collection hook turns the marker into the scheduling group; when ours
+# ran after it, the marker was ignored and the files spread over several workers.
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(config, items):
+    for item in items:
+        if item.path.name in _MACHINE_WIDE_TEST_FILES:
+            item.add_marker(pytest.mark.xdist_group("machine_wide"))
+
+
+@pytest.fixture(autouse=True)
+def _fresh_refused_info_cache(monkeypatch):
+    """Every test starts with the refused-entry switch read fresh (not cached).
+
+    ``refused_info.is_enabled()`` caches the switch in a module global; a test that turned it on
+    left ``_enabled = True`` for every later test in the same process. Which test ran later
+    changed with the parallel scheduling: test_ultra_engine's deny-path test then got
+    DENY_NO_CARD_MATCH instead of DEVICE_DENIED (2026-11-09, -n 8). Tests that need the switch
+    on still set it themselves (test_refused_info_resolve's autouse fixture runs after this one).
+    """
+    try:
+        from app.core import refused_info
+    except Exception:
+        yield
+        return
+    monkeypatch.setattr(refused_info, "_enabled", None, raising=False)
+    monkeypatch.setattr(refused_info, "_index", None, raising=False)
+    yield
