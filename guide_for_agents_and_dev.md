@@ -6378,6 +6378,12 @@ thread ended, and the local API runs one thread per request: gym 45 opened 1,235
 one-thread requests opened 1 connection instead of 300 (dev PC: 0.52 ms instead of 1.62 ms each).
 `[TEST: tests/test_db_read_pool.py]` `[FIELD: gym 45 logs; the gain on a gym PC is UNVERIFIED until a
 release with it runs there]`
+A pooled connection is shared state: a borrower must not change its settings. `get_conn()` puts
+`row_factory = sqlite3.Row` back before returning one to the pool, because v2 `Journal.get` set it to
+`None` and the next borrower got plain tuples -- `load_auth_token`'s `r["email"]` then raised "tuple
+indices must be integers or slices, not str" and fingerprint enrolment failed at "Checking login...".
+`Journal.get` no longer touches it. `[CODE]` `[TEST: tests/test_db_read_pool.py]` `[FIELD: 2026-11-09,
+1.5.2, Square Fit PC]`
 
 There is **no runtime registry** of event names: no `EVENT_NAMES` symbol, no test over
 the whole set. This table is the only index, so an event missing from it is invisible.

@@ -737,6 +737,16 @@ def get_conn() -> Iterator[sqlite3.Connection]:
             except Exception:
                 healthy = False
         if healthy:
+            # Since the pool is shared across threads (2324cb3), a borrower that changed
+            # row_factory (v2 Journal.get set it to None) handed plain tuples to the NEXT
+            # borrower: load_auth_token's r["email"] then raised "tuple indices must be
+            # integers or slices, not str" and fingerprint enrolment failed at "Checking
+            # login..." [FIELD 2026-11-09]. Every pooled connection goes back named-row.
+            try:
+                conn.row_factory = sqlite3.Row
+            except Exception:
+                healthy = False
+        if healthy:
             _return_read_connection(db_path, conn)
         else:
             try:

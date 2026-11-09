@@ -129,3 +129,48 @@ def test_a_db_path_change_never_hands_back_a_connection_to_the_old_file(db, tmp_
         conn.execute("SELECT * FROM u").fetchall()
     with pytest.raises(sqlite3.ProgrammingError):
         old.execute("SELECT 1")  # the stale one was closed, not left open
+
+
+def test_a_borrower_that_changes_row_factory_cannot_poison_the_next_one(db):
+    """[FIELD 2026-11-09] v2 Journal.get set row_factory = None on its pooled connection; the
+    next borrower (load_auth_token) got plain tuples and r["email"] raised "tuple indices must
+    be integers or slices, not str" -- fingerprint enrolment failed at "Checking login...".
+    """
+    db_module, opens = db
+    with db_module.get_conn() as conn:
+        conn.row_factory = None
+        assert isinstance(conn.execute("SELECT v FROM t").fetchone(), tuple)
+
+    def read_by_name():
+        out: list[str] = []
+
+        def work():
+            with db_module.get_conn() as c:
+                out.append(c.execute("SELECT v FROM t WHERE id = 1").fetchone()["v"])
+
+        th = threading.Thread(target=work)
+        th.start()
+        th.join()
+        return out
+
+    assert read_by_name() == ["a"]
+    assert len(opens) == 1  # the same pooled connection was reused, not a fresh one
+
+
+def test_v2_journal_get_leaves_the_pooled_connection_named_row(db):
+    db_module, _ = db
+    with db_module.get_conn() as conn:
+        conn.execute(
+            "CREATE TABLE v2_command_journal (id TEXT PRIMARY KEY, type TEXT, claim_token TEXT, "
+            "state TEXT, gym_device_id INTEGER, payload_json TEXT, finish_by REAL, started_at REAL, "
+            "outcome TEXT, result_code TEXT, result_json TEXT, reported INTEGER, created_at REAL)"
+        )
+        conn.execute("INSERT INTO v2_command_journal (id, type, state) VALUES ('c1', 'T', 'SEEN')")
+        conn.commit()
+
+    from app.core.v2.commands import Journal
+
+    got = Journal().get("c1")
+    assert got["id"] == "c1" and got["state"] == "SEEN"
+    with db_module.get_conn() as conn:
+        assert conn.execute("SELECT v FROM t WHERE id = 1").fetchone()["v"] == "a"

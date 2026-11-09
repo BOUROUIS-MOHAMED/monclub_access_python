@@ -69,7 +69,8 @@ class Journal:
     def get(self, cid: str) -> Optional[Dict[str, Any]]:
         from app.core.db import get_conn
         with get_conn() as conn:
-            conn.row_factory = None
+            # Never change row_factory on a pooled connection: it leaked to the next borrower
+            # (db.get_conn). A sqlite3.Row is a sequence, so dict(zip(keys, row)) still works.
             cur = conn.execute(
                 "SELECT id, type, claim_token, state, gym_device_id, payload_json, finish_by, started_at, "
                 "outcome, result_code, result_json, reported, created_at FROM v2_command_journal WHERE id = ?",
