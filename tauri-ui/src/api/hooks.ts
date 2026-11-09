@@ -236,6 +236,8 @@ export function usePopupStream(maxHistory = 50) {
     const es = openSSE("/agent/events", (type, data) => {
       if (type === "popup" && data && typeof data === "object") {
         const evt: PopupEvent = { ...data, receivedAt: Date.now() };
+        // Dedicated desk events never enter the TV broadcast or its fallback overlay.
+        if (evt.deskTest) return;
 
         // Always add to history (for notification drawer)
         setBadgeCount((c) => c + 1);
@@ -243,6 +245,8 @@ export function usePopupStream(maxHistory = 50) {
           const n = [evt, ...prev];
           return n.length > maxHistory ? n.slice(0, maxHistory) : n;
         });
+
+        if (evt.deskOnly) return;
 
         // Send to popup window (if popupEnabled for this device)
         if (evt.popupEnabled !== false) {

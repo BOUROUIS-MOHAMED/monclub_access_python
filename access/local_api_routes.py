@@ -14,6 +14,8 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("GET", "/api/v2/health", "_handle_health"),
     ("GET", "/api/v2/platform", "_handle_platform"),
     ("GET", "/api/v2/status", "_handle_status"),
+    ("GET", "/api/v2/desk-notify/settings", "_handle_desk_notify_settings"),
+    ("POST", "/api/v2/desk-notify/test", "_handle_desk_notify_test"),
     ("POST", "/api/v2/offline/unlock", "_handle_offline_unlock"),
     ("POST", "/api/v2/offline/act-as", "_handle_offline_act_as"),
     ("POST", "/api/v2/offline/lock", "_handle_offline_lock"),

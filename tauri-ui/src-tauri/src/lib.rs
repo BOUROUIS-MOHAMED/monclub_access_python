@@ -72,6 +72,7 @@ const ACCESS_PANEL_WIDTH: f64 = 428.0;
 const ACCESS_PANEL_HEIGHT: f64 = 608.0;
 const ACCESS_PANEL_MARGIN: f64 = 16.0;
 const POPUP_LABEL: &str = "access_popup";
+const DESK_NOTIFY_LABEL: &str = "desk_notify";
 const SCAN_RESULT_LABEL: &str = "scan-result";
 const FAVORITES_OVERLAY_LABEL: &str = "favorites-overlay";
 
@@ -574,6 +575,99 @@ fn show_main_window(app: &AppHandle) {
         let _ = win.unminimize();
         let _ = win.set_focus();
     }
+}
+
+// Desk notifications never activate, including when the member clicks a close button.
+fn create_desk_notify_window(app: &AppHandle) -> Result<(), String> {
+    if app.get_webview_window(DESK_NOTIFY_LABEL).is_some() {
+        return Ok(());
+    }
+    tauri::WebviewWindowBuilder::new(app, DESK_NOTIFY_LABEL, tauri::WebviewUrl::App("/desk-notify".into()))
+        .title("MonClub Access — Notifications")
+        .inner_size(424.0, 600.0)
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .shadow(false)
+        .focused(false)
+        .focusable(false)
+        .visible(false)
+        .build().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn ensure_desk_notify_window(app: AppHandle) -> Result<(), String> {
+    create_desk_notify_window(&app)
+}
+
+#[tauri::command]
+fn hide_desk_notify_window(app: AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window(DESK_NOTIFY_LABEL) {
+        win.hide().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn desk_notify_monitor(app: &AppHandle, screen: usize) -> Result<tauri::Monitor, String> {
+    let primary = app.primary_monitor().map_err(|e| e.to_string())?;
+    let mut others = app.available_monitors().map_err(|e| e.to_string())?;
+    if let Some(ref main) = primary {
+        others.retain(|m| m.position() != main.position());
+    }
+    // 0 means primary, independently of Windows' monitor enumeration order.
+    if screen > 0 {
+        if let Some(monitor) = others.get(screen - 1) {
+            return Ok(monitor.clone());
+        }
+    }
+    primary.or_else(|| others.into_iter().next()).ok_or_else(|| "No monitor available".into())
+}
+
+#[tauri::command]
+fn desk_notify_scale(app: AppHandle, screen: usize) -> Result<f64, String> {
+    Ok(desk_notify_monitor(&app, screen)?.scale_factor())
+}
+
+#[tauri::command]
+fn layout_desk_notify_window(app: AppHandle, screen: usize, position: String, width: u32, height: u32) -> Result<(), String> {
+    let win = app.get_webview_window(DESK_NOTIFY_LABEL).ok_or("Desk window missing")?;
+    let monitor = desk_notify_monitor(&app, screen)?;
+    let work = monitor.work_area();
+    let margin = 12_i32;
+    let w = width.max(1).min(work.size.width.saturating_sub(24).max(1));
+    let h = height.max(1).min(work.size.height.saturating_sub(24).max(1));
+    let left = work.position.x + margin;
+    let top = work.position.y + margin;
+    let x = if position.ends_with("_LEFT") { left }
+        else if position.ends_with("_CENTER") { work.position.x + (work.size.width as i32 - w as i32) / 2 }
+        else { work.position.x + work.size.width as i32 - w as i32 - margin };
+    let y = if position.starts_with("TOP_") { top }
+        else { work.position.y + work.size.height as i32 - h as i32 - margin };
+    win.set_size(tauri::PhysicalSize::new(w, h)).map_err(|e| e.to_string())?;
+    win.set_position(tauri::PhysicalPosition::new(x, y)).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn show_desk_notify_window(app: AppHandle) -> Result<(), String> {
+    let win = app.get_webview_window(DESK_NOTIFY_LABEL).ok_or("Desk window missing")?;
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+        let hwnd = win.hwnd().map_err(|e| e.to_string())?;
+        unsafe { ShowWindow(hwnd.0 as _, SW_SHOWNOACTIVATE); }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    { win.show().map_err(|e| e.to_string()) }
+}
+
+#[tauri::command]
+fn show_main_for_desk_notify(app: AppHandle) {
+    show_main_window(&app);
 }
 
 fn hide_access_panel_window(app: &AppHandle) {
@@ -1776,6 +1870,12 @@ pub fn run() {
         .manage(KeepBackgroundOnClose(Mutex::new(true)))
         .manage(CurrentScanShortcut(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
+            ensure_desk_notify_window,
+            hide_desk_notify_window,
+            desk_notify_scale,
+            layout_desk_notify_window,
+            show_desk_notify_window,
+            show_main_for_desk_notify,
             set_api_port,
             get_desktop_runtime_context,
             refresh_tray_menu,
@@ -1798,6 +1898,9 @@ pub fn run() {
             }
             let handle = app.handle().clone();
             setup_tray(&handle, &setup_role, desktop_product_name(&setup_role))?;
+            if setup_role == "access" {
+                create_desk_notify_window(&handle)?;
+            }
             if start_hidden {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();

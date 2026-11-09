@@ -1384,6 +1384,8 @@ export interface TvAdEvaluateResponse {
 
 // ─── K) Popup / Notification events (SSE) ───
 export interface PopupEvent {
+  deskOnly?: boolean;
+  deskTest?: boolean;
   eventId: string;
   title: string;
   message: string;
