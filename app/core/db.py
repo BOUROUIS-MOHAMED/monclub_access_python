@@ -2958,6 +2958,7 @@ def init_db() -> None:
         )
         # Added later: membership member-type category (NORMAL | KIDS | STAFF).
         _ensure_column(conn, "sync_memberships", "members_type", "members_type TEXT")
+        _ensure_column(conn, "sync_memberships", "successor_plan_id", "successor_plan_id INTEGER")
 
         # -----------------------------
         # GymAccessSoftwareSettingsDto (single row)
@@ -6021,8 +6022,8 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                 continue
             cur.execute(
                 """
-                INSERT INTO sync_memberships (id, title, description, price, duration_in_days, members_type)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO sync_memberships (id, title, description, price, duration_in_days, members_type, successor_plan_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     m.get("id"),
@@ -6031,6 +6032,7 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     m.get("price"),
                     m.get("durationInDays"),
                     m.get("membersType"),
+                    m.get("successorPlanId"),
                 ),
             )
 
@@ -6521,7 +6523,7 @@ def _replace_sync_memberships(cur: sqlite3.Cursor, memberships: List[Dict[str, A
         if not isinstance(membership, dict):
             continue
         cur.execute(
-            "INSERT INTO sync_memberships (id, title, description, price, duration_in_days, members_type) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sync_memberships (id, title, description, price, duration_in_days, members_type, successor_plan_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 membership.get("id"),
                 membership.get("title"),
@@ -6529,6 +6531,7 @@ def _replace_sync_memberships(cur: sqlite3.Cursor, memberships: List[Dict[str, A
                 membership.get("price"),
                 membership.get("durationInDays"),
                 membership.get("membersType"),
+                membership.get("successorPlanId"),
             ),
         )
 
@@ -7237,6 +7240,31 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                     except Exception:
                         pass  # never break sync
                 _replace_sync_memberships(cur, memberships if isinstance(memberships, list) else [])
+        elif isinstance(memberships, list) and any(
+            isinstance(plan, dict) and "successorPlanId" in plan for plan in memberships
+        ):
+            # Plans arrive on every sync. Keep plan changes (successor link, price, title...)
+            # even when settings were skipped, but rewrite the table only when a row changed.
+            def _plan_key(values):
+                return tuple(None if v is None else str(v) for v in values)
+
+            incoming = {
+                plan.get("id"): _plan_key((
+                    plan.get("title"), plan.get("description"), plan.get("price"),
+                    plan.get("durationInDays"), plan.get("membersType"), plan.get("successorPlanId"),
+                ))
+                for plan in memberships
+                if isinstance(plan, dict)
+            }
+            stored = {
+                row[0]: _plan_key(row[1:])
+                for row in cur.execute(
+                    "SELECT id, title, description, price, duration_in_days, members_type, successor_plan_id "
+                    "FROM sync_memberships"
+                ).fetchall()
+            }
+            if incoming != stored:
+                _replace_sync_memberships(cur, memberships)
 
         # Conditional: members (users + fingerprints)
         if refresh.get("members", True):
