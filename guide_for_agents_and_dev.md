@@ -5412,6 +5412,16 @@ path; it does not enable the offline money queue. `[CODE]`
 
 ### 3.14a Staff login, online renewal and force-opens (1.5.0)
 
+Renewal defaults follow a tidied plan's replacement in both the online and offline dialogs.
+The sync plan's nullable `successorPlanId` is stored as `sync_memberships.successor_plan_id`
+and returned unchanged by `list_sync_memberships` through the local plans API. Full sync,
+delta sync and membership-type patches retain it. A delta carrying this field refreshes
+the plan list even when settings are skipped; an older payload without the field keeps
+the existing settings-refresh rule. The dialog selects the synced successor when present,
+names the old and new plans above the list, and still lets staff pick another plan. Without
+a successor it retains the current plan, or the existing first-plan fallback when missing.
+`[CODE; TEST: tauri-ui/src/lib/renewalPlan.test.ts, tests/test_membership_successor_db.py]`
+
 The staff poll feeds `offline_mode.py::OfflineDetector`: four consecutive transport
 failures enter automatic offline mode; two successful staff snapshots leave it. HTTP
 4xx/5xx never count as transport failures and break both streaks. A separate manual

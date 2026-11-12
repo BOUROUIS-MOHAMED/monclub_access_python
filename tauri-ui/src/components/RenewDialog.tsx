@@ -9,8 +9,9 @@ import { staffError, staffPermissionHint, staffResultUnknown } from "@/component
 import { StaffPaymentFields, staffDate, staffEmptyPayment, staffMoney, staffPaymentPayload, staffPaymentValid, staffToday } from "@/components/PayRestDialog";
 import { showStaffToast } from "@/components/Toast";
 import { cn } from "@/lib/utils";
+import { renewalPlanChoice, type RenewalPlan } from "@/lib/renewalPlan";
 
-export type StaffPlan = { id: number | string; title?: string; price?: number | string };
+export type StaffPlan = RenewalPlan;
 type StaffRenewalKind = "QUEUED" | "START_TODAY" | "AFTER_EXPIRY";
 type StaffDebtTerm = { termId: number; seq: number; planTitle: string; rest: number; dueDate: string | null; suggestedDueDate: string | null };
 type StaffRenewalQuote = {
@@ -42,7 +43,8 @@ export default function RenewDialog(props: RenewDialogProps) {
 }
 
 function OfflineRenewDialog({ member, plans, staff, onClose, onSuccess }: RenewDialogProps) {
-  const initial = plans.find((p) => String(p.id) === String(member.membershipId)) || plans[0];
+  const [choice] = useState(() => renewalPlanChoice(plans, member.membershipId));
+  const initial = choice.plan;
   const [planId, setPlanId] = useState(String(initial?.id || ""));
   const [price, setPrice] = useState(String(initial?.price ?? ""));
   const [paid, setPaid] = useState(String(initial?.price ?? ""));
@@ -69,6 +71,7 @@ function OfflineRenewDialog({ member, plans, staff, onClose, onSuccess }: RenewD
     footer={<><span className="mr-auto text-[12.5px] text-muted-foreground">Argent : {limit ? Math.max(0, limit.max - limit.used) : 0} sur {limit?.max ?? 0} restantes</span><ActionButton disabled={busy} onClick={onClose}>Annuler</ActionButton><ActionButton kind="primary" disabled={!valid || busy} onClick={() => void submit()}>{busy ? "Enregistrement…" : `Enregistrer pour validation · ${staffMoney(amount || 0)} DT`}</ActionButton></>}>
     <fieldset disabled={busy} className="min-w-0 space-y-3 pb-3">
       <legend className="sr-only">Renouvellement hors ligne</legend>
+      {choice.note && String(choice.plan?.id) === planId && <Note tone="primary">{choice.note}</Note>}
       <div className="grid gap-2 sm:grid-cols-3" role="radiogroup" aria-label="Abonnement">{plans.map((plan) => <button key={plan.id} type="button" role="radio" aria-checked={String(plan.id) === planId}
         className={cn("rounded-[10px] border p-3 text-left text-[13px] focus-visible:ring-2 focus-visible:ring-primary", String(plan.id) === planId ? "border-primary bg-primary/8" : "border-grey/32")}
         onClick={() => { setPlanId(String(plan.id)); setPrice(String(plan.price ?? "")); setPaid(String(plan.price ?? "")); }}><div className="font-bold">{plan.title || `Abonnement ${plan.id}`}</div><div className="mt-1 text-muted-foreground">{plan.price == null ? "Prix à renseigner" : `${staffMoney(Number(plan.price))} DT`}</div></button>)}</div>
@@ -83,7 +86,8 @@ function OfflineRenewDialog({ member, plans, staff, onClose, onSuccess }: RenewD
 
 function OnlineRenewDialog({ member, plans, staff, gymDate, onClose, onSuccess }: RenewDialogProps) {
   const today = gymDate || staffToday();
-  const initialPlan = plans.find((p) => String(p.id) === String(member.membershipId)) || plans[0];
+  const [choice] = useState(() => renewalPlanChoice(plans, member.membershipId));
+  const initialPlan = choice.plan;
   const [planId, setPlanId] = useState(String(initialPlan?.id || ""));
   const [price, setPrice] = useState(String(initialPlan?.price ?? ""));
   const [paid, setPaid] = useState(String(initialPlan?.price ?? ""));
@@ -162,6 +166,7 @@ function OnlineRenewDialog({ member, plans, staff, gymDate, onClose, onSuccess }
     footer={<><span className="mr-auto text-[12.5px] text-muted-foreground">Fait par {staff?.agent?.name}</span><ActionButton disabled={busy} onClick={onClose}>Annuler</ActionButton><ActionButton kind="primary" disabled={!valid || busy} onClick={() => void submit()}>{busy ? "Renouvellement…" : `Renouveler · ${staffMoney(numericPrice || 0)} DT`}</ActionButton></>}>
     <fieldset disabled={busy} className="min-w-0 space-y-3">
       <legend className="sr-only">Abonnement et paiement</legend>
+      {choice.note && String(choice.plan?.id) === planId && <Note tone="primary">{choice.note}</Note>}
       <div className="grid gap-2 sm:grid-cols-3" role="radiogroup" aria-label="Abonnement">
         {plans.map((plan) => <button type="button" role="radio" aria-checked={String(plan.id) === planId} key={plan.id}
           className={cn("rounded-[10px] border p-3 text-left text-[13px] focus-visible:ring-2 focus-visible:ring-primary", String(plan.id) === planId ? "border-primary bg-primary/8" : "border-grey/32")}
