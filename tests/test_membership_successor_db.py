@@ -59,3 +59,14 @@ def test_existing_database_gains_nullable_column_without_losing_plans(tmp_path, 
     db.init_db()
     assert db.list_sync_memberships() == [{"id": 7, "title": "Existing", "description": None,
         "price": None, "duration_in_days": None, "members_type": None, "successor_plan_id": None}]
+
+
+def test_skipped_settings_still_store_a_changed_plan_price(db):
+    db.save_sync_cache({"membership": plans(), "users": []})
+    changed = plans()
+    changed[0]["price"] = "650.000"
+    db.save_sync_cache_delta({"membership": changed}, {"settings": False, "members": False,
+                             "devices": False, "credentials": False})
+    rows = {r["id"]: r for r in db.list_sync_memberships()}
+    assert rows[1]["price"] == "650.000"
+    assert rows[1]["successor_plan_id"] == 2

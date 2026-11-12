@@ -7243,16 +7243,25 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
         elif isinstance(memberships, list) and any(
             isinstance(plan, dict) and "successorPlanId" in plan for plan in memberships
         ):
-            # Plans arrive on every sync. Keep replacement changes even when settings were
-            # skipped, but rewrite the table only when a successor link actually changed.
+            # Plans arrive on every sync. Keep plan changes (successor link, price, title...)
+            # even when settings were skipped, but rewrite the table only when a row changed.
+            def _plan_key(values):
+                return tuple(None if v is None else str(v) for v in values)
+
             incoming = {
-                plan.get("id"): plan.get("successorPlanId")
+                plan.get("id"): _plan_key((
+                    plan.get("title"), plan.get("description"), plan.get("price"),
+                    plan.get("durationInDays"), plan.get("membersType"), plan.get("successorPlanId"),
+                ))
                 for plan in memberships
                 if isinstance(plan, dict)
             }
             stored = {
-                row[0]: row[1]
-                for row in cur.execute("SELECT id, successor_plan_id FROM sync_memberships").fetchall()
+                row[0]: _plan_key(row[1:])
+                for row in cur.execute(
+                    "SELECT id, title, description, price, duration_in_days, members_type, successor_plan_id "
+                    "FROM sync_memberships"
+                ).fetchall()
             }
             if incoming != stored:
                 _replace_sync_memberships(cur, memberships)
