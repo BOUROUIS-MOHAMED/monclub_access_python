@@ -2143,9 +2143,11 @@ def _handle_members_roster(ctx: _Ctx) -> None:
         counts = {key: sum(1 for r in rows if key == "all" or r.get("status") == key)
                   for key in ("all", "active", "expired", "pending")}
         counts["held"] = sum(1 for r in rows if r.get("heldReason"))
+        matricule_query = int(q.strip()) if q.strip().isdecimal() else None
         rows = [r for r in rows if (status == "all" or r.get("status") == status) and
-                (not q or any(q.lower() in str(r.get(k) or "").lower() for k in
-                              ("fullName", "phone", "email", "accountUsernameId", "firstCardId", "secondCardId", "membershipTitle")))]
+                (not q or (matricule_query is not None and matricule_query == r.get("matricule")) or
+                 any(q.lower() in str(r.get(k) or "").lower() for k in
+                     ("fullName", "phone", "email", "accountUsernameId", "firstCardId", "secondCardId", "membershipTitle")))]
         key = {"validTo": "validTo", "membership": "membershipTitle", "status": "status"}.get(sort_by, "fullName")
         rows.sort(key=lambda r: str(r.get(key) or "").lower(), reverse=sort_dir == "desc")
         total = len(rows)

@@ -474,7 +474,8 @@ export default function EnrollPage() {
     ? users.filter((u) =>
         `${u.fullName} ${u.userId} ${u.phone || ""} ${u.email || ""}`
           .toLowerCase()
-          .includes(userSearch.toLowerCase()),
+          .includes(userSearch.toLowerCase()) ||
+        (/^\d+$/.test(userSearch.trim()) && u.matricule != null && Number(userSearch.trim()) === u.matricule),
       )
     : users.slice(0, 50);
 
@@ -742,7 +743,7 @@ export default function EnrollPage() {
                       selectedUserId === String(u.userId) && "bg-primary/8 text-primary-ink",
                     )}
                   >
-                    <span className="truncate font-semibold">{u.fullName || "—"}</span>
+                    <span className="truncate font-semibold">{u.fullName || "—"}{u.matricule != null && <span className="ml-2 text-[12px] font-normal text-muted-foreground">N° {u.matricule}</span>}</span>
                     <span className="shrink-0 font-mono text-[12px] text-muted-foreground">#{u.userId}</span>
                   </button>
                 ))}
@@ -881,7 +882,7 @@ export default function EnrollPage() {
                         }`}
                         onClick={() => setSelectedUserId(String(u.userId))}
                       >
-                        <span className="font-medium">{u.fullName || "-"}</span>
+                        <span className="font-medium">{u.fullName || "-"}{u.matricule != null && <span className="ml-2 text-xs font-normal text-muted-foreground">N° {u.matricule}</span>}</span>
                         <span className="text-xs text-muted-foreground">#{u.userId}</span>
                       </div>
                     ))

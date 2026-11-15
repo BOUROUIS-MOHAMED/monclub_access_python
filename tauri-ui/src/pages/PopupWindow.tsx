@@ -57,6 +57,7 @@ export function toPopupEvent(raw: any): PopupEvent {
     imagePath: String(raw?.imagePath ?? raw?.image ?? ""),
     popupShowImage: raw?.popupShowImage !== false,
     userFullName: String(raw?.userFullName ?? raw?.fullName ?? ""),
+    matricule: typeof raw?.matricule === "number" ? raw.matricule : null,
     userImage: String(raw?.userImage ?? raw?.image ?? ""),
     userValidFrom: String(raw?.userValidFrom ?? raw?.validFrom ?? ""),
     userValidTo: String(raw?.userValidTo ?? raw?.validTo ?? ""),
@@ -199,6 +200,7 @@ interface EntryScan {
   refusedCardNo: string;
   plan: string | null;
   memberNo: string | null;
+  matricule: number | null;
   category: ScanCategory;
   validTo: Date | null;
   birthday: Date | null;
@@ -293,6 +295,7 @@ function mapLaneToScan(lane: ActiveLane): EntryScan {
     refusedCardNo: e.refusedCardNo || "",
     plan: title,
     memberNo: e.userMembershipId != null ? String(e.userMembershipId) : null,
+    matricule: e.matricule ?? null,
     category: cat,
     validTo: aParseDate(e.userValidTo),
     birthday: e.userBirthday ? aParseDate(e.userBirthday) : null,
@@ -649,6 +652,7 @@ function AVerdict({ scan, now, onImageError }: { scan: EntryScan; now: Date; onI
             {refused && (
               aUnknownCard(scan) ? <div style={{ marginTop: "22px", font: "600 20px ui-monospace, SFMono-Regular, Menlo, monospace", color: A_RED_SUB }}>{"Carte n° " + scan.refusedCardNo}</div> :
               <div style={{ marginTop: "22px", display: "flex", alignItems: "center", gap: "12px", fontSize: "20px", fontWeight: 600, color: A_RED_SUB }}>
+                {scan.matricule != null && <span>Matricule {scan.matricule}</span>}
                 {!!scan.plan && <><span>{scan.plan}</span><span style={{ width: "5px", height: "5px", borderRadius: "50%", background: A_RED_SUB }} /></>}
                 <ARefusalGlyph name={scan.method === "qr" ? "qrCode2" : "creditCard"} size={22} color={A_RED_SUB} />
                 <span>{aMethodLabel(scan.method)}</span>
@@ -700,7 +704,7 @@ function AVerdict({ scan, now, onImageError }: { scan: EntryScan; now: Date; onI
               </div>
             </div>
             <span style={{ flex: "none", fontSize: "19px", fontWeight: 600, color: "#4A5056", whiteSpace: "nowrap" }}>
-              {[scan.plan, scan.memberNo ? "nº " + scan.memberNo : null].filter(Boolean).join(" · ")}
+              {[scan.plan, scan.matricule != null ? "Matricule " + scan.matricule : null, scan.memberNo ? "nº " + scan.memberNo : null].filter(Boolean).join(" · ")}
             </span>
           </div>
         ) : expiring ? (
@@ -712,7 +716,7 @@ function AVerdict({ scan, now, onImageError }: { scan: EntryScan; now: Date; onI
               </div>
               <div style={{ fontSize: "19px", fontWeight: 500, color: A_GOLD }}>Passez à l'accueil quand vous voulez pour le renouveler.</div>
             </div>
-            {!!scan.memberNo && <span style={{ flex: "none", fontSize: "18px", fontWeight: 600, color: A_GOLD }}>{"nº " + scan.memberNo}</span>}
+            {(scan.matricule != null || !!scan.memberNo) && <span style={{ flex: "none", fontSize: "18px", fontWeight: 600, color: A_GOLD }}>{[scan.matricule != null ? "Matricule " + scan.matricule : null, scan.memberNo ? "nº " + scan.memberNo : null].filter(Boolean).join(" · ")}</span>}
           </div>
         ) : (
           <div style={{ flex: "none", display: "flex", alignItems: "center", gap: "14px", fontSize: "21px", fontWeight: 600, color: f.soft }}>
@@ -722,6 +726,7 @@ function AVerdict({ scan, now, onImageError }: { scan: EntryScan; now: Date; onI
             {scan.category !== "standard" && (
               <APill bg="rgba(255,255,255,.22)" color={f.ink}>{A_CATEGORY_LABEL[scan.category]}</APill>
             )}
+            {scan.matricule != null && <span>Matricule {scan.matricule}</span>}
             {!!scan.plan && <span>{scan.plan}</span>}
             {!birthday && !!scan.plan && !!scan.validTo && (
               <span style={{ width: "5px", height: "5px", borderRadius: "50%", background: f.dot }} />
@@ -827,6 +832,7 @@ function AMulti({ scans, now, onImageError }: { scans: EntryScan[]; now: Date; o
                 {!!scan.lastName && (
                   <div style={{ ...A_NAME, fontSize: lastSize + "px", color: f.sub, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{scan.lastName}</div>
                 )}
+                {scan.matricule != null && <div style={{ fontSize: footSize + "px", color: f.soft }}>Matricule {scan.matricule}</div>}
               </div>
               </div>
               {deny ? (

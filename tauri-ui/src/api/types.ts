@@ -446,6 +446,7 @@ export interface UserDto {
   email: string;
   validFrom: string;
   validTo: string;
+  matricule?: number | null;
   firstCardId: string | null;
   secondCardId: string | null;
   image: string | null;
@@ -1392,6 +1393,7 @@ export interface PopupEvent {
   imagePath: string;
   popupShowImage: boolean;
   userFullName: string;
+  matricule?: number | null;
   userImage: string;
   userValidFrom: string;
   userValidTo: string;

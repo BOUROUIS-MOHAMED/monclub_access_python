@@ -45,6 +45,7 @@ import {
   CreditCard,
   Eye,
   Fingerprint,
+  Hash,
   History,
   IdCard,
   ImagePlus,
@@ -94,6 +95,7 @@ type MemberRosterRow = {
   approvalCreated?: boolean;
   offlinePassState?: "ACTIVE" | "AWAITING_REAL_PIN" | "DROPPED" | null;
   offlinePendingLocalId?: string;
+  matricule?: number | null;
   firstCardId?: string;
   secondCardId?: string;
   validFrom?: string;
@@ -1385,6 +1387,7 @@ export default function UsersPage() {
     };
     const creds = [
       { icon: IdCard, l: "Identifiant compte", v: n(m.accountUsernameId) },
+      ...(m.matricule != null ? [{ icon: Hash, l: "Matricule", v: String(m.matricule) }] : []),
       { icon: CreditCard, l: "Carte", v: n(m.firstCardId) },
       { icon: CreditCard, l: "Deuxième carte", v: n(m.secondCardId) },
     ];
@@ -1497,7 +1500,7 @@ export default function UsersPage() {
             <input
               value={rosterQInput}
               onChange={(e) => setRosterQInput(e.target.value)}
-              placeholder="Nom, e-mail, téléphone, carte…"
+              placeholder="Nom, matricule, e-mail, téléphone, carte…"
               aria-label="Rechercher un membre"
               className="min-w-0 flex-1 bg-transparent text-[13.5px] text-foreground outline-none placeholder:text-muted-foreground"
             />
@@ -1557,7 +1560,7 @@ export default function UsersPage() {
                 <FlexCell flex={2.4}>
                   <Avatar initials={initialsOf(m.fullName || "")} tone={m.hasConflict ? "error" : st.tone} />
                   <CellText
-                    title={m.fullName || "—"}
+                    title={<>{m.fullName || "—"}{m.matricule != null && <span className="ml-2 text-[12px] font-normal text-muted-foreground">N° {m.matricule}</span>}</>}
                     sub={m.email || m.accountUsernameId || ""}
                     strong
                     flags={flag ? [flag] : undefined}

@@ -1134,6 +1134,19 @@ def _member_fees_json(u: Dict[str, Any]) -> Optional[str]:
     return json.dumps(fees, ensure_ascii=False, separators=(",", ":")) if fees else None
 
 
+def _member_matricule(u: Dict[str, Any]) -> Optional[int]:
+    """The member's per-gym number from a backend row (``matricule``) or a cached row; None when the
+    gym does not use matricules. Display and search only."""
+    raw = u.get("matricule")
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        n = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
 def _refresh_member_account_links(cur: Any) -> None:
     """Record every cached (activeMembershipId -> mainAccountId) pair in member_account_link.
 
@@ -1443,6 +1456,7 @@ def _create_protocol2_tables(conn: sqlite3.Connection) -> None:
     # Member fees F3c: _SYNC_USER_COLUMNS gained fees_json and a hold or a restore copies column
     # for column, so the held copy carries it too (guide §3.12).
     _ensure_column(conn, "sync_users_held", "fees_json", "fees_json TEXT")
+    _ensure_column(conn, "sync_users_held", "matricule", "matricule INTEGER")
 
 
 def get_access_v2_state() -> Dict[str, Any]:
@@ -2933,6 +2947,9 @@ def init_db() -> None:
         # every sync_users column above.
         _ensure_column_forcing_refresh(
             conn, "sync_users", "fees_json", "fees_json TEXT", _MEMBER_VERSION_TOKEN_KEYS,
+        )
+        _ensure_column_forcing_refresh(
+            conn, "sync_users", "matricule", "matricule INTEGER", _MEMBER_VERSION_TOKEN_KEYS,
         )
 
         # F-005: UNIQUE index on (user_id, active_membership_id) to prevent duplicate rows
@@ -5067,8 +5084,8 @@ def upsert_delta_users(users: list[dict]) -> None:
                     first_card_id, second_card_id, image,
                     fingerprints_json, face_id, account_username_id,
                     qr_code_payload, birthday, image_source, user_image_status,
-                    user_profile_image, main_account_id, fees_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    user_profile_image, main_account_id, fees_json, matricule
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     u.get("userId"), am_id, m_id,
@@ -5083,6 +5100,7 @@ def upsert_delta_users(users: list[dict]) -> None:
                     u.get("userProfileImage"),
                     _member_main_account_id(u),
                     _member_fees_json(u),
+                    _member_matricule(u),
                 ),
             )
         _refresh_member_account_links(conn)
@@ -5987,8 +6005,8 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     fingerprints_json,
                     face_id, account_username_id, qr_code_payload, birthday,
                     image_source, user_image_status, user_profile_image,
-                    main_account_id, fees_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    main_account_id, fees_json, matricule
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     u.get("userId"),
@@ -6012,6 +6030,7 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     u.get("userProfileImage"),
                     _member_main_account_id(u),
                     _member_fees_json(u),
+                    _member_matricule(u),
                 ),
             )
         _refresh_member_account_links(cur)
@@ -6488,8 +6507,8 @@ def _upsert_sync_user_row(cur: sqlite3.Cursor, member: Dict[str, Any]) -> None:
             fingerprints_json,
             face_id, account_username_id, qr_code_payload, birthday,
             image_source, user_image_status, user_profile_image,
-            main_account_id, fees_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            main_account_id, fees_json, matricule
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             member.get("userId"),
@@ -6513,6 +6532,7 @@ def _upsert_sync_user_row(cur: sqlite3.Cursor, member: Dict[str, Any]) -> None:
             member.get("userProfileImage"),
             _member_main_account_id(member),
             _member_fees_json(member),
+            _member_matricule(member),
         ),
     )
 
@@ -6773,11 +6793,12 @@ _SYNC_USER_COLUMNS: tuple[str, ...] = (
     # Member fees F3c (guide §3.12). APPENDED for the same reason: a row whose ONLY change is
     # its fee lines must compare unequal, or a fee paid at the desk would stay "unpaid".
     "fees_json",
+    "matricule",
 )
 # Schema affinities (CREATE TABLE sync_users + the _ensure_column migrations): the four
-# ids are INTEGER, every other column is TEXT.
+# ids and matricule are INTEGER, every other column is TEXT.
 _SYNC_USER_INTEGER_COLUMNS = frozenset(
-    {"user_id", "active_membership_id", "membership_id", "main_account_id"}
+    {"user_id", "active_membership_id", "membership_id", "main_account_id", "matricule"}
 )
 _SYNC_USER_COLUMN_IS_INTEGER: tuple[bool, ...] = tuple(
     c in _SYNC_USER_INTEGER_COLUMNS for c in _SYNC_USER_COLUMNS
@@ -6785,7 +6806,7 @@ _SYNC_USER_COLUMN_IS_INTEGER: tuple[bool, ...] = tuple(
 
 
 def _sync_user_row_values(u: Dict[str, Any]) -> tuple:
-    """The 21 values the sync_users INSERT binds, in _SYNC_USER_COLUMNS order.
+    """The 22 values the sync_users INSERT binds, in _SYNC_USER_COLUMNS order.
 
     Mirrors the delta-branch INSERT exactly -- same activeMembershipId -> membershipId
     fallback, same key aliases, same json.dumps of the templates -- so a full and a
@@ -6811,6 +6832,7 @@ def _sync_user_row_values(u: Dict[str, Any]) -> tuple:
         u.get("userProfileImage"),
         _member_main_account_id(u),
         _member_fees_json(u),
+        _member_matricule(u),
     )
 
 
@@ -6944,8 +6966,8 @@ def _apply_full_users_refresh(
                     full_name, phone, email, valid_from, valid_to,
                     first_card_id, second_card_id, image,
                     fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
-                    image_source, user_image_status, user_profile_image, main_account_id, fees_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    image_source, user_image_status, user_profile_image, main_account_id, fees_json, matricule
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 vals,
             )
@@ -6964,7 +6986,7 @@ def _apply_full_users_refresh(
                     first_card_id=?, second_card_id=?, image=?,
                     fingerprints_json=?, face_id=?, account_username_id=?, qr_code_payload=?, birthday=?,
                     image_source=?, user_image_status=?, user_profile_image=?,
-                    main_account_id=?, fees_json=?
+                    main_account_id=?, fees_json=?, matricule=?
                 WHERE rowid=?
                 """,
                 vals + (hit[0],),
@@ -7306,8 +7328,8 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                                     first_card_id, second_card_id, image,
                                     fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
                                     image_source, user_image_status, user_profile_image,
-                                    main_account_id, fees_json
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    main_account_id, fees_json, matricule
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
                                 (
                                     u.get("userId"), am_id, m_id,
@@ -7323,6 +7345,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                                     u.get("userProfileImage"),
                                     _member_main_account_id(u),
                                     _member_fees_json(u),
+                                    _member_matricule(u),
                                 ),
                             )
                             upserted_count += 1
@@ -7686,6 +7709,7 @@ def _coerce_user_row_to_payload(u: Dict[str, Any]) -> Dict[str, Any]:
         "birthday": g("birthday"),
         # Member fees F3c: the entry screen's fee lines, [] when none (guide §3.12).
         "fees": _member_fees_list(g("fees", "fees_json")),
+        "matricule": _member_matricule(u),
     }
 
 
@@ -8758,7 +8782,11 @@ def list_members_roster(
             "firstCardId", "secondCardId", "membershipTitle",
         )
 
+        matricule_query = int(ql) if ql.isdecimal() else None
+
         def _match(r: Dict[str, Any]) -> bool:
+            if matricule_query is not None and matricule_query == r.get("matricule"):
+                return True
             for k in search_keys:
                 v = r.get(k)
                 if v and ql in str(v).lower():

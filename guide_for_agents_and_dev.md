@@ -4193,7 +4193,7 @@ no `tzdata`, so `zoneinfo.ZoneInfo('Africa/Tunis')` raises; the Tunis offset is 
 | `access_v2_state` (one row) | the last `syncMeta`, `trusted`, the clock (`server_epoch`, `utc_offset_sec`, `skew_sec`, `floor_date`, `max_pc_epoch`, `clock_suspect`, `clock_reason`), `applied_date`, `grace_days`. NOT cleared by `clear_version_tokens` |
 | `member_access_window` | the window of every membership of today's set; replaced whole by each members section |
 | `sync_upcoming_users`, `sync_upcoming_credentials` | `upcoming[]` / `upcomingCredentials` exactly as last sent (the row's JSON; credentials stored disabled) |
-| `sync_users_held` | rows of today's set taken off the roster for a later gym date; the same 20 columns as `sync_users` (`_SYNC_USER_COLUMNS`) + reason/date. Also listed, flagged, on the Utilisateurs roster and member card (§3.14) |
+| `sync_users_held` | rows of today's set taken off the roster for a later gym date; the same 22 columns as `sync_users` (`_SYNC_USER_COLUMNS`) + reason/date. Also listed, flagged, on the Utilisateurs roster and member card (§3.14) |
 | `member_person_link` | membership → `userId` (+ `mainAccountId`), never deleted; written with `member_account_link` by every `sync_users` writer (no `mainAccountId` filter), back-filled at `init_db` — used by §3.4f |
 
 `windowsVersion` lives in `sync_version_tokens` (so logout and hard reset drop it and the request
@@ -5209,7 +5209,7 @@ the lines back as `fees` (a list, `[]` when none; `db.py::_member_fees_list`). `
 is `sync_access_software_settings.fee_due_soon_days`, read through
 `settings_reader.py::normalize_global_settings` as `fee_due_soon_days`, clamped 1-30, 7 when NULL.
 `[TEST: tests/test_member_fees_access.py; tests/test_full_replace_row_diff.py::
-test_full_refresh_statements_bind_every_column (21 columns);
+test_full_refresh_statements_bind_every_column (22 columns);
 tests/test_protocol2_save_and_flip.py::test_a_hold_and_restore_round_trip_preserves_every_sync_users_column]`
 
 **The upgrade.** Both columns arrive NULL and the backend's `membersVersion` / `settingsVersion`
@@ -5244,6 +5244,27 @@ renouveler. », the last line ending « +N autre(s) »; `AMulti` puts one small 
 tile's photo (red when a fee is unpaid, else gold). `[TEST: tauri-ui src/lib/feeAlerts.test.ts
 (npm test)]` The layout on a real entry TV with two fee lines and the gold expiry footer together
 is `[UNVERIFIED]`: checked by type-check and by reading the 1280×720 stage sizes only.
+
+**Member number (`matricule`, 2026-11-15).** `sync_users.matricule` and
+`sync_users_held.matricule` are nullable INTEGER columns. `_member_matricule` accepts positive
+integers and integer text; absent, null, boolean and invalid values become NULL. Every member
+writer stores it; `_SYNC_USER_COLUMNS` includes it in cache-row comparisons and held-row copies;
+`_coerce_user_row_to_payload` returns it. Adding the column drops the two member progress tokens
+once through `_ensure_column_forcing_refresh`, even when `fees_json` is added at the same start.
+It is display and search data only; device hashes, credentials, PINs and door decisions do not
+read it. `[CODE: db.py::_member_matricule, init_db, _sync_user_row_values;
+device_sync.py::_compute_desired_hash; ultra_engine.py::_standalone_pin_hash]`
+`[TEST: tests/test_member_matricule_access.py]`
+
+The member roster and its approval branch match a trimmed decimal query by exact number,
+ignoring leading zeros; their existing substring fields remain unchanged. `EnrollPage.tsx`
+applies the same exact match. `UsersPage.tsx` shows « N° 42 » next to the name and « Matricule »
+in the detail list. Entry popups carry `NotificationRequest.matricule` from an already resolved
+member (`ultra_pc_entry.py::member_popup_fields`, `ultra_engine.py::_enqueue_notification`,
+`realtime_agent.py::_popup_payload_from_request`); the popup enrichment adds no database lookup.
+`PopupWindow.tsx` and `NotificationPopup.tsx` show it in secondary identity text. The refused
+directory has no matricule: only refusals resolved from the roster or held rows carry it.
+`[CODE]` `[TEST: tests/test_member_matricule_access.py]` UI rendering is `[UNVERIFIED]`.
 
 ### 3.13 History pages and Base locale figures (Access v5 Card H, 2026-10-16)
 
