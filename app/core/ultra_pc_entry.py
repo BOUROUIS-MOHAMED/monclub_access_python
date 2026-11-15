@@ -87,7 +87,7 @@ def member_popup_fields(user: Any) -> Dict[str, Any]:
             "user_full_name": "", "user_image": "", "user_membership_id": None,
             "user_membership_plan_id": None, "user_phone": "", "user_valid_from": "",
             "user_valid_to": "", "user_birthday": "", "image_source": "", "user_image_status": "",
-            "user_profile_image": "", "user_id": None, "user_fees": [],
+            "user_profile_image": "", "user_id": None, "user_fees": [], "user_matricule": None,
         }
     membership_id: Optional[int] = None
     raw_am_id = user.get("activeMembershipId")
@@ -110,6 +110,7 @@ def member_popup_fields(user: Any) -> Dict[str, Any]:
         "user_profile_image": str(user.get("userProfileImage", "") or ""),
         # Member fees F3c: the cached fee lines, for the entry screen only (guide §3.12).
         "user_fees": list(user.get("fees") or []),
+        "user_matricule": user.get("matricule"),
         # for the frequent-pass visual alert only
         "user_id": _uid_for_alert(user),
     }

@@ -77,6 +77,7 @@ class NotificationRequest:
     # required, paid}], only fees not settled and not paused; [] when none. DISPLAY ONLY: the
     # entry screen judges them against its own today (tauri-ui src/lib/feeAlerts.ts).
     fees: List[Dict[str, Any]] = field(default_factory=list)
+    matricule: Optional[int] = None
 
 
 @dataclass

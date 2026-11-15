@@ -381,6 +381,7 @@ def _popup_payload_from_request(req: NotificationRequest) -> Dict[str, Any]:
         "imagePath": req.image_path,
         "popupShowImage": req.popup_show_image,
         "userFullName": req.user_full_name,
+        "matricule": req.matricule,
         "userImage": req.user_image,
         "userValidFrom": req.user_valid_from,
         "userValidTo": req.user_valid_to,
@@ -1545,6 +1546,7 @@ class DecisionService(threading.Thread):
                 win_notify_enabled=bool(settings.get("win_notify_enabled", True)),
                 user_profile_image=user_profile_image,
                 fees=list(user.get("fees") or []) if isinstance(user, dict) else [],
+                matricule=user.get("matricule") if isinstance(user, dict) else None,
             )
 
             # Windows notification (per-device winNotifyEnabled)

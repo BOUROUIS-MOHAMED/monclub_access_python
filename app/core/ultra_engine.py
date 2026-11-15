@@ -6688,6 +6688,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             user_image_status=user_image_status,
             user_profile_image=user_profile_image,
             user_fees=(user.get("fees") if isinstance(user, dict) else None),
+            user_matricule=(user.get("matricule") if isinstance(user, dict) else None),
             # for the frequent-pass visual alert only
             user_id=_uid_for_alert(user),
             door_id=door_id,
@@ -6958,6 +6959,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                 user_image_status=user_image_status,
                 user_profile_image=user_profile_image,
                 user_fees=(user.get("fees") if isinstance(user, dict) else None),
+                user_matricule=(user.get("matricule") if isinstance(user, dict) else None),
                 # for the frequent-pass visual alert only
                 user_id=_uid_for_alert(user),
                 door_id=door_id,
@@ -7148,6 +7150,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         door_id: Optional[int] = None,
         # Member fees F3c: the member's cached fee lines, for the entry screen only (guide §3.12).
         user_fees: Optional[List[Dict[str, Any]]] = None,
+        user_matricule: Optional[int] = None,
         user_membership_title: str = "",
         reason_date: str = "",
         refused_display: bool = False,
@@ -7240,6 +7243,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                 user_image_status=user_image_status,
                 user_profile_image=user_profile_image,
                 fees=list(user_fees or []),
+                matricule=user_matricule,
                 popup_duration_sec=int(self._settings.get("popup_duration_sec", 3)),
                 popup_enabled=bool(popup_enabled),
                 win_notify_enabled=bool(self._settings.get("win_notify_enabled", False)),

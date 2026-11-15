@@ -63,6 +63,7 @@ export default function NotificationPopup({ popup, onDismiss }: Props) {
         <Box sx={{ gridColumn: "1/2", gridRow: "2/4", display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "flex-end", px: 3, py: 2, bgcolor: allowed ? "rgba(34,197,94,0.1)" : "rgba(239,68,68,0.1)" }}>
           <Typography variant="overline" sx={{ color: "#888", mb: 0.5 }}>Nom complet</Typography>
           <Typography variant="h4" sx={{ color: "#fff", fontWeight: 700, textAlign: "right", mb: 3 }}>{popup.userFullName || "—"}</Typography>
+          {popup.matricule != null && <Typography variant="body2" sx={{ color: "#888", mb: 1 }}>N° {popup.matricule}</Typography>}
           <Typography variant="overline" sx={{ color: "#888", mb: 0.5 }}>Téléphone</Typography>
           <Typography variant="h6" sx={{ color: "#ccc", textAlign: "right" }}>{popup.userPhone || "—"}</Typography>
         </Box>
