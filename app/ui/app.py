@@ -518,6 +518,25 @@ class MainApp:
             print(f"Architecture error: {e}\nPlatform: {platform_summary()}")
             raise
 
+        self._boot_version = _read_runtime_version_string()
+        from app.core.logger import set_log_header_provider
+        from app.core.log_meta import build_header_text
+
+        # Built once, outside any lock: the file handler calls the provider while it holds its
+        # own lock, so the provider must never take another lock (PC identity, update manager)
+        # that a logging thread could hold. The running version is the boot version (an update
+        # restarts the app); the PC is named by pcUuid in the upload meta, not in this line.
+        import platform as _platform
+        _header_text = build_header_text(
+            str(self._boot_version)[:64], None,
+            f"{_platform.system()} {_platform.release()} {_platform.version()}"[:120],
+            "64-bit" if sys.maxsize > 2**32 else "32-bit")
+
+        def _log_header():
+            return _header_text
+
+        set_log_header_provider(_log_header)
+
         # --- Log upload queue (marker-file based, daemon thread) ---
         try:
             from app.core.log_uploader import LogUploadQueue
@@ -540,6 +559,7 @@ class MainApp:
                 log_dir=LOG_DIR,
                 get_token=load_auth_token,
                 get_upload_url=_resolve_presign_url,
+                get_meta=self._log_context,
             )
             # Wire the callback into the rotating file handler
             for _h in self.logger.handlers:
@@ -560,7 +580,24 @@ class MainApp:
         except Exception as _lue:
             # Never crash startup due to upload system
             self.logger.warning("Log upload queue failed to start: %s", _lue)
-        self._boot_version = _read_runtime_version_string()
+        self._discovery_scheduler = None
+        try:
+            from app.core.device_discovery import DiscoveryScheduler, post_discovery_report
+            from app.core.v2.store import kv_get, kv_put
+            from app.core.app_const import MONCLUB_BASE_URL
+
+            def _post_discovery(device_id, body):
+                state = load_auth_token()
+                token = state.token if hasattr(state, "token") else state
+                if not token:
+                    return {}
+                return post_discovery_report(MONCLUB_BASE_URL, token, device_id, body)
+
+            self._discovery_scheduler = DiscoveryScheduler(
+                self, post_report=_post_discovery, kv_get=kv_get, kv_put=kv_put)
+            self._discovery_scheduler.start()
+        except Exception as exc:
+            self.logger.warning("Device discovery scheduler failed to start: %s", exc)
         # NOTE: _started_from_windows_startup is set later in __init__ from sys.argv;
         # read the same source directly here so the banner doesn't depend on init order.
         _boot_startup_arg = WINDOWS_STARTUP_ARG in sys.argv[1:]
@@ -859,7 +896,42 @@ class MainApp:
                 self.logger.info("KeyboardInterrupt received, shutting down.")
             self.quit_app()
 
+    def _log_context(self) -> dict:
+        import platform
+        version = getattr(self, "_boot_version", "unknown")
+        try:
+            version = self._update_manager.get_current_version() or version
+        except Exception:
+            pass
+        identity = {}
+        try:
+            from access.pc_identity import get_pc_identity_service
+            identity = get_pc_identity_service(self).status() or {}
+        except Exception:
+            pass
+        role = None
+        if getattr(self, "_v2_runtime", None) is not None:
+            try:
+                from app.core.v2 import lease_gate
+                role = lease_gate.current().role
+            except Exception:
+                pass
+        if role not in ("DRIVER", "READER", "ALL_TURNSTILES"):
+            role = None
+        return {
+            "appVersion": str(version)[:64], "pcUuid": identity.get("pcUuid"),
+            "pcName": identity.get("pcName"), "pcRole": role,
+            "osVersion": f"{platform.system()} {platform.release()} {platform.version()}"[:120],
+            "arch": "64-bit" if sys.maxsize > 2**32 else "32-bit",
+        }
+
     def destroy(self) -> None:
+        discovery = getattr(self, "_discovery_scheduler", None)
+        if discovery is not None:
+            discovery.stop()
+        uploader = getattr(self, "_log_upload_queue", None)
+        if uploader is not None:
+            uploader.stop()
         self._stop_event.set()
         self._wake_scheduler()
         v2_runtime = getattr(self, "_v2_runtime", None)

@@ -699,6 +699,22 @@ the wrong heading. `[TEST: fake-COM harness under 32-bit Windows PowerShell 5.1]
 
 ---
 
+### Identity reads
+
+`read_identity(*, timeout_sec=_DEFAULT_CMD_TIMEOUT_SEC)` queues `read_identity` on the
+STA dispatch. `_do_read_identity` reads serial, firmware, product code (falling back to
+`GetSysOption(1, "~DeviceName", out)`), platform, algorithm versions, MAC and the usage /
+capacity indices in `_STATUS_FIELDS`. Unsupported fields are absent; no connection is
+opened. String reads try the `(ok, value)` tuple shape first (the shape `_read_platform`
+relies on), then a ByRef VARIANT. Usage and capacity counters go through the unchanged
+`_read_status_index`, so a terminal that only answers the ByRef shape reports no capacity
+(absent, never guessed).
+`[CODE: ZKStandaloneDevice.read_identity, ::_do_read_identity, ::_read_status_index]`
+`[TEST: tests/test_device_discovery.py::test_standalone_identity_partial,
+::test_standalone_not_connected, ::test_standalone_identity_byref_shape,
+::test_status_tuple_return_with_byref_argument]` Firmware support and read duration remain
+`[UNVERIFIED — hardware]`.
+
 ## 5. `push_roster` — behaviour
 
 ```python

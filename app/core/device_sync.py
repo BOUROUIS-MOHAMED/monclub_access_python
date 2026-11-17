@@ -2044,6 +2044,8 @@ class DeviceSyncEngine:
             # so a protocol guard placed downstream could never fire. Inert for
             # PullSDK gyms: absent or "ZK_PULLSDK" resolves exactly as before.
             "deviceProtocol": g("deviceProtocol", "device_protocol", default=None),
+            "discoveryDue": _boolish(g("discoveryDue", "discovery_due", default=False), False),
+            "serialNumber": str(g("serialNumber", "serial_number") or "").strip() or None,
             "model": g("model", default=""),
             "allowedMemberships": _as_list(allowed),
             "doorIds": _as_list(doors),

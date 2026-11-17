@@ -562,6 +562,18 @@ Found while tracing this, **not changed** `[CODE]`:
   Unchanged since before the claim. `[CODE: zk_standalone.py::set_device_time;
   local_access_api_v2.py::_sync_device_clock]`
 
+### Daily device identity
+
+`DiscoveryScheduler` waits 600 seconds after startup, then checks once per local calendar
+day for each leased DRIVE id, or each ULTRA worker when assignments are unused. All reads
+use `request_run_sdk(label="device_discovery", timeout=20.0)` on the held connection;
+standalone reads queue their own STA command. Missing workers leave the daily marker
+untouched. Due devices post a full identity; other devices with a confirmed serial post
+only after a non-empty, case-insensitive serial change. The report uses the gym bearer,
+and network failures are logged. `[CODE: app/core/device_discovery.py]`
+`[TEST: tests/test_device_discovery.py]` Read duration and firmware support on real devices
+remain `[UNVERIFIED — hardware]`.
+
 ### 3.1b The QR/TOTP roster check — trial first, then enforce (2026-09-18)
 
 **The gap it closes.** A QR code opens the door through the PC: the ULTRA rescue
@@ -1037,7 +1049,7 @@ Note: the git tag `access_1.4.35` points at `a6be482`, the 1.4.33 commit, not at
 
 | Route | Handler | With a worker | Budget |
 |---|---|---|---|
-| `GET …/info` | `_handle_device_info` | `request_run_sdk`: one `GetDeviceParam`, six `GetDeviceDataCount`, no table read | 15 s |
+| `GET …/info` | `_handle_device_info` | `request_run_sdk`: PullSDK: one `GetDeviceParam`, six `GetDeviceDataCount`; standalone: `read_identity()` on its STA thread. No table read | 15 s |
 | `GET …/table/{name}` | `_handle_device_table` | `request_run_sdk`, count first, capped (below) | 15 s |
 | `GET …/users` | `_handle_device_users_list` | `request_run_sdk`, `user` table, capped | 15 s |
 | `POST …/users/push` | `_handle_device_users_push` | guards, reset, then `request_run_sdk` (below) | 10 s |
@@ -1056,6 +1068,12 @@ here either, but these routes never reach it: `LEASE_GATED_HANDLERS` answers 409
 first, from the same `lease_gate` test that keeps it out of `UltraEngine`'s workers.
 `[CODE: access/local_api_routes.py::gated_handler; lease_gate.py::device_allowed, ::filter_devices]` One difference there: a failed connect now
 answers 503, where these handlers answered 500. The response bodies are unchanged.
+
+Standalone `/info` returns K3 identity keys in `params` (values converted to strings),
+empty `counts` and empty `raw`. Without an ULTRA worker it answers 503, without attempting
+a connection. `[CODE: local_access_api_v2._handle_device_info]`
+`[TEST: tests/test_device_discovery.py::test_device_info_standalone_uses_identity,
+::test_device_info_standalone_without_worker_never_connects]`
 
 **Which handle.** For a PullSDK panel the worker's driver is a `PullSDKDevice`
 (`device_driver.py::get_driver`). It does not expose `get_device_data_count`,
@@ -5944,6 +5962,12 @@ on the PullSDK paths and from the worker's raw `self._device` on the standalone 
 device would receive every card. Callers that only name members keep the default (`apply_card_mode=False`).
 `[TEST: test_device_push_rules.py::test_normalize_device_keeps_the_card_decision,
 ::test_the_push_filter_applies_the_card_choice_only_when_asked, ::test_every_push_path_asks_for_the_card_choice]`
+
+`discoveryDue` and `serialNumber` also survive the fixed allowlist and the SQLite
+`sync_devices` projection (`discovery_due`, `serial_number`). Missing fields become false
+and null; strings are trimmed. `[CODE: DeviceSyncEngine._normalize_device,
+sync_device_store._insert_device_row, ::_coerce_device_row_to_payload]`
+`[TEST: tests/test_device_discovery.py::test_discovery_fields_survive_local_store]`
 
 ---
 

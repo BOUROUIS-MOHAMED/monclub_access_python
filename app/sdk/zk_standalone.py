@@ -1178,6 +1178,14 @@ class ZKStandaloneDevice:
             self.logger.warning("%s list_device_users failed: %s", self._prefix, exc)
             return {"ok": False, "users": [], "error": str(exc)}
 
+    def read_identity(self, *, timeout_sec: float = _DEFAULT_CMD_TIMEOUT_SEC) -> Dict[str, Any]:
+        if not self.is_connected:
+            return {"ok": False, "error": "not connected"}
+        try:
+            return self._call("read_identity", timeout=timeout_sec) or {"ok": False}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
     def read_capacity(self, *, timeout_sec: float = _DEFAULT_CMD_TIMEOUT_SEC) -> Dict[str, Any]:
         """Free user / fingerprint slots and the fingerprint algorithm version, NOW.
 
@@ -1474,6 +1482,11 @@ class ZKStandaloneDevice:
                                               "error": "not connected"}
                             else:
                                 cmd.result = self._do_delete_users(zk, cmd.args["pins"])
+                        elif cmd.op == "read_identity":
+                            if zk is None or not connected:
+                                cmd.result = {"ok": False, "error": "not connected"}
+                            else:
+                                cmd.result = self._do_read_identity(zk)
                         elif cmd.op == "read_capacity":
                             if zk is None or not connected:
                                 cmd.result = {"ok": False, "error": "not connected"}
@@ -1682,6 +1695,65 @@ class ZKStandaloneDevice:
             except Exception:
                 continue
         return None
+
+    @staticmethod
+    def _read_identity_string(zk: Any, method: str, *args) -> str:
+        # The tuple shape first: it is the one makepy gives on the terminals in the field
+        # (see _read_platform). The ByRef VARIANT is only a fallback for other COM builds.
+        for attempt in ("tuple", "byref"):
+            try:
+                call = getattr(zk, method)
+                if attempt == "byref":
+                    import pythoncom
+                    from win32com.client import VARIANT
+                    box = VARIANT(pythoncom.VT_BYREF | pythoncom.VT_BSTR, "")
+                    if call(*args, box):
+                        value = str(box.value or "").strip()
+                        if value:
+                            return value
+                else:
+                    result = call(*args, "")
+                    if isinstance(result, (tuple, list)) and len(result) >= 2 and result[0]:
+                        return str(result[1] or "").strip()
+            except Exception:
+                continue
+        return ""
+
+    def _do_read_identity(self, zk: Any) -> Dict[str, Any]:
+        from app.core.device_discovery import normalize_standalone_identity
+
+        values = {}
+        for field, method, args in (
+            ("serialNumber", "GetSerialNumber", (1,)),
+            ("firmwareVersion", "GetFirmwareVersion", (1,)),
+            ("hwModelName", "GetProductCode", (1,)),
+            ("faceAlgoVersion", "GetSysOption", (1, "ZKFaceVersion")),
+            ("macAddress", "GetDeviceMAC", (1,)),
+        ):
+            values[field] = self._read_identity_string(zk, method, *args)
+        if not values.get("hwModelName"):
+            values["hwModelName"] = self._read_identity_string(zk, "GetSysOption", 1, "~DeviceName")
+        for field, reader in (("hwPlatform", self._read_platform), ("fpAlgoVersion", self._read_fp_version)):
+            try:
+                values[field] = reader(zk)
+            except Exception:
+                pass
+        if not values.get("hwPlatform"):
+            values["hwPlatform"] = self._read_identity_string(zk, "GetPlatform", 1)
+        if not values.get("fpAlgoVersion"):
+            values["fpAlgoVersion"] = self._read_identity_string(zk, "GetSysOption", 1, "~ZKFPVersion")
+        status_fields = {
+            "users": "usersUsed", "fingerprints": "fingerprintsUsed", "faces": "facesUsed",
+            "user_capacity": "userCapacity", "fingerprint_capacity": "fingerprintCapacity",
+            "face_capacity": "faceCapacity", "attendance_capacity": "logCapacity",
+        }
+        for index, name in self._STATUS_FIELDS.items():
+            if name in status_fields:
+                try:
+                    values[status_fields[name]] = self._read_status_index(zk, index)
+                except Exception:
+                    pass
+        return {"ok": True, "values": normalize_standalone_identity({"values": values})}
 
     def _do_read_capacity(self, zk: Any) -> Dict[str, Any]:
         """STA side of read_capacity. Refreshes the cached connect-time values it reads."""

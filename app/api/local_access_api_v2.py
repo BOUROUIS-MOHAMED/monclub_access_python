@@ -4399,6 +4399,24 @@ def _handle_device_disconnect(ctx: _Ctx) -> None:
 
 def _handle_device_info(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
+    if _device_protocol_of(did) == "ZK_STANDALONE":
+        if _ultra_worker_holding(ctx, did) is None:
+            ctx.send_json(503, {"ok": False, "error": "device not connected"})
+            return
+
+        def _read_identity(sdk):
+            result = sdk.read_identity()
+            if not result.get("ok"):
+                raise RuntimeError(result.get("error") or "identity read failed")
+            return {"params": {key: str(value) for key, value in (result.get("values") or {}).items()},
+                    "counts": {}, "raw": ""}
+
+        result = _run_on_device_sdk(ctx, did, _read_identity, label="device_info", timeout=15.0)
+        if not result["ok"]:
+            _send_run_failure(ctx, result)
+            return
+        ctx.send_json(200, {"ok": True, **(result["result"] or {})})
+        return
     if _unsupported_for_protocol(ctx, did, "la lecture des paramètres appareil"):
         return
     items = ctx.q("items", default=(

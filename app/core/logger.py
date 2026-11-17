@@ -22,6 +22,18 @@ _LOG_FILE_RE = re.compile(
     r"^app-(\d{4}-\d{2}-\d{2})-(?:am|pm|from-\d{2}-to-\d{2})(?:\.(\d+))?\.log$"
 )
 _STALE_MARKER_CUTOFF_DAYS = 30
+_log_header_provider: Callable[[], str] | None = None
+
+
+def set_log_header_provider(fn: Callable[[], str] | None) -> None:
+    global _log_header_provider
+    _log_header_provider = fn
+    if fn is not None:
+        for handler in logging.getLogger("zkapp").handlers:
+            if isinstance(handler, HalfDaySizeRotatingFileHandler):
+                with handler.lock:
+                    handler._switch_if_needed(handler.now_func())
+                    handler._write_header()
 
 # Upload windows: the day is split into these contiguous ranges so each finalized
 # log is pushed to the backend at the end of its window, instead of only twice a
@@ -102,6 +114,7 @@ class HalfDaySizeRotatingFileHandler(logging.FileHandler):
         self.now_func = now_func or dt.datetime.now
         self._last_cleanup_date: dt.date | None = None
         self.on_log_rotated = on_log_rotated
+        self._header_pending = True
         # NOTE: callback is invoked synchronously under the handler lock — must return quickly.
         # Design: register_pending() does a single atomic file rename (<1 ms); this is safe.
         # Windows risk: AV scans may briefly stall file creation. If logging latency spikes
@@ -121,6 +134,23 @@ class HalfDaySizeRotatingFileHandler(logging.FileHandler):
             self.stream.close()
             self.stream = None
         self.baseFilename = str(path)
+        self._header_pending = True
+
+    def _write_header(self) -> None:
+        self._header_pending = False
+        if _log_header_provider is None:
+            return
+        try:
+            text = _log_header_provider()
+            record = logging.LogRecord("zkapp", logging.INFO, __file__, 0, f"=== {text} ===", (), None)
+            # Use the fixed file-header format even if a caller customizes the handler.
+            formatter = logging.Formatter("%(asctime)s | INFO | %(message)s")
+            if self.stream is None:
+                self.stream = self._open()
+            self.stream.write(formatter.format(record) + self.terminator)
+            self.stream.flush()
+        except Exception:
+            pass
 
     def _switch_if_needed(self, now: dt.datetime) -> None:
         path = self._path_for(now)
@@ -173,6 +203,7 @@ class HalfDaySizeRotatingFileHandler(logging.FileHandler):
                 return
             dest = self._next_suffix_path(source)
             source.rename(dest)                     # rename must succeed first
+            self._header_pending = True
             if self.on_log_rotated:
                 try:
                     self.on_log_rotated(dest)       # called with RENAMED destination
@@ -236,6 +267,8 @@ class HalfDaySizeRotatingFileHandler(logging.FileHandler):
             self._switch_if_needed(now)
             if self._should_rotate(record):
                 self._rotate_active_file()
+            if self._header_pending:
+                self._write_header()
             super().emit(record)
         except Exception:
             self.handleError(record)

@@ -3156,6 +3156,8 @@ def init_db() -> None:
                 frequent_pass_window_minutes INTEGER NOT NULL DEFAULT 0,
 
                 device_protocol TEXT,
+                discovery_due INTEGER,
+                serial_number TEXT,
 
                 roster_pushing_policy TEXT,
 
@@ -3226,6 +3228,8 @@ def init_db() -> None:
         # NULL/absent -> ZK_PULLSDK (safe default: every pre-existing device is a
         # PullSDK panel); 'ZK_STANDALONE' -> MB2000-class standalone terminals.
         _ensure_column(conn, "sync_devices", "device_protocol", "device_protocol TEXT")
+        _ensure_column(conn, "sync_devices", "discovery_due", "discovery_due INTEGER")
+        _ensure_column(conn, "sync_devices", "serial_number", "serial_number TEXT")
 
         # Per-device roster pushing policy (backend rosterPushingPolicy). NULL/absent
         # -> PRESERVE (additive, current behavior); 'MIRROR' -> the standalone full

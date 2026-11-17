@@ -10,6 +10,29 @@ import pytest
 from app.core.log_uploader import LogUploadQueue
 
 
+def test_presign_body_carries_meta(tmp_path):
+    raw = b'2026-11-16 08:00:01,000 | ERROR | broken\n'
+    q = LogUploadQueue(tmp_path, lambda: 'token', lambda: 'https://example.test/presign',
+                       get_meta=lambda: {'appVersion': '2.4.1'})
+    response = MagicMock(status_code=200)
+    response.json.return_value = {'url': 'https://example.test/storage'}
+    with patch('requests.post', return_value=response) as post, patch('requests.put', return_value=response):
+        assert q._upload('file.log', gzip.compress(raw))
+    assert post.call_args.kwargs['json']['meta']['appVersion'] == '2.4.1'
+    assert post.call_args.kwargs['json']['meta']['errors'] == 1
+    assert post.call_args.kwargs['json']['meta']['rawBytes'] == len(raw)
+
+
+def test_meta_failure_still_uploads(tmp_path):
+    q = LogUploadQueue(tmp_path, lambda: 'token', lambda: 'https://example.test/presign',
+                       get_meta=lambda: 1 / 0)
+    response = MagicMock(status_code=200)
+    response.json.return_value = {'url': 'https://example.test/storage'}
+    with patch('requests.post', return_value=response) as post, patch('requests.put', return_value=response):
+        assert q._upload('file.log', b'invalid gzip')
+    assert post.call_args.kwargs['json'] == {'filename': 'file.log'}
+
+
 def _make_queue(tmp_path: Path, get_token=None, get_url=None) -> LogUploadQueue:
     get_token = get_token or (lambda: "test-token")
     get_url = get_url or (lambda: "https://api.example.com/api/v1/gym/access/logs/presign")
