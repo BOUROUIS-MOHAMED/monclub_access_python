@@ -47,10 +47,12 @@ class LogUploadQueue:
         log_dir: Path,
         get_token: Callable[[], object | None],
         get_upload_url: Callable[[], str | None],
+        get_meta: Callable[[], dict] | None = None,
     ) -> None:
         self.log_dir = Path(log_dir)
         self._get_token = get_token
         self._get_upload_url = get_upload_url
+        self._get_meta = get_meta
         self._stop = threading.Event()
         # Wake event lets external callers (the /logs/flush endpoint, the
         # sync-request poller) interrupt the 60 s upload-loop sleep so a
@@ -366,10 +368,30 @@ class LogUploadQueue:
         try:
             import requests
 
+            body = {"filename": filename}
+            meta = {}
+            meta_available = False
+            if self._get_meta is not None:
+                try:
+                    meta.update(self._get_meta())
+                    meta_available = True
+                except Exception:
+                    pass
+            try:
+                from app.core.log_meta import scan_log_text
+                raw = gzip.decompress(compressed)
+                meta.update(scan_log_text(raw.decode("utf-8", errors="replace")))
+                meta["rawBytes"] = len(raw)
+                meta_available = True
+            except Exception:
+                pass
+            if meta_available:
+                body["meta"] = meta
+
             # Step 1: request upload credentials from the backend
             resp = requests.post(
                 presign_url,
-                json={"filename": filename},
+                json=body,
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=20,
             )

@@ -145,6 +145,7 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             frequent_pass_limit, frequent_pass_window_minutes,
 
             device_protocol,
+            discovery_due, serial_number,
 
             roster_pushing_policy,
 
@@ -177,6 +178,7 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             ?,
             ?, ?,
             ?,
+            ?, ?,
             ?,
             ?,
             ?,
@@ -258,6 +260,8 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             _to_int_or_none(d.get("frequentPassWindowMinutes", 0)) or 0,
 
             (_safe_str(d.get("deviceProtocol") or d.get("device_protocol"), "").strip().upper() or None),
+            _bool_to_i(d.get("discoveryDue", d.get("discovery_due")), default=0),
+            (_safe_str(d.get("serialNumber", d.get("serial_number")), "").strip() or None),
 
             (_safe_str(d.get("rosterPushingPolicy") or d.get("roster_pushing_policy"), "").strip().upper() or None),
 
@@ -331,6 +335,8 @@ def _coerce_device_row_to_payload(d: Dict[str, Any]) -> Dict[str, Any]:
         # SDK-family routing (device-driver factory). None/absent -> the factory's
         # ZK_PULLSDK default, so pre-protocol rows keep working unchanged.
         "deviceProtocol": g("deviceProtocol", "device_protocol"),
+        "discoveryDue": bool(_bool_to_i(g("discoveryDue", "discovery_due"), default=0)),
+        "serialNumber": _safe_str(g("serialNumber", "serial_number"), "").strip() or None,
 
         # Roster pushing policy (PRESERVE default / MIRROR). None -> engine treats as
         # PRESERVE, so pre-migration rows keep the additive behavior.

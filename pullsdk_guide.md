@@ -934,3 +934,13 @@ grep -n "^class PullSDK\|^class PullSDKDevice" app/sdk/pullsdk.py
 ```bash
 grep -rn "PullSDK(" app/ --include=*.py
 ```
+
+## Identity reads
+
+`app/core/device_discovery.py::read_pullsdk_identity` reads `PULLSDK_ITEMS` through
+`get_device_param(items=PULLSDK_ITEMS, initial_size=65536)`, then independently counts
+`user` and `templatev10`. It receives the existing raw handle from the ULTRA worker;
+it opens no connection. Capacities are unscaled positive integers; unreadable fields
+are absent. `[CODE]` `[TEST: tests/test_device_discovery.py::test_parse_pullsdk_full,
+::test_parse_pullsdk_missing_items_absent, ::test_pullsdk_counts_are_independent]`
+Firmware support and duration are `[UNVERIFIED — hardware]`.
