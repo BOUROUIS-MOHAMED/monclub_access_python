@@ -9969,13 +9969,42 @@ def record_push_results(*, device_id: int, rows: "Iterable[tuple]") -> int:
     if not params:
         return 0
 
+    # PIN length watch (observation only, never fails this write): the longest PIN confirmed on
+    # this turnstile BEFORE these rows land, so the first confirmed or refused longer PIN is said.
+    longest_before = _longest_confirmed_pin_digits(did)
+
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
         conn.executemany(
             "INSERT OR REPLACE INTO device_push_result (device_id, pin, ok, at, corrected, error) "
             "VALUES (?, ?, ?, ?, ?, ?)", params)
         return len(params)
 
-    return int(_run_db_write_sync("record_push_results", _write))
+    written = int(_run_db_write_sync("record_push_results", _write))
+    try:
+        from app.core import pin_length_watch
+
+        pin_length_watch.observe(did, [(p[1], bool(p[2]), p[5]) for p in params], longest_before)
+    except Exception:
+        pass
+    return written
+
+
+def _longest_confirmed_pin_digits(device_id: int) -> Optional[int]:
+    """Digits of the longest PIN whose last push to this turnstile is confirmed, for the PIN
+    length watch. Read from the table once per turnstile and process. None = not known."""
+    try:
+        from app.core import pin_length_watch
+
+        def _load(did: int) -> int:
+            with get_conn() as conn:
+                row = conn.execute(
+                    "SELECT MAX(LENGTH(pin)) FROM device_push_result "
+                    "WHERE device_id=? AND ok=1 AND pin NOT GLOB '*[^0-9]*'", (did,)).fetchone()
+            return int(row[0] or 0) if row else 0
+
+        return pin_length_watch.baseline(device_id, _load)
+    except Exception:
+        return None
 
 
 def reset_push_results_for_pins(*, device_id: int, pins: "Iterable[str]") -> int:

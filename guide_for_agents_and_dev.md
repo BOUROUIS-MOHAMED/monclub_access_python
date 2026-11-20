@@ -4761,6 +4761,15 @@ Stored in `device_push_result` (`db.py::record_push_results`, `::list_push_resul
   (or connected, with no worker), so a write the worker skips leaves "unknown" (§3.1c). A held or handed-over
   turnstile is refused before any of that (§3.2h). `[CODE]`
   `[TEST: test_v2_last_push.py::TestTheAdminUsersPushRoute]`
+- **The PIN length watch (2026-11-20) reads these results and decides nothing.** `db.py::record_push_results`
+  is the one place every push result of both SDKs lands, so it hands each batch to
+  `app/core/pin_length_watch.py`: the longest all-digit PIN with `ok=1` on the turnstile is read from
+  `device_push_result` once per turnstile and process (`db.py::_longest_confirmed_pin_digits`), BEFORE the
+  rows are written; a confirmed longer PIN is said once (`[T] PIN_LENGTH_FIRST_PUSH_OK`), a failed longer
+  PIN once per length and code (`[T] PIN_LENGTH_PUSH_FAILED`, warn). It writes nothing, withholds nothing,
+  and an error inside it never fails the result write. Why it exists: every production id had at most 5
+  digits when it was written, so no turnstile had received a 6-digit PIN (§7). `[CODE]`
+  `[TEST: test_pin_length_watch.py]`
 - **Upload.** The three fields are part of "has this row changed": `v2_ownership_uploaded` gains
   `last_push_ok / last_push_src_at / last_push_error / last_push_sent_at`, the change key being the LOCAL record
   (ok, its own time, code) so a moving clock offset does not re-send rows; a changed row gets an `observedAt`
@@ -6031,6 +6040,19 @@ the raw value** in `rawRow`. `[CODE: _VERIFY_METHOD_SCAN_MODE]`
 Do not write logic that depends on a specific integer until the mapping is confirmed on
 the actual terminal.
 
+### How many PIN digits each turnstile stores `[UNVERIFIED — HARDWARE-GATED]`
+
+A device PIN is `main_account.id` or `active_membership.id` (§3.2b). On the production copy of 2026-11-19 the
+highest were 79,276 and 39,108: **no turnstile has ever been sent a PIN longer than 5 digits.** What is in the
+code: the MB2000 driver skips a PIN over 9 digits (`zk_standalone.py::_MAX_PIN_DIGITS`, graded `[COMMENT]`,
+a datasheet); the PullSDK paths have no length rule at all. What is not known for any model: whether a 6- to
+9-digit PIN is stored whole, refused, or cut. A refusal shows as a failed push with its code; a silent cut
+would be confirmed like any write. To prove a length: push a test user with that PIN (the local admin route `users/push`),
+open the door with its card or finger, and read the PIN the door event carries. Until then the PIN length
+watch (`[T] PIN_LENGTH_FIRST_PUSH_OK` / `PIN_LENGTH_PUSH_FAILED`, §3.9 "The last push result") only reports what
+the drivers answer, and the backend warns the owner before the ids reach the next length
+(`monclub.access.pin-length.*`).
+
 ### Other MB2000 unknowns `[UNVERIFIED — HARDWARE-GATED]`
 
 Declared in `zk_standalone.py`'s own module docstring: in-process COM viability, event
@@ -6513,6 +6535,8 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `SYNC_RETRY_BACKOFF` | `device_sync.py`, `ultra_engine.py` | `device_id pins` |
 | `PIN_SCHEME_ACCOUNT_WITHHELD` | `device_sync.py` | `device_id withheld` (warn; §3.2b — ACCOUNT rows with no `mainAccountId`) |
 | `PIN_SCHEME_SWITCH` | `db.py` | `device_id previous scheme cleared_rows` (warn; §3.2e — the terminal must be wiped) |
+| `PIN_LENGTH_FIRST_PUSH_OK` | `pin_length_watch.py` (from `db.py::record_push_results`) | `device_id digits previous pin` — the first push result `true` of a PIN with more digits than any confirmed on this turnstile (`previous`). Says the driver confirmed the write, NOT that the terminal stored every digit (§7 "How many PIN digits"). Can repeat after a restart that follows a restore or an erase |
+| `PIN_LENGTH_PUSH_FAILED` | `pin_length_watch.py` (from `db.py::record_push_results`) | `device_id digits longest_ok code count pin` (warn; once per turnstile, length and code per process) — a push result `false` for a PIN longer than any confirmed on this turnstile; `code` = the last-push code, `pin` = one example. The length is a suspect, not a verdict |
 | `ZKEM_PUSH_WEDGED` | `zk_standalone.py` | `chunk chunks members consecutive pushed_before err` |
 | `ZKEM_PUSH_RECONNECT` | `zk_standalone.py` | `chunk ok err` |
 | `ZKEM_PUSH_ABANDONED` | `zk_standalone.py` | `consecutive chunk chunks pushed` |
