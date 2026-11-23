@@ -527,6 +527,9 @@ def _stub_heavy_init(monkeypatch) -> None:
     monkeypatch.setattr(app_module.MainApp, "_resolve_sdk_dll", lambda self, path: path)
     monkeypatch.setattr(app_module, "require_32bit_python_for_32bit_dll", lambda path: None)
     monkeypatch.setattr(app_module, "setup_logging", lambda *args, **kwargs: MagicMock())
+    # init_db is stubbed and startup is deliberately aborted; no real uploader may outlive
+    # this test and read a later fixture's database (or scan/upload the installed log directory).
+    monkeypatch.setattr("app.core.log_uploader.LogUploadQueue", MagicMock())
     monkeypatch.setattr(app_module, "get_access_config_status", lambda: {})
     monkeypatch.setattr(app_module, "get_access_storage_status", lambda: {})
     monkeypatch.setattr(app_module, "check_zkemkeeper_registration", lambda: {"ok": True})
@@ -542,6 +545,28 @@ def _stub_heavy_init(monkeypatch) -> None:
     from app.core import device_hold
 
     monkeypatch.setattr(device_hold, "load", lambda **kw: frozenset())
+
+
+def test_stubbed_startup_does_not_launch_the_real_log_uploader(tmp_path, monkeypatch) -> None:
+    """A stopped initializer must not leave a daemon reading later tests' database paths."""
+    from app.core.log_uploader import LogUploadQueue
+
+    monkeypatch.setattr(dbmod, "_DB_PATH", str(tmp_path / "init.db"), raising=False)
+    monkeypatch.setattr(app_module, "LOG_DIR", tmp_path / "logs")
+    _stub_heavy_init(monkeypatch)
+    real_start = MagicMock()
+    monkeypatch.setattr(LogUploadQueue, "start", real_start)
+
+    class StopInit(Exception):
+        pass
+
+    def stop_after(self, *args):
+        raise StopInit
+
+    monkeypatch.setattr(MainApp, "after", stop_after)
+    with pytest.raises(StopInit):
+        MainApp()
+    real_start.assert_not_called()
 
 
 def test_init_applies_the_startup_flip_before_the_first_sync_tick(tmp_path, monkeypatch) -> None:

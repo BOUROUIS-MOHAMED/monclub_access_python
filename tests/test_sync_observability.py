@@ -320,6 +320,9 @@ def test_main_app_initializes_scheduler_before_first_after(monkeypatch):
     monkeypatch.setattr(app_module.MainApp, "_resolve_sdk_dll", lambda self, path: path)
     monkeypatch.setattr(app_module, "require_32bit_python_for_32bit_dll", lambda path: None)
     monkeypatch.setattr(app_module, "setup_logging", lambda *args, **kwargs: logger)
+    # init_db is stubbed and startup is deliberately aborted; no real uploader may outlive
+    # this test and read a later fixture's database (or scan/upload the installed log directory).
+    monkeypatch.setattr("app.core.log_uploader.LogUploadQueue", MagicMock())
     monkeypatch.setattr(app_module, "get_access_config_status", lambda: {})
     monkeypatch.setattr(app_module, "get_access_storage_status", lambda: {})
     monkeypatch.setattr(app_module, "check_zkemkeeper_registration", lambda: {"ok": True})

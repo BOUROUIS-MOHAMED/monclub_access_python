@@ -329,3 +329,25 @@ def test_the_stale_lock_resets_still_log_through_the_module_logging(db, monkeypa
     errors = [r.getMessage() for r in caplog.records if r.name == "db" and r.levelno == logging.ERROR]
     assert any("Failed to reset stale processing locks" in m for m in errors)
     assert any("Failed to reset stale mutation locks" in m for m in errors)
+
+
+def test_startup_migrates_legacy_auth_before_token_readers_run(db, monkeypatch):
+    """An old Access DB gains refresh columns without losing its stored login."""
+    db_module, path = db
+    _seed(path,
+          ("CREATE TABLE auth_state (id INTEGER PRIMARY KEY CHECK (id=1), email TEXT, "
+           "token_protected TEXT, last_login_at TEXT)", ()),
+          ("INSERT INTO auth_state VALUES (1, ?, ?, ?)",
+           ("legacy@example.test", "legacy-protected-token", "2026-01-01T10:00:00Z")))
+    monkeypatch.setattr(db_module, "unprotect_auth_token", lambda value: value)
+
+    for _ in range(2):  # The migration also remains safe on the next launch.
+        _start(db_module)
+        assert {"refresh_token_protected", "next_refresh_at"} <= set(_columns(path, "auth_state"))
+        auth = db_module.load_auth_token()
+        assert auth is not None
+        assert (auth.email, auth.token, auth.last_login_at) == (
+            "legacy@example.test", "legacy-protected-token", "2026-01-01T10:00:00Z")
+        assert auth.refresh_token == "" and auth.next_refresh_at == ""
+        assert db_module.load_refresh_token() is None
+        assert db_module.load_next_refresh_at() is None
